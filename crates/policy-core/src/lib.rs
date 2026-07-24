@@ -11,16 +11,12 @@
 //! a [`HostRequest`]. The caller resolves it and calls
 //! [`VmSession::resume`] with the result.
 //!
-//! **Important:** XRPC requests made from the policy are **always queries**
-//! (read-only), never procedures. Evaluating a policy must never change the
-//! state of the system. The host should enforce this — if the policy requests
-//! a mutation endpoint the host should either reject it or treat it as a
-//! no-op query.
-//!
 //! Because `RegoVM` is `Send + Sync` (with regorus's `arc` feature), each
 //! caller owns its own `VmSession` — no pool needed.
 
 use std::fmt::Display;
+
+pub use regorus;
 
 use regorus::{
     PolicyModule, Value,

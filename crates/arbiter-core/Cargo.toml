@@ -8,10 +8,9 @@ default = ["futures"]
 futures = ["dep:async-lock"]
 
 [dependencies]
-async-lock = { version = "3.4.2", optional = true }
 policy-core = { path = "../policy-core" }
-regorus = { version = "0.10.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tracing = { version = "0.1" }
+
+async-lock = { version = "3.4.2", optional = true }

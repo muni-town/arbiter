@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 
-use policy_core::{HostRequest, VmResult, VmSession, XrpcMethod};
+use policy_core::{HostRequest, VmResult, VmSession, XrpcMethod, regorus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
