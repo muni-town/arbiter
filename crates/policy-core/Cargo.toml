@@ -1,8 +1,0 @@
-[package]
-name = "policy-core"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-regorus = { version = "0.10.1", default-features = false, features = ["rvm", "arc", "std"] }
-thiserror = "2"
