@@ -1,140 +1,71 @@
-//! Async IO trait and event processing for the arbiter state machine.
-//!
-//! Provides an [`Io`] trait that users implement to supply the network
-//! layer, and a [`process_event`] helper that drives one event through
-//! the state machine recursively — fulfilling IO actions and feeding
-//! remote results back until the policy completes.
-//!
-//! No external runtime dependency: the trait uses native `async fn`
-//! (stable in Rust 1.75+, edition 2024).  Callers may build their own
-//! event loop on top of `process_event`, or integrate the `Io` impl
-//! with any async runtime (tokio, smol, etc.).
-//!
-//! # Example (conceptual)
-//!
-//! ```ignore
-//! use arbiter_core::{StateMachine, Event, futures::Io};
-//!
-//! struct MyIo;
-//!
-//! impl Io for MyIo {
-//!     async fn send_response(&mut self, body: Value, status: u16) {
-//!         // … send HTTP response …
-//!     }
-//!     async fn remote_request(
-//!         &mut self,
-//!         did: &str,
-//!         method: &policy_core::XrpcMethod,
-//!         nsid: &str,
-//!         input: Value,
-//!     ) -> (u16, Value) {
-//!         // … make HTTP request, return XrpcResponse …
-//!     }
-//! }
-//!
-//! # async fn example() {
-//! let mut sm = StateMachine::create(…);
-//! let mut io = MyIo;
-//!
-//! // Drive one incoming request to completion.
-//! arbiter_core::futures::process_event(
-//!     &mut io,
-//!     &mut sm,
-//!     Event::IncomingXrpc { … },
-//! ).await;
-//! # }
-//! ```
+use crate::{
+    arbiter::{Arbiter, ArbiterReqMachine, ArbiterReqMachineStep, Policies},
+    xrpc::{XrpcEndpoint, XrpcRequest, XrpcResult},
+};
 
-use std::sync::Arc;
-
-use serde_json::Value;
-
-use crate::{Event, IoAction, StateMachine, XrpcResponse, policy_core::XrpcMethod};
-
-// ---------------------------------------------------------------------------
-// IO trait
-// ---------------------------------------------------------------------------
-
-/// Network layer for an arbiter state machine.
+/// Async IO implementation that must be provided to
+/// [`ArbiterReqMachine::into_future`] if you want to use a future instead of
+/// manually advancing the state machine.
 ///
-/// Implement this trait to connect the sans-IO [`StateMachine`] to the
-/// real world — sending XRPC responses to clients and making remote
-/// XRPC requests to other arbiters or services.
-pub trait Io {
-    /// Send an XRPC response back to the client that made the original
-    /// request.
-    fn send_response(
+/// `Send + Sync` is required because [`ArbiterReqMachine::into_future`]
+/// borrows `&self` across an `.await`, so the produced future is only `Send`
+/// when the IO implementation is `Sync` (and the request future it returns is
+/// `Send`, declared below).
+pub trait ArbiterAsyncIo: Send + Sync {
+    /// Send a request to the given endpoint on behalf of the arbiter's policy.
+    fn xrpc_request(
         &self,
-        body: Value,
-        status: u16,
-    ) -> impl std::future::Future<Output = ()> + Send;
-
-    /// Perform a remote XRPC request and return the [`XrpcResponse`].
-    ///
-    /// This is called when the policy engine invokes `xrpc_remote`.
-    /// The implementation should make the network call and return the
-    /// response.  Errors (timeouts, network failures) should be reported
-    /// as an appropriate HTTP status code so the policy can handle them.
-    fn remote_request(
-        &self,
-        did: &str,
-        method: &XrpcMethod,
-        nsid: &str,
-        input: Value,
-    ) -> impl std::future::Future<Output = XrpcResponse> + Send;
+        endpoint: XrpcEndpoint,
+        request: XrpcRequest,
+    ) -> impl Future<Output = XrpcResult> + Send;
 }
 
-// ---------------------------------------------------------------------------
-// Event processing
-// ---------------------------------------------------------------------------
+/// An async version of the [`Arbiter`].
+pub struct AsyncArbiter<Io: ArbiterAsyncIo> {
+    policies: Policies,
+    io: Io,
+}
 
-/// Drive a single [`Event`] through the state machine to completion.
-///
-/// The function processes the event, fulfils every [`IoAction`] that the
-/// state machine emits, and feeds remote results back recursively — the
-/// returned future resolves only after the policy has finished (either
-/// completed or errored).
-///
-/// If the policy suspends on `xrpc_remote`, this function blocks the
-/// current task until the remote request finishes.  For concurrent
-/// processing of multiple in-flight requests (stored in the state
-/// machine's [`pending_jobs`](StateMachine::pending_jobs)), callers
-/// should provide their own event loop that calls this function from
-/// separate tasks or uses a [`select`](futures_util::select)-style
-/// pattern.
-///
-/// # No more IO actions
-///
-/// After the policy completes, the state machine emits exactly one
-/// [`IoAction::SendXrpcResponse`] (or errors out).  This function
-/// sends that response and returns.
-pub async fn process_event(
-    io: &impl Io,
-    sm: Arc<async_lock::Mutex<StateMachine>>,
-    event: Event,
-) {
-    let mut stack = vec![event];
+impl Arbiter {
+    /// Convert this arbiter into an [`AsyncArbiter`] that is easier to use in
+    /// an async context without having to manually drive the state machine.
+    pub fn into_async<Io: ArbiterAsyncIo>(self, io: Io) -> AsyncArbiter<Io> {
+        AsyncArbiter {
+            policies: self.policies,
+            io,
+        }
+    }
+}
 
-    while let Some(event) = stack.pop() {
-        let actions = sm.lock().await.handle_event(event);
-        for action in actions {
-            match action {
-                IoAction::SendXrpcResponse { body, status } => {
-                    io.send_response(body, status).await;
-                }
-                IoAction::SendXrpcRequest {
-                    did,
-                    method,
-                    nsid,
-                    input,
-                    job_id,
-                } => {
-                    let resp = io.remote_request(&did, &method, &nsid, input).await;
-                    stack.push(Event::XrpcRemoteResult {
-                        status: resp.status,
-                        body: resp.body,
-                        job_id,
-                    });
+impl<Io: ArbiterAsyncIo> AsyncArbiter<Io> {
+    /// Create a new [`AsyncArbiter`] from it's policies and [`ArbiterAsyncIo`]
+    /// implementation.
+    pub fn new(policies: Policies, io: Io) -> Self {
+        Self { policies, io }
+    }
+
+    /// Handle an XRPC request by routing through the arbiter's policies.
+    pub async fn handle_request(&self, req: XrpcRequest) -> XrpcResult {
+        ArbiterReqMachine::new(self.policies.clone(), req)
+            .into_future(&self.io)
+            .await
+    }
+}
+
+impl ArbiterReqMachine {
+    /// Convert the [`ArbiterReqMachine`] into a future that will automatically
+    /// advance the state machine using the provided IO implementation.
+    pub fn into_future<Io: ArbiterAsyncIo>(mut self, io: &Io) -> impl Future<Output = XrpcResult> {
+        use ArbiterReqMachineStep::*;
+        async move {
+            let mut step = self.start();
+            loop {
+                match step {
+                    Completed(result) => return result,
+                    RemoteXrpcRequest { endpoint, request } => {
+                        let resp = io.xrpc_request(endpoint, request).await;
+                        step = self.resume(resp);
+                    }
                 }
             }
         }

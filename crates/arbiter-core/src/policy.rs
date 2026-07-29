@@ -3,8 +3,6 @@
 //! This module is responsible for executing the Rego policies that power the
 //! arbiter. It is relatively low-level, providing a state machine for Rego
 //! execution with custom host functions, but no arbiter-specific functionality.
-//!
-//! Status: Basically Complete ✅
 
 use anyhow::{Context, Result};
 use regorus::{
@@ -19,6 +17,7 @@ use regorus::{
 /// A thin wrapper around a [Rego][`regorus`] [VM][`RegoVM`] that makes it
 /// simpler to compile a policy and evaluate it while also responding to custom
 /// async builtins.
+#[derive(Debug)]
 pub struct PolicyVm {
     data: Value,
     vm: RegoVM,
@@ -29,23 +28,31 @@ impl Clone for PolicyVm {
     fn clone(&self) -> Self {
         // Clone the program and data
         let program = self.vm.get_program().clone();
-        let data = self.data.clone();
 
-        // Create a new VM using the same program and dta
+        // Create a new VM using the same program and data
         let mut vm = RegoVM::new();
         vm.load_program(program);
-        vm.set_data(data.clone()).unwrap();
+        // `set_data` only fails via `check_rule_data_conflicts`, a pure check of
+        // the program's rule tree against `data`. Here both the program (cloned
+        // from `self.vm`) and the data (`self.data`, already accepted by `new`)
+        // are byte-for-byte the same pair that `new` successfully installed, so
+        // the conflict check is guaranteed to pass again. The unwrap is
+        // infallible given the invariant that this `PolicyVm` was successfully
+        // constructed.
+        vm.set_data(self.data.clone())
+            .expect("clone preserves the program+data pair that new() already validated");
         vm.set_execution_mode(regorus::rvm::vm::ExecutionMode::Suspendable);
 
-        Self { data, vm }
+        Self {
+            data: self.data.clone(),
+            vm,
+        }
     }
 }
 
 pub enum PolicyVmOutput {
     /// The policy has called a host function.
     ///
-    /// The host will need to execute the named funtion with the given args and
-    /// then resume the policy execution.
     HostCall { fn_name: String, arg: Value },
     /// The policy has completed and returned a value
     Completed(Value),
@@ -60,10 +67,11 @@ impl PolicyVm {
     /// - `entrypoint`: the rule that will be evaluated to create the result of the
     ///   policy.
     /// - `async_host_fns`: a list of built-in function names to make available to
-    ///   the policy and the number of arguments that the function takes. When
-    ///   evaluated in the policy these will suspend the VM and give the host the
-    ///   opportunity to make any requests or do any processing and provide the result
-    ///   to the VM before resuming execution.
+    ///   the policy. Each function is registered as taking exactly one argument;
+    ///   when evaluated in the policy the VM suspends and gives the host the
+    ///   opportunity to make any requests or do any processing and provide the
+    ///   result to the VM before resuming execution. Host functions that need a
+    ///   different arity are not currently supported.
     pub fn new(
         policy: &str,
         data: Value,
@@ -100,6 +108,11 @@ impl PolicyVm {
 
     /// Start evaluating a policy. The provided input will be set as the `input`
     /// global in the policy.
+    ///
+    /// A `PolicyVm` may be started again after a previous [`PolicyVmOutput::Completed`]
+    /// (the VM is re-driven with the new `input`). It must not be re-started
+    /// while a [`PolicyVmOutput::HostCall`] is outstanding — such a call must be
+    /// resolved with [`Self::resume`] first.
     pub fn start(&mut self, input: Value) -> Result<PolicyVmOutput> {
         self.vm.set_input(input);
         self.vm.execute()?;

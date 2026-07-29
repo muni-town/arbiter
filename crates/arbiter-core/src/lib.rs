@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod arbiter;
 pub mod policy;
 pub mod xrpc;
-pub mod arbiter;
+
+pub mod futures;

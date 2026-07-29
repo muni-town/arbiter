@@ -128,10 +128,8 @@ name = "arbiter-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-lock",
  "atrium-xrpc",
  "regorus",
- "serde",
  "serde_json",
 ]
 
