@@ -1,27 +1,45 @@
 # Current Project Planning & Implementation Status
 
-**Overall Focus:** Think about the minimal flow for the arbiter server as XRPC
-requests come in, get processed by the policy, and make requests to the PDS.
-
 ## Notes
 
-The PDS is going to be the main datastore for the arbiter. The main policy itself,
-all the other subpolicies, and the member list will just be records on the PDS
-for now.
-
-## Implementation
-
-- Each logical arbiter will have a PDS account.
+- `arbiter-core` is essentially finished.
 - The arbiter server will manage multiple arbiters.
-- I have `policy.rs` in `arbiter-core` in a good place: a simple wrapper around
-  the `RegoVM`.
-- `axum` looks like a good minimal webserver to go with.
-- `atrium_xrpc` types will serve well for parsing / serialization of the XRPC stuff.
-  - I think at the `arbiter-core` level it might make sense to just deal with
-    the atrium xrpc types and then expect the server to parse into those types.
-  - There is an extra consideration we need to make about how we are going to
-    pass XRPC requests to Rego at this point because the request may have
-    `parameters` in the query string as well as a `body` that could have any
-    mime type or else be JSON. Rego doesn't support bytes in the policy ( which
-    makes sense as it is unnecessary ) so that means we will need to be a little
-    more sophisticated with the way we pass data and responses to it.
+- The PDS is going to be the main datastore for the arbiter. The main policy
+  itself, all the other subpolicies, and the member list will just be records on
+  the PDS for now.
+  - The arbiter-core `Policies` struct shows the basic structure: a root policy
+    with multiple named sub-policies.
+- The arbiter server will need local storage for the PDS passwords /
+  AppPasswords and the DID keys for accounts that it has created.
+- Previously we required an arbiter to have a service record on the DID doc.
+  That will no longer be necessary.
+  - We can create a `town.muni.arbiter.service/self` record with a `did` field
+    that will point to something like `did:web:arbiter.example.com`.
+  - _That_ `did` referenced in the `town.muni.arbiter.service` record will have
+    an `#arbiter` service endpoint that points at the arbiter server URL.
+- The arbiter policies will be loaded from PDS records.
+  - When the arbiter server starts up it will fetch the latest root and
+    sub-policies from the PDS account.
+  - The arbiter server will also subscribe to the jetstream so that it can
+    monitor changes to the policies. When a policy update comes in over the
+    jetstream it will reinstantiate the arbiter instance so that subsequent
+    requests will go through the updated policies.
+  - We'll have `town.muni.arbiter.policy.root/self` record for the root policy
+    and `town.muni.arbiter.policy.sub/sub-policy-name` records for the
+    sub-policies.
+- We're switching from `salvo` to `axum` for http.
+- We'll use Turso and Toasty for arbiter server storage:
+  https://docs.turso.tech/sdk/rust/orm/toasty
+- We don't need all the arbiter XRPCs about members and spaces at all anymore.
+  - The only built-in XRPCs we need are the ones for creating arbiters, either
+    from imports of existing accounts or for creating new accounts.
+  - All other XRPC requests will be required to have an `arbiter-proxy` header
+    containing the DID and service fragment describing the destination service,
+    and an `arbiter-did` header with the DID of the account that we will be
+    acting on behalf of.
+    - The `arbiter-did` will be used to select the arbiter that will do the
+      policy evaluation, a `data.pdsEndpoint` will be added
+      as`arbiter-did#atproto_pds` to the policy context along with
+      `data.arbiterDid` which will just be the arbiter DID, and
+      `input.xrpcEndpoint`, which will the intended destination of the XRPC
+      request.

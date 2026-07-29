@@ -1,23 +1,23 @@
 use std::collections::HashMap;
 
 use arbiter_core::{
-    arbiter::{Arbiter, ArbiterReqMachineStep, BYTES_KEY, Policies},
+    arbiter::{Arbiter, ArbiterReqMachineStep, BYTES_KEY, Policies, RequestCtx},
     policy::PolicyVm,
-    xrpc::{XrpcEndpoint, XrpcOutput, XrpcRequest, XrpcResult},
+    xrpc::{XrpcOutput, XrpcRequest, XrpcResult},
 };
 use atrium_xrpc::{InputDataOrBytes, http};
 use regorus::Value;
 
 /// Build a `PolicyVm` whose entrypoint is `data.arbiter.result`, registering the
-/// three arbiter host functions as async builtins.
+/// arbiter host functions as async builtins.
 fn arbiter_policy(src: &str) -> PolicyVm {
     arbiter_policy_with_host_fns(src, &[])
 }
 
 /// Like [`arbiter_policy`] but registers `extra_host_fns` in addition to the
-/// standard `pds`, `xrpc`, and `policy` host functions.
+/// standard `xrpc` and `policy` host functions.
 fn arbiter_policy_with_host_fns(src: &str, extra_host_fns: &[&str]) -> PolicyVm {
-    let mut host_fns: Vec<&str> = vec!["pds", "xrpc", "policy"];
+    let mut host_fns: Vec<&str> = vec!["xrpc", "policy"];
     host_fns.extend_from_slice(extra_host_fns);
     PolicyVm::new(
         src,
@@ -52,7 +52,7 @@ fn immediate_completion() {
         "#,
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None));
+    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
 
     match machine.start() {
         ArbiterReqMachineStep::Completed(Ok(XrpcOutput::Data(json))) => {
@@ -62,23 +62,24 @@ fn immediate_completion() {
     }
 }
 
-/// A root policy that calls the `pds` host function and echoes its response.
+/// A root policy that calls the `xrpc` host function targeting its own PDS
+/// account endpoint and echoes its response.
 #[test]
-fn pds_host_call_roundtrip() {
+fn xrpc_host_call_roundtrip() {
     let root = arbiter_policy(
         r#"
         package arbiter
         result := { "ok": resp.ok, "output": resp.output }
-        resp := pds({ "method": "GET", "nsid": "com.example.foo", "parameters": null, "body": null })
+        resp := xrpc({ "did": "did:web:own-account.example#atproto_pds", "method": "GET", "nsid": "com.example.foo", "parameters": null, "body": null })
         "#,
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None));
+    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
 
     let step = machine.start();
     let request = match step {
         ArbiterReqMachineStep::RemoteXrpcRequest { endpoint, request } => {
-            assert!(matches!(endpoint, XrpcEndpoint::PdsAccount));
+            assert_eq!(endpoint, "did:web:own-account.example#atproto_pds");
             assert_eq!(request.method, http::Method::GET);
             assert_eq!(request.nsid, "com.example.foo");
             request
@@ -108,13 +109,13 @@ fn xrpc_host_call_targeting_remote() {
         "#,
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None));
+    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
 
     match machine.start() {
         ArbiterReqMachineStep::RemoteXrpcRequest { endpoint, request } => {
             assert_eq!(
                 endpoint,
-                XrpcEndpoint::Remote("did:web:example.com#atproto_pds".to_string())
+                "did:web:example.com#atproto_pds".to_string()
             );
             assert_eq!(request.method, http::Method::POST);
             assert_eq!(request.nsid, "com.example.bar");
@@ -158,7 +159,7 @@ fn sub_policy_invocation() {
     let mut subs = HashMap::new();
     subs.insert("moderation".to_string(), sub);
     let arbiter = Arbiter::new(Policies::new(root, subs));
-    let mut machine = arbiter.handle_request(make_req(http::Method::POST, "com.example.foo", None));
+    let mut machine = arbiter.handle_request(make_req(http::Method::POST, "com.example.foo", None), RequestCtx::default());
 
     match machine.start() {
         ArbiterReqMachineStep::Completed(Ok(XrpcOutput::Data(json))) => {
@@ -168,7 +169,7 @@ fn sub_policy_invocation() {
     }
 }
 
-/// A sub-policy that itself makes a `pds` call: the remote request bubbles up
+/// A sub-policy that itself makes an `xrpc` call: the remote request bubbles up
 /// to the caller, and after the response the root policy completes with the
 /// sub-policy's derived result.
 #[test]
@@ -177,7 +178,7 @@ fn sub_policy_with_remote_call() {
         r#"
         package arbiter
         result := { "ok": resp.ok, "output": { "pds_echo": resp.output } }
-        resp := pds({ "method": "GET", "nsid": "com.example.fetch", "parameters": null, "body": null })
+        resp := xrpc({ "did": "did:web:own-account.example#atproto_pds", "method": "GET", "nsid": "com.example.fetch", "parameters": null, "body": null })
         "#,
     );
     let root = arbiter_policy(
@@ -190,11 +191,11 @@ fn sub_policy_with_remote_call() {
     let mut subs = HashMap::new();
     subs.insert("moderation".to_string(), sub);
     let arbiter = Arbiter::new(Policies::new(root, subs));
-    let mut machine = arbiter.handle_request(make_req(http::Method::POST, "com.example.foo", None));
+    let mut machine = arbiter.handle_request(make_req(http::Method::POST, "com.example.foo", None), RequestCtx::default());
 
     match machine.start() {
         ArbiterReqMachineStep::RemoteXrpcRequest { endpoint, .. } => {
-            assert!(matches!(endpoint, XrpcEndpoint::PdsAccount));
+            assert_eq!(endpoint, "did:web:own-account.example#atproto_pds");
         }
         _other => panic!("expected remote xrpc request from sub-policy, got something else"),
     }
@@ -209,7 +210,7 @@ fn sub_policy_with_remote_call() {
 
 /// Binary request body: bytes are stashed into the machine's buffers and passed
 /// to the policy as a `{ "$__bytes__": <idx> }` marker. The policy forwards the
-/// marker as the body of a `pds` call, which resolves back to real bytes in the
+/// marker as the body of an `xrpc` call, which resolves back to real bytes in the
 /// emitted `XrpcRequest`.
 #[test]
 fn bytes_request_body_roundtrips_through_host_call() {
@@ -217,7 +218,7 @@ fn bytes_request_body_roundtrips_through_host_call() {
         r#"
         package arbiter
         result := resp
-        resp := pds({ "method": "POST", "nsid": "com.example.upload", "parameters": null, "body": input.body })
+        resp := xrpc({ "did": "did:web:own-account.example#atproto_pds", "method": "POST", "nsid": "com.example.upload", "parameters": null, "body": input.body })
         "#,
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
@@ -226,11 +227,11 @@ fn bytes_request_body_roundtrips_through_host_call() {
         http::Method::POST,
         "com.example.upload",
         Some(InputDataOrBytes::Bytes(payload.clone())),
-    ));
+    ), RequestCtx::default());
 
     let request = match machine.start() {
         ArbiterReqMachineStep::RemoteXrpcRequest { endpoint, request } => {
-            assert!(matches!(endpoint, XrpcEndpoint::PdsAccount));
+            assert_eq!(endpoint, "did:web:own-account.example#atproto_pds");
             request
         }
         _other => panic!("expected remote xrpc request, got something else"),
@@ -262,7 +263,7 @@ fn error_envelope_becomes_xrpc_error() {
         "#,
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None));
+    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
 
     match machine.start() {
         ArbiterReqMachineStep::Completed(Err(err)) => {
@@ -291,7 +292,7 @@ fn internal_error_becomes_500_xrpc_error() {
         "#,
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None));
+    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
 
     match machine.start() {
         ArbiterReqMachineStep::Completed(Err(err)) => {
@@ -323,7 +324,7 @@ fn resume_without_pending_request_panics() {
         "#,
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None));
+    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
     let _ = machine.start();
     let _ = machine.resume(Ok(XrpcOutput::Data(serde_json::Value::Null)));
 }
@@ -339,7 +340,7 @@ fn start_called_twice_panics() {
         "#,
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None));
+    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
     let _ = machine.start();
     let _ = machine.start();
 }
@@ -362,7 +363,7 @@ fn policy_call_depth_limit_terminates() {
     let mut subs = HashMap::new();
     subs.insert("loop".to_string(), arbiter_policy(call));
     let arbiter = Arbiter::new(Policies::new(root, subs));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None));
+    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
     match machine.start() {
         ArbiterReqMachineStep::Completed(Err(e)) => {
             assert_eq!(e.status, http::StatusCode::INTERNAL_SERVER_ERROR);
@@ -371,14 +372,14 @@ fn policy_call_depth_limit_terminates() {
     }
 }
 
-/// An `encoding` field on a `pds` host-call argument is propagated to the
+/// An `encoding` field on an `xrpc` host-call argument is propagated to the
 /// emitted remote XRPC request.
 #[test]
 fn encoding_passed_through_on_outgoing_xrpc() {
     let root = arbiter_policy(
         r#"
         package arbiter
-        result := pds({ "method": "POST", "nsid": "com.example.upload", "encoding": "application/octet-stream", "parameters": null, "body": input.body })
+        result := xrpc({ "did": "did:web:own-account.example#atproto_pds", "method": "POST", "nsid": "com.example.upload", "encoding": "application/octet-stream", "parameters": null, "body": input.body })
     "#,
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
@@ -390,10 +391,10 @@ fn encoding_passed_through_on_outgoing_xrpc() {
         input: Some(InputDataOrBytes::Bytes(payload.clone())),
         encoding: None,
     };
-    let mut machine = arbiter.handle_request(req);
+    let mut machine = arbiter.handle_request(req, RequestCtx::default());
     match machine.start() {
         ArbiterReqMachineStep::RemoteXrpcRequest { endpoint, request } => {
-            assert_eq!(endpoint, XrpcEndpoint::PdsAccount);
+            assert_eq!(endpoint, "did:web:own-account.example#atproto_pds");
             assert_eq!(
                 request.encoding.as_deref(),
                 Some("application/octet-stream")
@@ -425,7 +426,7 @@ fn incoming_encoding_surfaced_to_policy() {
         input: None,
         encoding: Some("image/png".to_string()),
     };
-    let mut machine = arbiter.handle_request(req);
+    let mut machine = arbiter.handle_request(req, RequestCtx::default());
     match machine.start() {
         ArbiterReqMachineStep::Completed(Ok(XrpcOutput::Data(json))) => {
             assert_eq!(json.as_str(), Some("image/png"));
@@ -463,7 +464,7 @@ fn encoding_forwarded_to_sub_policy() {
         input: None,
         encoding: Some("image/png".to_string()),
     };
-    let mut machine = arbiter.handle_request(req);
+    let mut machine = arbiter.handle_request(req, RequestCtx::default());
     match machine.start() {
         ArbiterReqMachineStep::Completed(Ok(XrpcOutput::Data(json))) => {
             assert_eq!(json.as_str(), Some("image/png"));
@@ -492,7 +493,7 @@ fn sub_policy_encoding_defaults_to_null() {
     subs.insert("echo".to_string(), sub);
     let arbiter = Arbiter::new(Policies::new(root, subs));
 
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None));
+    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
     match machine.start() {
         ArbiterReqMachineStep::Completed(Ok(XrpcOutput::Data(json))) => {
             assert_eq!(json, serde_json::Value::Null);
@@ -514,7 +515,7 @@ fn unknown_host_function_returns_error_envelope() {
         &["unknown_fn"],
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None));
+    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
 
     match machine.start() {
         ArbiterReqMachineStep::Completed(Err(err)) => {

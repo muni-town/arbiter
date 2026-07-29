@@ -1,16 +1,10 @@
 use serde_json::Value as JsonValue;
 
-/// A destination for an XRPC request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum XrpcEndpoint {
-    /// The request should be sent to the PDS account that is managed by this
-    /// arbiter.
-    PdsAccount,
-    /// The request should be sent to a remote XRPC endpoint. This should be a
-    /// valid DID with a service endpoint suffix such as `#atproto_pds`, but it
-    /// is not validated by this library.
-    Remote(String),
-}
+/// A destination for an XRPC request: a DID with a service endpoint suffix
+/// such as `did:web:example.com#atproto_pds`. The DID is not validated by this
+/// library; the endpoint to use (including the arbiter's own PDS account)
+/// is supplied by the policy, e.g. via its input.
+pub type XrpcEndpoint = String;
 
 pub type XrpcRequest = atrium_xrpc::XrpcRequest<JsonValue, JsonValue>;
 pub type XrpcResult = Result<XrpcOutput, XrpcError>;

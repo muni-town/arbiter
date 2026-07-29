@@ -1,5 +1,5 @@
 use crate::{
-    arbiter::{Arbiter, ArbiterReqMachine, ArbiterReqMachineStep, Policies},
+    arbiter::{Arbiter, ArbiterReqMachine, ArbiterReqMachineStep, Policies, RequestCtx},
     xrpc::{XrpcEndpoint, XrpcRequest, XrpcResult},
 };
 
@@ -45,8 +45,8 @@ impl<Io: ArbiterAsyncIo> AsyncArbiter<Io> {
     }
 
     /// Handle an XRPC request by routing through the arbiter's policies.
-    pub async fn handle_request(&self, req: XrpcRequest) -> XrpcResult {
-        ArbiterReqMachine::new(self.policies.clone(), req)
+    pub async fn handle_request(&self, req: XrpcRequest, ctx: RequestCtx) -> XrpcResult {
+        ArbiterReqMachine::new(self.policies.clone(), req, ctx)
             .into_future(&self.io)
             .await
     }

@@ -27,6 +27,25 @@ pub const BYTES_KEY: &str = "$__bytes__";
 /// limit.
 const MAX_POLICY_DEPTH: usize = 16;
 
+/// Per-request context injected into the Rego policy's `input` value.
+///
+/// These fields vary per request and have no other delivery channel (the
+/// `PolicyVm`'s `data` is baked at compile time and `request_to_input`
+/// otherwise only carries the XRPC method/params/body). The policy reads them
+/// as `input.arbiterDid`, `input.pdsEndpoint`, `input.callerDid`, and
+/// `input.xrpcEndpoint`.
+#[derive(Debug, Clone, Default)]
+pub struct RequestCtx {
+    /// The DID of the stewarded account this arbiter is named after; the
+    /// subject the request acts on behalf of.
+    pub arbiter_did: String,
+    /// The stewarded account's PDS endpoint URL (`#atproto_pds` resolved).
+    pub pds_endpoint: String,
+    /// The verified caller DID (from the serviceAuth token `sub`).
+    pub caller_did: String,
+    /// The destination `did#service` the policy should forward to.
+    pub xrpc_endpoint: String,
+}
 /// The state of an arbiter for an individual ATProto account.
 #[derive(Debug)]
 pub struct Arbiter {
@@ -37,8 +56,8 @@ pub struct Arbiter {
 impl Arbiter {
     /// Create a new arbiter from the given root and sub-policies.
     ///
-    /// The policies must have been compiled with the `pds`, `xrpc`, and
-    /// `policy` builtins registered as async host functions (see
+    /// The policies must have been compiled with the `xrpc` and `policy`
+    /// builtins registered as async host functions (see
     /// [`PolicyVm::new`]); the request machine interprets those host calls.
     pub fn new(policies: Policies) -> Self {
         Self { policies }
@@ -46,8 +65,8 @@ impl Arbiter {
 
     /// Get a state machine that may be driven to respond to the provided XRPC
     /// request.
-    pub fn handle_request(&self, req: XrpcRequest) -> ArbiterReqMachine {
-        ArbiterReqMachine::new(self.policies.clone(), req)
+    pub fn handle_request(&self, req: XrpcRequest, ctx: RequestCtx) -> ArbiterReqMachine {
+        ArbiterReqMachine::new(self.policies.clone(), req, ctx)
     }
 }
 
@@ -89,8 +108,8 @@ impl Policies {
 /// completion by the caller.
 ///
 /// The machine is sans-io: it runs the installed Rego policies and, whenever a
-/// policy triggers a request to a remote XRPC endpoint (via the `pds` or
-/// `xrpc` host functions), it suspends and surfaces a
+/// policy triggers a request to a remote XRPC endpoint (via the `xrpc` host
+/// function), it suspends and surfaces a
 /// [`ArbiterReqMachineStep::RemoteXrpcRequest`] to the caller. The caller is
 /// responsible for actually issuing the request and feeding the response back
 /// in via [`ArbiterReqMachine::resume`].
@@ -106,6 +125,7 @@ pub struct ArbiterReqMachine {
     buffers: Vec<Vec<u8>>,
     /// The current status of the machine.
     status: ArbiterReqMachineStatus,
+    ctx: RequestCtx,
 }
 
 impl std::fmt::Debug for ArbiterReqMachine {
@@ -229,12 +249,13 @@ impl std::fmt::Debug for ArbiterReqMachineStep {
 
 impl ArbiterReqMachine {
     /// Create a new [`ArbiterReqMachine]
-    pub fn new(policies: Policies, req: XrpcRequest) -> Self {
+    pub fn new(policies: Policies, req: XrpcRequest, ctx: RequestCtx) -> Self {
         Self {
             req,
             policies,
             buffers: Vec::new(),
             status: ArbiterReqMachineStatus::Init,
+            ctx,
         }
     }
 
@@ -273,7 +294,7 @@ impl ArbiterReqMachine {
     /// Errors here (e.g. policy compilation/input conversion failures) are
     /// converted to an error XRPC response by [`Self::drive_from`].
     fn start_inner(&mut self) -> Result<(PolicyVm, Vec<PolicyVm>, PolicyVmOutput)> {
-        let input = Self::request_to_input(&mut self.buffers, &self.req)?;
+        let input = Self::request_to_input(&mut self.buffers, &self.req, &self.ctx)?;
         let mut root = self.policies.root().clone();
         let output = root.start(input)?;
         Ok((root, Vec::new(), output))
@@ -346,7 +367,7 @@ impl ArbiterReqMachine {
     ///
     /// - completes with no callers left (the root policy finished) → emits
     ///   [`ArbiterReqMachineStep::Completed`], or
-    /// - triggers a `pds`/`xrpc` host call → suspends, stashes the stack into
+    /// - triggers an `xrpc` host call → suspends, stashes the stack into
     ///   [`ArbiterReqMachineStatus::WaitingOnRemoteXrpcResp`], and emits
     ///   [`ArbiterReqMachineStep::RemoteXrpcRequest`].
     ///
@@ -400,12 +421,8 @@ impl ArbiterReqMachine {
                             frame = sub;
                             output = sub_output;
                         }
-                        "pds" | "xrpc" => {
-                            let endpoint = if fn_name == "pds" {
-                                XrpcEndpoint::PdsAccount
-                            } else {
-                                XrpcEndpoint::Remote(Self::field_string(&arg, "did")?)
-                            };
+                        "xrpc" => {
+                            let endpoint = Self::field_string(&arg, "did")?;
                             let request = Self::arg_to_xrpc_request(&self.buffers, &arg)?;
                             self.status = ArbiterReqMachineStatus::WaitingOnRemoteXrpcResp {
                                 frame: Box::new(frame),
@@ -453,7 +470,11 @@ impl ArbiterReqMachine {
     /// The input has the shape `{ method, nsid, parameters, body }`, where
     /// `body` is either the JSON value or a [`BYTES_KEY`] marker (with the
     /// bytes stashed into `buffers`).
-    fn request_to_input(buffers: &mut Vec<Vec<u8>>, req: &XrpcRequest) -> Result<Value> {
+    fn request_to_input(
+        buffers: &mut Vec<Vec<u8>>,
+        req: &XrpcRequest,
+        ctx: &RequestCtx,
+    ) -> Result<Value> {
         let mut input = Object::new();
         input.insert(Value::from("method"), Value::from(req.method.as_str()));
         input.insert(Value::from("nsid"), Value::from(req.nsid.as_str()));
@@ -472,14 +493,19 @@ impl ArbiterReqMachine {
             Value::from("encoding"),
             req.encoding.clone().map(Value::from).unwrap_or(Value::Null),
         );
+        // Per-request context (see `RequestCtx`).
+        input.insert(Value::from("arbiterDid"), Value::from(ctx.arbiter_did.as_str()));
+        input.insert(Value::from("pdsEndpoint"), Value::from(ctx.pds_endpoint.as_str()));
+        input.insert(Value::from("callerDid"), Value::from(ctx.caller_did.as_str()));
+        input.insert(Value::from("xrpcEndpoint"), Value::from(ctx.xrpc_endpoint.as_str()));
         Ok(input.into_value())
     }
 
-    /// Convert a `pds`/`xrpc` host-call argument object into an
+    /// Convert an `xrpc` host-call argument object into an
     /// [`XrpcRequest`] suitable for issuing to a remote endpoint.
     ///
-    /// The argument has the shape `{ method, nsid, parameters, body }` (plus
-    /// `did` for `xrpc`). A `body` that is a [`BYTES_KEY`] marker is resolved
+    /// The argument has the shape `{ did, method, nsid, parameters, body }`. A
+    /// `body` that is a [`BYTES_KEY`] marker is resolved
     /// against `buffers`; otherwise the body is treated as JSON.
     fn arg_to_xrpc_request(buffers: &[Vec<u8>], arg: &Value) -> Result<XrpcRequest> {
         let method_str = Self::field_string(arg, "method")?;
@@ -600,7 +626,7 @@ impl ArbiterReqMachine {
     }
 
     /// Convert an [`XrpcResult`] into the ok/err envelope value that is passed
-    /// back to a policy as the result of a `pds`/`xrpc` host call (and,
+    /// back to a policy as the result of an `xrpc` host call (and,
     /// symmetrically, produced by sub-policies).
     ///
     /// A `Bytes` output is stashed into `buffers` and represented via a

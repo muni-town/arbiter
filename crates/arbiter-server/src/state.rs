@@ -1,204 +1,116 @@
-//! Server state — collection of arbiter state machines.
+//! In-memory collection of active arbiters, keyed by stewarded-account DID.
 //!
-//! Each arbiter is a full [`arbiter_core::StateMachine`] backed by a PDS
-//! account.  The collection is locked behind a single `tokio::sync::Mutex`
-//! in [`ServerState`].
-//!
-//! Persistence stores [`ArbiterState`](arbiter_core::ArbiterState) data in
-//! `state.json` and PDS account credentials in `pds-arbiters.json`
-//! (separate file so it can be encrypted independently in future).
+//! One arbiter per stewarded account (SERVER_PLAN.md §1). All methods take a
+//! short-lived lock: `begin_request` only holds the lock long enough to create
+//! the owned request machine, then releases it before the caller does any
+//! async I/O.
 
 use std::collections::HashMap;
 
-use arbiter_core::{ArbiterState, MemberEntry, Space, SpaceId, StateMachine};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use arbiter_core::arbiter::{Arbiter, ArbiterReqMachine, RequestCtx};
+use arbiter_core::xrpc::XrpcRequest;
+use tokio::sync::Mutex;
 
-type Did = String;
+use crate::error::AppError;
 
-/// PDS account — stored alongside every arbiter.
-///
-/// Used to proxy XRPC requests during policy evaluation through the
-/// associated PDS.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PdsCredentials {
-    /// The app password (stored locally for proxied auth).
-    pub app_password: String,
+/// A loaded arbiter plus its per-arbiter state.
+struct ArbiterEntry {
+    arbiter: Arbiter,
+    pds_endpoint: String,
+    /// Last-applied repo `rev` per policy/service record key, for monotonic
+    /// reload (SERVER_PLAN.md §4).
+    revs: HashMap<String, String>,
 }
 
-// ---------------------------------------------------------------------------
-// Snapshot types (JSON-serializable full state)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpaceSnapshot {
-    pub key: String,
-    pub space_type: String,
-    pub config: Value,
-    pub members: Vec<MemberEntry>,
+/// The result of beginning a request: an owned request machine (the arbiter's
+/// policies have been cloned into it) plus the stewarded account's PDS
+/// endpoint, so the caller can drive the machine and proxy without holding the
+/// collection lock.
+pub struct RequestDrive {
+    pub machine: ArbiterReqMachine,
+    pub pds_endpoint: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArbiterSnapshot {
-    pub did: Did,
-    pub version: u64,
-    pub config: Value,
-    pub spaces: Vec<SpaceSnapshot>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerSnapshot {
-    pub arbiters: Vec<ArbiterSnapshot>,
-}
-
-/// Snapshot of an arbiter's PDS credentials.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PdsArbiterSnapshot {
-    pub did: Did,
-    pub pds_account: PdsCredentials,
-}
-
-/// All arbiter PDS accounts.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct PdsArbiterSnapshotSet {
-    pub arbiters: Vec<PdsArbiterSnapshot>,
-}
-
-// ---------------------------------------------------------------------------
-// ArbiterCollection — all state machines
-// ---------------------------------------------------------------------------
-
-/// All arbiter state machines managed by this server.
-///
-/// Every arbiter has an associated PDS account for proxying XRPC requests.
-/// Locked behind [`tokio::sync::Mutex`] in [`ServerState`](crate::ServerState).
+/// The set of currently-active arbiters.
 #[derive(Default)]
 pub struct ArbiterCollection {
-    pub arbiters: HashMap<Did, StateMachine>,
-    /// PDS accounts for proxying XRPC requests, keyed by arbiter DID.
-    pub pds_accounts: HashMap<Did, PdsCredentials>,
+    inner: Mutex<HashMap<String, ArbiterEntry>>,
 }
 
 impl ArbiterCollection {
     pub fn new() -> Self {
-        Self {
-            arbiters: HashMap::new(),
-            pds_accounts: HashMap::new(),
+        Self::default()
+    }
+
+    /// Onboard (or replace) an arbiter for the given DID with freshly loaded
+    /// policies. Resets rev tracking.
+    pub async fn onboard(&self, did: String, arbiter: Arbiter, pds_endpoint: String) {
+        let mut map = self.inner.lock().await;
+        map.insert(
+            did,
+            ArbiterEntry {
+                arbiter,
+                pds_endpoint,
+                revs: HashMap::new(),
+            },
+        );
+    }
+
+    /// Replace an existing arbiter's policies (hot reload), keeping its PDS
+    /// endpoint and rev tracking. No-op if the arbiter is not active.
+    pub async fn update_policies(&self, did: &str, arbiter: Arbiter) {
+        let mut map = self.inner.lock().await;
+        if let Some(entry) = map.get_mut(did) {
+            entry.arbiter = arbiter;
         }
     }
 
-    pub fn get(&self, did: &str) -> Option<&StateMachine> {
-        self.arbiters.get(did)
+    /// Stop serving an arbiter (e.g. its service record disappeared). Keeps
+    /// credentials; the arbiter may be re-onboarded later. Returns was-active.
+    pub async fn offboard(&self, did: &str) -> bool {
+        self.inner.lock().await.remove(did).is_some()
     }
 
-    pub fn get_mut(&mut self, did: &str) -> Option<&mut StateMachine> {
-        self.arbiters.get_mut(did)
+    /// Whether an arbiter is currently active (policies loaded).
+    pub async fn contains(&self, did: &str) -> bool {
+        self.inner.lock().await.contains_key(did)
     }
 
-    /// Create an arbiter backed by a PDS account.  All XRPC requests
-    /// triggered during policy evaluation are proxied through the PDS.
-    pub fn create_arbiter_with_app_password(
-        &mut self,
-        did: Did,
-        config: Value,
-        pds_account: PdsCredentials,
-    ) -> anyhow::Result<()> {
-        let sm = StateMachine::create(did.clone(), config)?;
-        self.pds_accounts.insert(did.clone(), pds_account);
-        self.arbiters.insert(did, sm);
-
-        Ok(())
+    /// Begin a request against the arbiter for `did`. Fail-closed: a missing
+    /// arbiter (not yet loaded / offboarded) yields `ArbiterNotReady`.
+    pub async fn begin_request(
+        &self,
+        did: &str,
+        req: XrpcRequest,
+        ctx: RequestCtx,
+    ) -> Result<RequestDrive, AppError> {
+        let mut map = self.inner.lock().await;
+        let entry = map
+            .get_mut(did)
+            .ok_or_else(|| AppError::ArbiterNotReady(did.to_string()))?;
+        let machine = entry.arbiter.handle_request(req, ctx);
+        Ok(RequestDrive {
+            machine,
+            pds_endpoint: entry.pds_endpoint.clone(),
+        })
     }
 
-    /// Get the PDS account associated with an arbiter, if any.
-    pub fn get_pds_credential(&self, arbiter_did: &str) -> Option<&PdsCredentials> {
-        self.pds_accounts.get(arbiter_did)
-    }
-
-    // -------------------------------------------------------------------
-    // Snapshot / serialisation
-    // -------------------------------------------------------------------
-
-    pub fn snapshot(&self) -> ServerSnapshot {
-        let arbiters: Vec<ArbiterSnapshot> = self
-            .arbiters
-            .values()
-            .map(|sm| {
-                let arb = &sm.arbiter;
-                let spaces: Vec<SpaceSnapshot> = arb
-                    .spaces
-                    .values()
-                    .map(|s| SpaceSnapshot {
-                        key: s.key.clone(),
-                        space_type: s.space_type.clone(),
-                        config: s.config.clone(),
-                        members: s.members.clone(),
-                    })
-                    .collect();
-                ArbiterSnapshot {
-                    did: arb.did.clone(),
-                    version: arb.version,
-                    config: arb.config.clone(),
-                    spaces,
-                }
-            })
-            .collect();
-        ServerSnapshot { arbiters }
-    }
-
-    pub fn load_snapshot(&mut self, snapshot: ServerSnapshot) {
-        self.arbiters.clear();
-        for a in snapshot.arbiters {
-            let spaces: HashMap<SpaceId, Space> = a
-                .spaces
-                .into_iter()
-                .map(|s| {
-                    let space = Space {
-                        key: s.key.clone(),
-                        space_type: s.space_type.clone(),
-                        config: s.config,
-                        members: s.members,
-                    };
-                    let id = SpaceId {
-                        space_key: space.key.clone(),
-                        space_type: space.space_type.clone(),
-                    };
-                    (id, space)
-                })
-                .collect();
-            let arb_state = ArbiterState {
-                did: a.did.clone(),
-                version: a.version,
-                config: a.config,
-                spaces,
-            };
-            self.arbiters.insert(a.did, StateMachine::new(arb_state));
+    /// Whether the given `rev` is strictly newer than the last-applied rev for
+    /// `key` (string comparison; atproto repo revs are TID-based and
+    /// lexicographically ordered), or if no rev is stored yet.
+    pub async fn is_newer(&self, did: &str, key: &str, rev: &str) -> bool {
+        let map = self.inner.lock().await;
+        match map.get(did) {
+            Some(entry) => entry.revs.get(key).map_or(true, |old| rev > old.as_str()),
+            None => false,
         }
     }
 
-    /// Load PDS account data from a snapshot (loaded separately from main state).
-    pub fn load_pds_snapshot(&mut self, snapshot: PdsArbiterSnapshotSet) {
-        for a in snapshot.arbiters {
-            self.pds_accounts.insert(a.did, a.pds_account);
+    /// Record the last-applied `rev` for a record key.
+    pub async fn set_rev(&self, did: &str, key: &str, rev: String) {
+        let mut map = self.inner.lock().await;
+        if let Some(entry) = map.get_mut(did) {
+            entry.revs.insert(key.to_string(), rev);
         }
-    }
-
-    /// Snapshot just the PDS accounts (for separate persistence).
-    pub fn pds_snapshot(&self) -> PdsArbiterSnapshotSet {
-        let arbiters = self
-            .pds_accounts
-            .iter()
-            .map(|(did, account)| PdsArbiterSnapshot {
-                did: did.clone(),
-                pds_account: account.clone(),
-            })
-            .collect();
-        PdsArbiterSnapshotSet { arbiters }
-    }
-
-    /// Remove an arbiter by DID.  Returns `true` if it existed.
-    pub fn remove(&mut self, did: &str) -> bool {
-        self.pds_accounts.remove(did);
-        self.arbiters.remove(did).is_some()
     }
 }

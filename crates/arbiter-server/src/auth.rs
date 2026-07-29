@@ -1,120 +1,147 @@
-//! Auth middleware for the arbiter XRPC server.
+//! serviceAuth verification (SERVER_PLAN.md §2).
 //!
-//! Extracts the caller DID from:
-//! 1. `Authorization: Bearer <JWT>` — verifies the JWT signature against
-//!    the issuer's resolved DID document using atproto-identity.
-//! 2. `Authorization: Bearer <token>` — with the unsafe dev token (if configured).
+//! `CallerDid` is an axum extractor that verifies the caller's serviceAuth JWT
+//! (issued by the caller's PDS via `com.atproto.server.getServiceAuth`) and
+//! yields the caller DID (token `sub`) and the bound `lxm`.
+//!
+//! Verification model: the token is signed **by the caller's PDS**, not by the
+//! account itself. The `iss` claim is the PDS DID; we resolve that PDS DID
+//! document, extract its signing key from the verification methods, and verify
+//! the JWT signature against it. This is a different key path than verifying
+//! against the caller's own DID-document keys.
 
-use atproto_identity::key;
+use std::sync::LazyLock;
+
+use atproto_identity::key::{identify_key, KeyData};
 use atproto_oauth::encoding::FromBase64;
-use atproto_oauth::jwt;
-use salvo::prelude::*;
+use atproto_oauth::jwt::{verify, Claims};
+use axum::extract::FromRequestParts;
+use axum::http::header::AUTHORIZATION;
+use axum::http::request::Parts;
+use moka::future::Cache;
 
+use crate::error::AppError;
 use crate::resolver::RESOLVER;
+use crate::CONFIG;
 
-pub struct CallerDid(String);
-impl std::ops::Deref for CallerDid {
-    type Target = str;
-    fn deref(&self) -> &Self::Target {
-        self.0.as_str()
-    }
+/// Cache of PDS signing keys, keyed by PDS DID (the JWT `iss` claim).
+///
+/// serviceAuth tokens are signed by the caller's PDS, so the verifying key is
+/// read from the PDS DID document (not the account's). Resolving a DID document
+/// on every request would be expensive and rate-limit-prone, so the extracted
+/// `KeyData` is memoized here.
+static PDS_SIGNING_KEYS: LazyLock<Cache<String, KeyData>> = LazyLock::new(|| Cache::new(256));
+
+/// The verified caller, extracted from a `Authorization: Bearer <serviceAuth>`
+/// token. `did` is the token `sub`; `lxm` is the bound XRPC method. The
+/// **handler** is responsible for checking `lxm == <request path NSID>` (the
+/// extractor cannot see the path).
+pub struct CallerDid {
+    pub did: String,
+    pub lxm: String,
 }
 
-/// Auth middleware that extracts the caller DID from JWT tokens.
-#[derive(Clone)]
-pub struct AuthMiddleware;
+impl<S> FromRequestParts<S> for CallerDid
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
 
-#[async_trait]
-impl salvo::Handler for AuthMiddleware {
-    async fn handle(
-        &self,
-        req: &mut Request,
-        depot: &mut Depot,
-        res: &mut Response,
-        ctrl: &mut FlowCtrl,
-    ) {
-        // Try to extract Authorization: Bearer <token>
-        let auth_header = req
-            .header::<&str>("authorization")
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .map(|s| s.to_string());
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        // 1. Extract `Authorization: Bearer <jwt>`.
+        let header = parts
+            .headers
+            .get(AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .ok_or_else(|| AppError::Unauthorized("missing Authorization header".into()))?;
+        let jwt = header
+            .strip_prefix("Bearer ")
+            .ok_or_else(|| {
+                AppError::Unauthorized("Authorization header is not a Bearer token".into())
+            })?
+            .trim();
+        if jwt.is_empty() {
+            return Err(AppError::Unauthorized("empty Bearer token".into()));
+        }
 
-        let caller_did = match auth_header {
-            Some(token) => match verify_jwt(&token).await {
-                Ok(did) => did,
-                Err(e) => {
-                    res.status_code(StatusCode::FORBIDDEN)
-                        .render(Json(serde_json::json!({
-                            "error": "ErrAccessDenied",
-                            "message": format!("JWT verification failed: {e}")
-                        })));
-                    return;
-                }
-            },
+        // 2. Decode the claims WITHOUT verifying, to read `iss` (the PDS DID)
+        //    so we know which PDS signing key to verify against.
+        let claims_segment = jwt
+            .split('.')
+            .nth(1)
+            .ok_or_else(|| AppError::Unauthorized("malformed serviceAuth JWT".into()))?;
+        let unverified: Claims = Claims::from_base64(claims_segment).map_err(|e| {
+            AppError::Unauthorized(format!("unable to decode serviceAuth claims: {e}"))
+        })?;
+        let pds_did = unverified
+            .jose
+            .issuer
+            .as_deref()
+            .ok_or_else(|| AppError::Unauthorized("serviceAuth missing `iss` claim".into()))?;
+
+        // 3. Resolve the PDS signing key (cached, keyed by PDS DID).
+        let key_data = match PDS_SIGNING_KEYS.get(pds_did).await {
+            Some(k) => k,
             None => {
-                res.status_code(StatusCode::FORBIDDEN)
-                    .render(Json(serde_json::json!({
-                        "error": "ErrAccessDenied",
-                        "message": format!("Missing authorization header"),
-                    })));
-                return;
+                let key = resolve_pds_signing_key(pds_did).await?;
+                PDS_SIGNING_KEYS
+                    .insert(pds_did.to_string(), key.clone())
+                    .await;
+                key
             }
         };
 
-        depot.inject(CallerDid(caller_did));
-        ctrl.call_next(req, depot, res).await;
-    }
-}
+        // 4. Verify the JWT signature against the PDS signing key. `verify`
+        //    also rejects expired (`exp` past) and not-yet-valid (`nbf`) tokens.
+        let claims = verify(jwt, &key_data).map_err(|e| {
+            AppError::Unauthorized(format!("serviceAuth verification failed: {e}"))
+        })?;
 
-/// Verify a JWT token and extract the issuer DID.
-///
-/// Steps:
-/// 1. Decode claims to get the issuer DID
-/// 2. Resolve the DID document via the identity resolver
-/// 3. Extract public keys from the DID document
-/// 4. Verify the JWT signature against each key
-async fn verify_jwt(token: &str) -> anyhow::Result<String> {
-    let issuer = decode_jwt_issuer(token)?;
-
-    // Resolve the DID document
-    let did_document = RESOLVER
-        .resolve(&issuer)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to resolve DID {issuer}: {e}"))?;
-
-    // Extract public keys from the DID document
-    let did_keys = did_document.did_keys();
-    if did_keys.is_empty() {
-        anyhow::bail!("No verification keys in DID document for {issuer}");
-    }
-
-    // Try to verify the JWT signature with each key
-    for key_multibase in did_keys {
-        let Ok(key_data) = key::identify_key(key_multibase) else {
-            continue;
-        };
-        if jwt::verify(token, &key_data).is_ok() {
-            return Ok(issuer);
+        // 5. Check `aud == CONFIG.server_did`.
+        let aud = claims
+            .jose
+            .audience
+            .as_deref()
+            .ok_or_else(|| AppError::Unauthorized("serviceAuth missing `aud` claim".into()))?;
+        if aud != CONFIG.server_did {
+            return Err(AppError::Unauthorized(format!(
+                "serviceAuth `aud` `{aud}` does not match this server `{}`",
+                CONFIG.server_did
+            )));
         }
-    }
 
-    anyhow::bail!("JWT signature could not be verified with any key for {issuer}");
+        // 6. Extract `sub` (caller DID) and `lxm` (bound NSID).
+        let did = claims
+            .jose
+            .subject
+            .ok_or_else(|| AppError::Unauthorized("serviceAuth missing `sub` claim".into()))?;
+        let lxm = claims
+            .private
+            .get("lxm")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| AppError::Unauthorized("serviceAuth missing `lxm` claim".into()))?;
+
+        Ok(CallerDid { did, lxm })
+    }
 }
 
-/// Extract the issuer DID from a JWT without full signature verification.
-/// Only the claims payload is decoded (without verification) to determine
-/// which DID to resolve. Actual signature verification happens afterward
-/// via `jwt::verify` once the DID document's keys are obtained.
-fn decode_jwt_issuer(token: &str) -> anyhow::Result<String> {
-    let payload = token
-        .split('.')
-        .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("Invalid JWT: expected 3 parts"))?;
-
-    let claims = jwt::Claims::from_base64(payload)?;
-
-    claims
-        .jose
-        .issuer
-        .ok_or_else(|| anyhow::anyhow!("JWT missing required 'iss' claim"))
+/// Resolve a PDS DID document via `RESOLVER` and extract its signing key from
+/// the first `Multikey` verification method.
+async fn resolve_pds_signing_key(pds_did: &str) -> Result<KeyData, AppError> {
+    let doc = RESOLVER.resolve(pds_did).await.map_err(|e| {
+        AppError::Unauthorized(format!("unable to resolve PDS DID `{pds_did}`: {e}"))
+    })?;
+    let multibase = doc.did_keys().into_iter().next().ok_or_else(|| {
+        AppError::Unauthorized(format!("PDS `{pds_did}` exposes no signing key"))
+    })?;
+    // `did_keys()` returns the raw multibase value; `identify_key` expects a
+    // `did:key:`-prefixed (or bare multibase) string.
+    let full = if multibase.starts_with("did:key:") {
+        multibase.to_string()
+    } else {
+        format!("did:key:{multibase}")
+    };
+    identify_key(&full)
+        .map_err(|e| AppError::Unauthorized(format!("invalid PDS signing key: {e}")))
 }

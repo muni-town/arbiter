@@ -10,17 +10,33 @@ path = "src/main.rs"
 [dependencies]
 arbiter-core = { path = "../arbiter-core" }
 anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
-salvo = { version = "0.76", features = ["affix-state", "server", "cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+moka = { version = "0.12", features = ["future"] }
 atproto-identity = "0.14.5"
 atproto-oauth = "0.14.5"
 atrium-xrpc-client = { version = "0.5.15", features = ["reqwest"], default-features = false }
-moka = { version = "0.12.15", features = ["future"] }
 atrium-xrpc = "0.12.4"
 atrium-api = { version = "0.25.8", default-features = false, features = ["agent"] }
+regorus = { version = "0.11.0", default-features = false, features = ["rvm", "arc", "std"] }
+# --- Turso/libSQL durable credential storage (storage agent) ---
+# libSQL client: connects to a local libSQL file or a remote Turso Cloud database.
+libsql = { version = "0.9", default-features = false, features = ["core", "remote", "tls"] }
+# AES-256-GCM for encrypting the password field at rest.
+aes-gcm = "0.11"
+# base64 encoding of the encryption key and encrypted password blobs.
+base64 = "0.22"
+# --- Jetstream subscription (policy/service-record hot reload) ---
+# Raw WebSocket consumer for ATProto Jetstream commit events.
+tokio-tungstenite = { version = "0.26", features = ["connect", "rustls-tls-native-roots"] }
+futures-util = "0.3"
