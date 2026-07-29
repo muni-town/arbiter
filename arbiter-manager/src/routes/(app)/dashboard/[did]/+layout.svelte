@@ -26,7 +26,7 @@
     hasArbiter = false;
     checkError = null;
 
-    arbiter.hasService(did).then((ok) => {
+    arbiter.hasArbiterService(did).then((ok) => {
       if (cancelled) return;
       hasArbiter = ok;
       checking = false;
@@ -41,10 +41,9 @@
 
   const activeTab = $derived.by(() => {
     const path = page.url.pathname;
-    if (path.endsWith('/spaces')) return 'Spaces';
     if (path.endsWith('/policy')) return 'Policy';
     if (path.endsWith('/debug')) return 'Debug';
-    return 'Spaces';
+    return 'Policy';
   });
 </script>
 
@@ -67,15 +66,15 @@
         No arbiter service found
       </p>
       <p class="text-xs text-amber-700 dark:text-amber-400 mt-1">
-        This account does not have an <code class="font-mono">#arbiter</code> service endpoint on its
-        DID document. Only accounts with a Muni Town arbiter can be managed here.
+        This account does not have a <code class="font-mono">town.muni.arbiter.service/self</code>
+        record on its PDS repo. Only accounts with a Muni Town arbiter service record can be
+        managed here.
       </p>
     </Box>
   {:else}
     <!-- Tabs navigation -->
     <Tabs
       items={[
-        { name: 'Spaces', href: `/dashboard/${encodeURIComponent(did)}/spaces` },
         { name: 'Policy', href: `/dashboard/${encodeURIComponent(did)}/policy` },
         { name: 'Debug', href: `/dashboard/${encodeURIComponent(did)}/debug` },
       ]}

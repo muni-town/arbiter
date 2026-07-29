@@ -40,8 +40,7 @@
   <div class="flex flex-col gap-4 py-2">
     <div class="flex flex-col gap-2">
       <p class="text-sm text-base-600 dark:text-base-400">
-        Type a handle to find the account. It must have an
-        <code class="font-mono text-xs">#arbiter</code> service to be managed here.
+        Type a handle to find the account. It must have an arbiter service record
       </p>
       <AtprotoHandlePopup onselected={onSelect} />
       {#if error}

@@ -2,13 +2,15 @@
   import { Button } from '@foxui/core';
   import { setupState } from '$lib/setupState.svelte';
   import { AtprotoHandlePopup, type Profile } from '@foxui/all';
-  import { PUBLIC_ARBITER_URL } from '$env/static/public';
+  import { PUBLIC_ARBITER_URL, PUBLIC_ARBITER_DID } from '$env/static/public';
+  import type { AtprotoDid } from '@atcute/lexicons/syntax';
   import { auth } from '$lib/auth.svelte';
   import * as town from '$lib/lexicons/town';
   import * as com from '$lib/lexicons/com';
   import { isAtprotoDid } from '@atproto/oauth-client-browser';
   import { xrpc } from '@atproto/lex';
   import { defaultPolicyWithOwner } from '$lib/default-policy';
+  import { arbiter } from '$lib/arbiter';
 
   let selectedAdmin: Profile | undefined = $state(undefined);
 
@@ -33,28 +35,28 @@
       let token = (
         await auth.client.xrpc(com.atproto.server.getServiceAuth, {
           params: {
-            aud: auth.did,
+            aud: PUBLIC_ARBITER_DID as AtprotoDid,
             lxm: 'town.muni.arbiter.createAppPasswordArbiter',
           },
         })
       ).body.token;
 
-      // Create the new arbiter!
+      // Import the existing account as a stewarded arbiter.
       await xrpc(PUBLIC_ARBITER_URL, town.muni.arbiter.createAppPasswordArbiter, {
         body: {
           arbiterDid: auth.did,
           appPassword: setupState.appPassword,
-          replaceExisting: true,
-          config: {
-            $type: 'town.muni.arbiter.server.v1.config',
-            policy: defaultPolicyWithOwner(selectedAdmin.did),
-          } as any,
         },
         headers: {
-          'atproto-proxy': `${auth.did}#arbiter`,
+          'arbiter-did': auth.did,
+          'arbiter-proxy': `${auth.did}#atproto_pds`,
           authorization: `Bearer ${token}`,
         },
       });
+
+      // Write the initial root policy as a PDS record (proxied through the
+      // arbiter), substituting the selected admin as the owner.
+      await arbiter.setPolicy(auth.did, defaultPolicyWithOwner(selectedAdmin.did));
 
       setupState.step = 'complete';
       setupState.error = undefined;

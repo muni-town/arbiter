@@ -7,6 +7,10 @@ edition = "2024"
 name = "arbiter-server"
 path = "src/main.rs"
 
+[lib]
+name = "arbiter_server"
+path = "src/lib.rs"
+
 [dependencies]
 arbiter-core = { path = "../arbiter-core" }
 anyhow = "1"

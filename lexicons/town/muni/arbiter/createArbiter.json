@@ -4,52 +4,25 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Create a new arbiter.\n\nThe return type is an open union that will contain a `$type` key and may be\ndifferent depending on the server and/or the provided config `$type`.",
-      "input": {
+      "description": "Provision a brand-new stewarded PDS account and bring its arbiter online.\n\nThe caller authenticates via serviceAuth (aud = arbiter-server DID,\nlxm = town.muni.arbiter.createArbiter). The server creates a new account\non the configured default PDS using an invite code + random password,\nstores the credentials, writes the service + recovery records from the\nnew account's session, and loads the (default/empty) policies.",
+      "output": {
         "encoding": "application/json",
         "schema": {
           "type": "object",
           "properties": {
-            "arbiterDid": {
-              "type": "string",
-              "format": "did",
-              "description": "The DID of the arbiter.\n\nDifferent servers may have different policies regarding who is allowed\nto create an arbiter for what DIDs.\n\nThe DID will not be created by this procedure: it must be created\nseparately and have its #space_host service pointed to this server."
-            },
-            "config": {
-              "type": "union",
-              "refs": [],
-              "description": "A configuration object for the arbiter.\n\nDifferent servers will support different config lexicons. The NSID of\nthe config lexicon determines what kind of arbiter it is. Different\nkinds of arbiters may have totally different mechanisms for determining\naccess."
-            }
+            "ok": { "type": "boolean" }
           },
-          "required": [
-            "arbiterDid",
-            "config"
-          ]
-        }
-      },
-      "output": {
-        "encoding": "application/json",
-        "schema": {
-          "type": "union",
-          "refs": []
+          "required": ["ok"]
         }
       },
       "errors": [
         {
-          "name": "ErrArbiterAlreadyExists",
-          "description": "The specified DID already has an arbiter for it on this server."
-        },
-        {
           "name": "ErrPermissionDenied",
-          "description": "The requesting user is not allowed to make the request."
+          "description": "The requesting user is not allowed to create an arbiter."
         },
         {
-          "name": "ErrUnsupportedConfigLexicon",
-          "description": "The config lexicon provided is not supported by this server. Different servers\nmay support different config lexicons."
-        },
-        {
-          "name": "ErrInvalidConfig",
-          "description": "The config provided is invalid for some reason other than it being an unsupported\nlexicon."
+          "name": "ErrProvisioningFailed",
+          "description": "Account creation or initial record writes failed."
         }
       ]
     }

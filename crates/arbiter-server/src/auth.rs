@@ -10,9 +10,10 @@
 //! the JWT signature against it. This is a different key path than verifying
 //! against the caller's own DID-document keys.
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use atproto_identity::key::{identify_key, KeyData};
+use atproto_identity::traits::IdentityResolver;
 use atproto_oauth::encoding::FromBase64;
 use atproto_oauth::jwt::{verify, Claims};
 use axum::extract::FromRequestParts;
@@ -21,8 +22,8 @@ use axum::http::request::Parts;
 use moka::future::Cache;
 
 use crate::error::AppError;
-use crate::resolver::RESOLVER;
 use crate::CONFIG;
+use crate::AppState;
 
 /// Cache of PDS signing keys, keyed by PDS DID (the JWT `iss` claim).
 ///
@@ -41,13 +42,13 @@ pub struct CallerDid {
     pub lxm: String,
 }
 
-impl<S> FromRequestParts<S> for CallerDid
-where
-    S: Send + Sync,
-{
+impl FromRequestParts<Arc<AppState>> for CallerDid {
     type Rejection = AppError;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
         // 1. Extract `Authorization: Bearer <jwt>`.
         let header = parts
             .headers
@@ -83,7 +84,7 @@ where
         let key_data = match PDS_SIGNING_KEYS.get(pds_did).await {
             Some(k) => k,
             None => {
-                let key = resolve_pds_signing_key(pds_did).await?;
+                let key = resolve_pds_signing_key(&*state.resolver, pds_did).await?;
                 PDS_SIGNING_KEYS
                     .insert(pds_did.to_string(), key.clone())
                     .await;
@@ -126,10 +127,13 @@ where
     }
 }
 
-/// Resolve a PDS DID document via `RESOLVER` and extract its signing key from
+/// Resolve a PDS DID document via `resolver` and extract its signing key from
 /// the first `Multikey` verification method.
-async fn resolve_pds_signing_key(pds_did: &str) -> Result<KeyData, AppError> {
-    let doc = RESOLVER.resolve(pds_did).await.map_err(|e| {
+pub async fn resolve_pds_signing_key(
+    resolver: &dyn IdentityResolver,
+    pds_did: &str,
+) -> Result<KeyData, AppError> {
+    let doc = resolver.resolve(pds_did).await.map_err(|e| {
         AppError::Unauthorized(format!("unable to resolve PDS DID `{pds_did}`: {e}"))
     })?;
     let multibase = doc.did_keys().into_iter().next().ok_or_else(|| {

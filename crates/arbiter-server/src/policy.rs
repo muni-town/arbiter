@@ -1,10 +1,7 @@
 //! Policy loading from PDS records + startup onboarding (SERVER_PLAN.md §4/§6).
 //!
 //! Records read from each stewarded account's PDS (resolved via
-//! [`crate::resolver::RESOLVER`]):
-//!
-//! - `town.muni.arbiter.service/self` — the service record carrying a `did`
-//!   field pointing at the arbiter **server's** DID. Its presence/contents drive
+//! [`crate::AppState`].resolver):
 //!   the §4 lifecycle (offboard when absent; offboard + purge credentials when it
 //!   points at a different server).
 //! - `town.muni.arbiter.policy.root/self` — the root Rego policy source.
@@ -21,10 +18,8 @@ use arbiter_core::arbiter::{Arbiter, Policies};
 use arbiter_core::policy::PolicyVm;
 use regorus::Value;
 use serde_json::Value as Json;
-
-use crate::resolver::RESOLVER;
+use atproto_identity::traits::IdentityResolver;
 use crate::{AppState, CONFIG};
-
 /// Service record collection + rkey (`town.muni.arbiter.service/self`).
 const SERVICE_COLLECTION: &str = "town.muni.arbiter.service";
 const SERVICE_RKEY: &str = "self";
@@ -81,8 +76,7 @@ pub async fn startup_onboard(state: Arc<AppState>) -> Result<()> {
 /// -> `state.arbiters.offboard(did)`; if its `did` field != `CONFIG.server_did`
 /// -> `offboard` + `state.store.remove(did)`.
 pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
-    // Resolve the stewarded account's PDS endpoint from its DID document.
-    let pds_endpoint = resolve_pds_endpoint(did)
+    let pds_endpoint = resolve_pds_endpoint(&*state.resolver, did)
         .await
         .with_context(|| format!("resolving PDS endpoint for {did}"))?;
 
@@ -193,8 +187,11 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
 }
 
 /// Resolve `did` -> PDS endpoint via the `#atproto_pds` service in its DID doc.
-async fn resolve_pds_endpoint(did: &str) -> Result<String> {
-    let doc = RESOLVER
+pub(crate) async fn resolve_pds_endpoint(
+    resolver: &dyn IdentityResolver,
+    did: &str,
+) -> Result<String> {
+    let doc = resolver
         .resolve(did)
         .await
         .map_err(|e| anyhow!("identity resolution failed for {did}: {e:#}"))?;

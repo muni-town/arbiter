@@ -1,38 +1,17 @@
-//! Muni Town Arbiter Server — ATProto XRPC policy proxy.
+//! Muni Town Arbiter Server — binary entry point.
 //!
-//! See `SERVER_PLAN.md` for the full design and
-//! `local://arbiter-server-contract.md` for the implementation contract.
+//! See `SERVER_PLAN.md` for the full design and `lib.rs` for the library
+//! crate (used by integration tests).
 
 #![forbid(unsafe_code)]
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
-mod auth;
-mod config;
-mod credstore;
-mod error;
-mod handlers;
-mod jetstream;
-mod policy;
-mod proxy;
-mod resolver;
-mod state;
-mod storage;
-
-use clap::Parser;
-use credstore::{CredentialStore, MemoryCredentialStore};
-use state::ArbiterCollection;
-
-pub use config::ServerConfig;
-
-/// Parsed server configuration (clap). Available process-wide via `CONFIG`.
-pub static CONFIG: LazyLock<ServerConfig> = LazyLock::new(ServerConfig::parse);
-
-/// Shared server state handed to every request handler.
-pub struct AppState {
-    pub arbiters: ArbiterCollection,
-    pub store: Box<dyn CredentialStore>,
-}
+use arbiter_server::{
+    credstore::{CredentialStore, MemoryCredentialStore},
+    handlers, jetstream, policy, resolver::RESOLVER, state::ArbiterCollection, storage,
+    AppState, CONFIG,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -58,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         arbiters: ArbiterCollection::new(),
         store,
+        resolver: RESOLVER.clone(),
     });
 
     // Load + onboard every known arbiter (fail-closed per arbiter; un-onboarded

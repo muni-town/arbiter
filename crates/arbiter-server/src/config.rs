@@ -39,4 +39,9 @@ pub struct ServerConfig {
     /// otherwise the in-memory/JSON store is used.
     #[arg(long = "turso-url", env = "TURSO_URL")]
     pub turso_url: Option<String>,
+
+    /// Handle domain suffix for newly created stewarded accounts
+    /// (e.g. `.muni.town` → handle `arbiter-<random>.muni.town`).
+    #[arg(long = "handle-suffix", env = "HANDLE_SUFFIX", default_value = ".muni.town")]
+    pub handle_suffix: String,
 }

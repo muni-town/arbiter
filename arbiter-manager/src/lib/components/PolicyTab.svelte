@@ -41,10 +41,7 @@
     saveSuccess = false;
 
     try {
-      const config = await arbiter.getConfig(arbiterDid);
-      const rawPolicy =
-        (config.policy as string) ?? '# Enter your Rego policy here\n\nallow = true\n';
-      policy = rawPolicy;
+      policy = await arbiter.getPolicy(arbiterDid);
     } catch (e) {
       error = arbiter.formatError(e);
     } finally {
@@ -70,9 +67,7 @@
     saveSuccess = false;
 
     try {
-      const config = await arbiter.getConfig(arbiterDid);
-      config.policy = policy;
-      await arbiter.setConfig(arbiterDid, config);
+      await arbiter.setPolicy(arbiterDid, policy);
       saveSuccess = true;
     } catch (e) {
       saveError = arbiter.formatError(e);

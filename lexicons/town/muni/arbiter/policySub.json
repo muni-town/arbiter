@@ -1,0 +1,21 @@
+{
+  "lexicon": 1,
+  "id": "town.muni.arbiter.policy.sub",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Named sub-policy for an arbiter. The rkey is the sub-policy name.\nMaps to the HashMap<name, sub> in Policies::new(root, sub_policies).",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "Rego source text for the sub-policy."
+          }
+        },
+        "required": ["source"]
+      }
+    }
+  }
+}

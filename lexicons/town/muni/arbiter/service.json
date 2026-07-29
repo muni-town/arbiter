@@ -1,0 +1,22 @@
+{
+  "lexicon": 1,
+  "id": "town.muni.arbiter.service",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Service record on a stewarded account's repo. Points at the arbiter\nserver's DID (the did:web:... that hosts the #arbiter service).\n\nPresence/absence and the `did` field drive the arbiter lifecycle:\n- Absent → offboard (keep credentials, re-onboard if it returns).\n- `did` != this server → offboard + purge credentials.",
+      "key": "literal:self",
+      "record": {
+        "type": "object",
+        "properties": {
+          "did": {
+            "type": "string",
+            "format": "did",
+            "description": "The arbiter server's DID (e.g. did:web:arbiter.example.com)."
+          }
+        },
+        "required": ["did"]
+      }
+    }
+  }
+}

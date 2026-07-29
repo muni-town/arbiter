@@ -36,7 +36,6 @@ use crate::credstore::PdsCredentials;
 use crate::error::AppError;
 use crate::policy;
 use crate::proxy;
-use crate::resolver::RESOLVER;
 use crate::AppState;
 use crate::CONFIG;
 
@@ -96,7 +95,7 @@ async fn xrpc_handler(
     let arbiter_proxy = header_str(&headers, "arbiter-proxy")?
         .ok_or_else(|| AppError::MissingHeader("arbiter-proxy"))?;
 
-    let pds_endpoint = resolve_pds_endpoint(&arbiter_did).await?;
+    let pds_endpoint = resolve_pds_endpoint(&*state.resolver, &arbiter_did).await?;
 
     // Build the XRPC request the arbiter policy will evaluate. Query params are
     // surfaced to the policy for GET; the body is parsed as JSON for non-GET.
@@ -183,11 +182,14 @@ fn header_str(headers: &HeaderMap, name: &'static str) -> Result<Option<String>,
 }
 
 /// Resolve a DID's `#atproto_pds` service endpoint, with a short-lived cache.
-async fn resolve_pds_endpoint(did: &str) -> Result<String, AppError> {
+async fn resolve_pds_endpoint(
+    resolver: &dyn atproto_identity::traits::IdentityResolver,
+    did: &str,
+) -> Result<String, AppError> {
     if let Some(ep) = PDS_CACHE.get(did).await {
         return Ok(ep);
     }
-    let doc = RESOLVER
+    let doc = resolver
         .resolve(did)
         .await
         .map_err(|e| AppError::Other(anyhow::anyhow!("resolve {did}: {e:#}")))?;
@@ -200,7 +202,6 @@ async fn resolve_pds_endpoint(did: &str) -> Result<String, AppError> {
     PDS_CACHE.insert(did.to_string(), ep.clone()).await;
     Ok(ep)
 }
-
 // ----- built-in provisioning ----------------------------------------------
 
 /// Provision a brand-new stewarded PDS account (`town.muni.arbiter.createArbiter`).
@@ -293,7 +294,7 @@ async fn create_app_password_arbiter(
         .to_string();
     let pds_url = match body_json.get("pdsUrl").and_then(|v| v.as_str()) {
         Some(u) => u.to_string(),
-        None => resolve_pds_endpoint(&arbiter_did).await?,
+        None => resolve_pds_endpoint(&*state.resolver, &arbiter_did).await?,
     };
 
     state
@@ -403,12 +404,13 @@ fn random_secret(len: usize) -> String {
     }
 }
 
-/// A random-ish valid handle (`arbiter-<...>.muni.town`).
+/// A random-ish valid handle using the configured suffix
+/// (`arbiter-<pid>-<nanos><suffix>`).
 fn random_handle() -> Result<Handle, &'static str> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let pid = std::process::id();
-    Handle::new(format!("arbiter-{pid:x}-{nanos:x}.muni.town"))
+    Handle::new(format!("arbiter-{pid:x}-{nanos:x}{}", CONFIG.handle_suffix))
 }

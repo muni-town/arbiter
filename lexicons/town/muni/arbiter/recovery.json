@@ -1,0 +1,22 @@
+{
+  "lexicon": 1,
+  "id": "town.muni.arbiter.recovery",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Recovery-admin designation record. Documents who is intended to\nrecover the arbiter. The arbiter does not yet act on this record;\nrecovery is via direct PDS access for now.",
+      "key": "literal:self",
+      "record": {
+        "type": "object",
+        "properties": {
+          "did": {
+            "type": "string",
+            "format": "did",
+            "description": "The DID of the designated recovery admin."
+          }
+        },
+        "required": ["did"]
+      }
+    }
+  }
+}
