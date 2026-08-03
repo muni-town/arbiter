@@ -1,9 +1,10 @@
-//! Policy loading from PDS records + startup onboarding (SERVER_PLAN.md §4/§6).
+//! Policy loading from PDS records + startup onboarding.
 //!
 //! Records read from each stewarded account's PDS (resolved via
 //! [`crate::AppState`].resolver):
-//!   the §4 lifecycle (offboard when absent; offboard + purge credentials when it
-//!   points at a different server).
+//! - `town.muni.arbiter.service/self` — the arbiter service record. Its `did`
+//!   field determines lifecycle: absent -> offboard (keep credentials); pointing
+//!   at a different server -> offboard + purge credentials.
 //! - `town.muni.arbiter.policy.root/self` — the root Rego policy source.
 //! - `town.muni.arbiter.policy.sub/<name>` — named sub-policies (listed via
 //!   `com.atproto.repo.listRecords`, keyed by record rkey).
@@ -72,7 +73,7 @@ pub async fn startup_onboard(state: Arc<AppState>) -> Result<()> {
 /// from its PDS, build `Policies`, and onboard (or update) the arbiter. Returns
 /// the resolved PDS endpoint.
 ///
-/// Also applies the §4 lifecycle: if `town.muni.arbiter.service/self` is absent
+/// Also applies the lifecycle: if `town.muni.arbiter.service/self` is absent
 /// -> `state.arbiters.offboard(did)`; if its `did` field != `CONFIG.server_did`
 /// -> `offboard` + `state.store.remove(did)`.
 pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
@@ -103,7 +104,7 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
         None => None,
     };
 
-    // --- §4 lifecycle: service record --------------------------------------
+    // --- lifecycle: service record ----------------------------------------
     let service = get_record(&client, &pds_endpoint, token.as_deref(), did, SERVICE_COLLECTION, SERVICE_RKEY)
         .await
         .with_context(|| format!("fetching {SERVICE_COLLECTION}/{SERVICE_RKEY}"))?;
@@ -240,7 +241,7 @@ async fn pds_session(
 /// Fetch a single record via `com.atproto.repo.getRecord`.
 ///
 /// Returns `Ok(None)` when the record does not exist (treated as absent for the
-/// §4 lifecycle). Other HTTP errors are propagated.
+/// lifecycle). Other HTTP errors are propagated.
 async fn get_record(
     client: &reqwest::Client,
     pds_url: &str,

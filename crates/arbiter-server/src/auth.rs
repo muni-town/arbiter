@@ -1,4 +1,4 @@
-//! serviceAuth verification (SERVER_PLAN.md §2).
+//! serviceAuth verification.
 //!
 //! `CallerDid` is an axum extractor that verifies the caller's serviceAuth JWT
 //! (issued by the caller's PDS via `com.atproto.server.getServiceAuth`) and

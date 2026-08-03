@@ -1,12 +1,12 @@
-//! Jetstream subscription for policy/service-record hot reload + auto-delete
-//! (SERVER_PLAN.md §4).
+//! Jetstream subscription for policy/service-record hot reload + auto-delete.
 //!
 //! Subscribes to ATProto Jetstream using the `atproto-jetstream` consumer
 //! library (typed events, WebSocket + parsing handled by the library). The
 //! subscription is filtered to the stewarded accounts' repos and the record
 //! collections this server cares about:
 //!
-//! - `town.muni.arbiter.service` (the `self` service record) — §4 lifecycle.
+//! - `town.muni.arbiter.service` (the `self` service record) — arbiter
+//!   lifecycle (absent or repointed -> offboard).
 //! - `town.muni.arbiter.policy.root` / `town.muni.arbiter.policy.sub` — policy
 //!   hot reload.
 //!
@@ -14,7 +14,7 @@
 //! through [`crate::state::ArbiterCollection::is_newer`] (older/duplicate revs
 //! are discarded) and, if newer, the arbiter is reloaded via
 //! [`crate::policy::load_and_onboard`], which re-fetches the *current* records
-//! from the PDS and applies the §4 lifecycle. Because `load_and_onboard` always
+//! from the PDS and reapplies the lifecycle. Because `load_and_onboard` always
 //! reads the latest PDS state (never the event payload), a reordered or
 //! duplicate event can never regress policy.
 //!

@@ -1,5 +1,5 @@
 //! Durable storage for PDS credentials of accounts the arbiter server has
-//! created or imported (SERVER_PLAN.md §5).
+//! created or imported.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

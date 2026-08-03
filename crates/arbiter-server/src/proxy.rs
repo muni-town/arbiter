@@ -1,5 +1,5 @@
 //! Execute a policy-issued remote XRPC request, authenticated as the stewarded
-//! account (SERVER_PLAN.md §8).
+//! account.
 //!
 //! The arbiter's Rego policy issues remote calls via the `xrpc` host function;
 //! the host (this module) executes them. Authentication is always as the

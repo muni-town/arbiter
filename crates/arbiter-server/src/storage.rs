@@ -7,17 +7,14 @@
 //!
 //! This store is a plain local file database. The `turso` crate's remote/cloud sync
 //! (`sync` feature) is deliberately **not** enabled, so nothing is pushed or pulled to
-//! Turso Cloud. If you inspect the dependency graph, the sync engine types are absent.
-//! The server is single-instance (§5/§11 of SERVER_PLAN.md), so a local replica is the
-//! right model — no multi-writer coordination to reason about yet.
+//! Turso Cloud.
 //!
-//! ## Why `turso` and not the Toasty ORM?
+//! ## Why a raw `turso::Connection` and not an ORM
 //!
-//! The contract prefers the Toasty ORM, but Toasty's query API takes `&mut Db` on every
-//! call, which is incompatible with the `&self`-only [`CredentialStore`] trait (it would
-//! force a `Mutex` serializing every credential operation). Dropping down to the DB
-//! client directly, a single `turso::Connection` (cheaply clonable, `&self` query
-//! methods) is shared across all operations.
+//! [`CredentialStore`] methods take `&self`; the Toasty ORM requires `&mut Db` on every
+//! call, which would force a `Mutex` serializing every credential operation. A single
+//! `turso::Connection` (cheaply clonable, `&self` query methods) is shared across all
+//! operations instead.
 //!
 //! ## No encryption at rest (for now)
 //!

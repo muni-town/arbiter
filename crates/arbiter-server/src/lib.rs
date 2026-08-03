@@ -1,7 +1,5 @@
 //! Muni Town Arbiter Server — ATProto XRPC policy proxy.
 //!
-//! See `SERVER_PLAN.md` for the full design.
-//!
 //! This library crate exposes the server's modules so that integration tests
 //! can construct an `AppState` with injected dependencies (e.g. a mock
 //! identity resolver) and drive the server end-to-end without real DNS/HTTP.

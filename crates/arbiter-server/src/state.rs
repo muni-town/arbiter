@@ -1,9 +1,8 @@
 //! In-memory collection of active arbiters, keyed by stewarded-account DID.
 //!
-//! One arbiter per stewarded account (SERVER_PLAN.md §1). All methods take a
-//! short-lived lock: `begin_request` only holds the lock long enough to create
-//! the owned request machine, then releases it before the caller does any
-//! async I/O.
+//! One arbiter per stewarded account. All methods take a short-lived lock:
+//! `begin_request` only holds the lock long enough to create the owned request
+//! machine, then releases it before the caller does any async I/O.
 
 use std::collections::HashMap;
 
@@ -18,7 +17,7 @@ struct ArbiterEntry {
     arbiter: Arbiter,
     pds_endpoint: String,
     /// Last-applied repo `rev` per policy/service record key, for monotonic
-    /// reload (SERVER_PLAN.md §4).
+    /// reload.
     revs: HashMap<String, String>,
 }
 

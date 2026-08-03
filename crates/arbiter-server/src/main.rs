@@ -1,7 +1,6 @@
 //! Muni Town Arbiter Server — binary entry point.
 //!
-//! See `SERVER_PLAN.md` for the full design and `lib.rs` for the library
-//! crate (used by integration tests).
+//! See `lib.rs` for the library crate (used by integration tests).
 
 #![forbid(unsafe_code)]
 

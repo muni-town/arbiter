@@ -1,4 +1,4 @@
-//! XRPC routing (SERVER_PLAN.md §8).
+//! XRPC routing.
 //!
 //! All requests come through one axum catch-all `/xrpc/{nsid}`. The handler
 //! enforces `lxm == nsid` (the `CallerDid` extractor can't see the path),
@@ -393,7 +393,7 @@ fn ok_response() -> Response {
 ///
 /// Drawn from a CSPRNG (`rand`) and base64-encoded (URL-safe, unpadded) so the
 /// password has full entropy per byte and no ambiguous characters. The password
-/// is stored encrypted-at-rest locally and used to authenticate as the steward.
+/// is stored by the credential store and used to authenticate as the steward.
 fn random_secret(len: usize) -> String {
     use base64::Engine;
     // `len` is the number of *base64 characters* we return, not bytes. Each byte

@@ -1,5 +1,7 @@
-//! atproto identity resolution (DID docs). Kept from the prior implementation;
-//! reused by `auth` (PDS signing key) and `policy` (PDS endpoint resolution).
+//! atproto identity resolution (DID docs).
+//!
+//! Shared resolver reused by `auth` (PDS signing key) and `policy`/`handlers`
+//! (PDS endpoint resolution).
 
 use std::sync::{Arc, LazyLock};
 
