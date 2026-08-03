@@ -3,12 +3,6 @@
 //! `TursoCredentialStore` implements [`CredentialStore`](crate::credstore::CredentialStore)
 //! against a local Turso database file using the `turso` crate (the successor to `libsql`).
 //!
-//! ## Local-only, no sync
-//!
-//! This store is a plain local file database. The `turso` crate's remote/cloud sync
-//! (`sync` feature) is deliberately **not** enabled, so nothing is pushed or pulled to
-//! Turso Cloud.
-//!
 //! ## Why a raw `turso::Connection` and not an ORM
 //!
 //! [`CredentialStore`] methods take `&self`; the Toasty ORM requires `&mut Db` on every
@@ -39,14 +33,14 @@ const SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS arbiter_credentials (\n\
 );";
 
 /// Upsert a credential row, keyed by DID.
-const UPSERT_SQL: &str =
-    "INSERT INTO arbiter_credentials (did, pds_url, password) VALUES (?, ?, ?)\n\
+const UPSERT_SQL: &str = "INSERT INTO arbiter_credentials (did, pds_url, password) VALUES (?, ?, ?)\n\
      ON CONFLICT(did) DO UPDATE SET pds_url = excluded.pds_url, password = excluded.password";
 
 /// Durable credential store backed by a local Turso database file.
 ///
-/// Construct with [`TursoCredentialStore::new`]; the choice between this and the in-memory
-/// store is wired in `main.rs` based on `CONFIG.turso_url`.
+/// Construct with [`TursoCredentialStore::new`]; it is the sole
+/// [`CredentialStore`] implementation and is wired in `main.rs` from
+/// `CONFIG.turso_url`.
 pub struct TursoCredentialStore {
     /// Local Turso database file path (e.g. `./data/creds.db`).
     path: String,
@@ -95,9 +89,12 @@ impl TursoCredentialStore {
 impl CredentialStore for TursoCredentialStore {
     async fn store(&self, did: String, creds: PdsCredentials) -> Result<()> {
         let conn = self.conn().await?;
-        conn.execute(UPSERT_SQL, turso::params![did, creds.pds_url, creds.password])
-            .await
-            .context("failed to store credentials")?;
+        conn.execute(
+            UPSERT_SQL,
+            turso::params![did, creds.pds_url, creds.password],
+        )
+        .await
+        .context("failed to store credentials")?;
         Ok(())
     }
 
@@ -134,10 +131,7 @@ impl CredentialStore for TursoCredentialStore {
     async fn list(&self) -> Result<Vec<(String, PdsCredentials)>> {
         let conn = self.conn().await?;
         let mut rows = conn
-            .query(
-                "SELECT did, pds_url, password FROM arbiter_credentials",
-                (),
-            )
+            .query("SELECT did, pds_url, password FROM arbiter_credentials", ())
             .await
             .context("failed to list credentials")?;
         let mut out = Vec::new();

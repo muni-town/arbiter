@@ -27,7 +27,9 @@ impl IntoResponse for AppError {
         let status = match &self {
             AppError::ArbiterNotFound(_) => StatusCode::NOT_FOUND,
             AppError::ArbiterNotReady(_) => StatusCode::SERVICE_UNAVAILABLE,
-            AppError::MissingHeader(_) | AppError::InvalidHeader(_, _) | AppError::MissingPdsEndpoint(_) => StatusCode::BAD_REQUEST,
+            AppError::MissingHeader(_)
+            | AppError::InvalidHeader(_, _)
+            | AppError::MissingPdsEndpoint(_) => StatusCode::BAD_REQUEST,
             AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             AppError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };

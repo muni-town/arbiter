@@ -8,37 +8,36 @@
 //! policy-supplied endpoint authenticated as the stewarded account.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::sync::Arc;
 
 use arbiter_core::arbiter::{ArbiterReqMachineStep, RequestCtx};
 use arbiter_core::xrpc::{XrpcOutput, XrpcRequest, XrpcResult};
-use atrium_api::agent::atp_agent::store::MemorySessionStore;
-use atrium_api::agent::atp_agent::CredentialSession;
 use atrium_api::agent::Agent;
+use atrium_api::agent::atp_agent::CredentialSession;
+use atrium_api::agent::atp_agent::store::MemorySessionStore;
 use atrium_api::com::atproto::repo::create_record;
 use atrium_api::com::atproto::server::create_account;
-use atrium_api::types::string::{AtIdentifier, Handle, Nsid, RecordKey};
 use atrium_api::types::TryIntoUnknown;
+use atrium_api::types::string::{AtIdentifier, Handle, Nsid, RecordKey};
 use atrium_xrpc::InputDataOrBytes;
 use atrium_xrpc_client::reqwest::ReqwestClient;
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
-use moka::future::Cache;
 use rand::RngCore;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tower_http::cors::CorsLayer;
 
+use crate::AppState;
+use crate::CONFIG;
 use crate::auth::CallerDid;
 use crate::credstore::PdsCredentials;
 use crate::error::AppError;
 use crate::policy;
 use crate::proxy;
-use crate::AppState;
-use crate::CONFIG;
+use crate::resolver;
 
 /// Built-in NSID: provision a brand-new stewarded PDS account.
 const NSID_CREATE_ARBITER: &str = "town.muni.arbiter.createArbiter";
@@ -48,22 +47,12 @@ const NSID_CREATE_APP_PASSWORD_ARBITER: &str = "town.muni.arbiter.createAppPassw
 /// A typed agent over an authenticated `CredentialSession` against a PDS.
 type SessionAgent = Agent<CredentialSession<MemorySessionStore, ReqwestClient>>;
 
-/// Per-DID cache of resolved `#atproto_pds` endpoints (avoids re-resolving on
-/// every proxied request).
-static PDS_CACHE: LazyLock<Cache<String, String>> = LazyLock::new(|| {
-    Cache::builder()
-        .max_capacity(10_000)
-        .time_to_live(Duration::from_secs(5 * 60))
-        .build()
-});
-
 pub fn router(state: Arc<AppState>) -> axum::Router {
     axum::Router::new()
         .route("/xrpc/{nsid}", axum::routing::any(xrpc_handler))
         .with_state(state)
         .layer(CorsLayer::permissive())
 }
-
 
 async fn xrpc_handler(
     State(state): State<Arc<AppState>>,
@@ -85,7 +74,7 @@ async fn xrpc_handler(
     match nsid.as_str() {
         NSID_CREATE_ARBITER => return create_arbiter(&state, &caller).await,
         NSID_CREATE_APP_PASSWORD_ARBITER => {
-            return create_app_password_arbiter(&state, &caller, &body).await
+            return create_app_password_arbiter(&state, &caller, &body).await;
         }
         _ => {}
     }
@@ -96,7 +85,7 @@ async fn xrpc_handler(
     let arbiter_proxy = header_str(&headers, "arbiter-proxy")?
         .ok_or_else(|| AppError::MissingHeader("arbiter-proxy"))?;
 
-    let pds_endpoint = resolve_pds_endpoint(&*state.resolver, &arbiter_did).await?;
+    let pds_endpoint = resolver::resolve_pds_endpoint(&*state.resolver, &arbiter_did).await?;
 
     // Build the XRPC request the arbiter policy will evaluate. Query params are
     // surfaced to the policy for GET; the body is parsed as JSON for non-GET.
@@ -182,27 +171,6 @@ fn header_str(headers: &HeaderMap, name: &'static str) -> Result<Option<String>,
     }
 }
 
-/// Resolve a DID's `#atproto_pds` service endpoint, with a short-lived cache.
-async fn resolve_pds_endpoint(
-    resolver: &dyn atproto_identity::traits::IdentityResolver,
-    did: &str,
-) -> Result<String, AppError> {
-    if let Some(ep) = PDS_CACHE.get(did).await {
-        return Ok(ep);
-    }
-    let doc = resolver
-        .resolve(did)
-        .await
-        .map_err(|e| AppError::Other(anyhow::anyhow!("resolve {did}: {e:#}")))?;
-    let ep = doc
-        .service
-        .iter()
-        .find(|s| s.id == "#atproto_pds" || s.id == "atproto_pds")
-        .map(|s| s.service_endpoint.clone())
-        .ok_or_else(|| AppError::MissingPdsEndpoint(did.to_string()))?;
-    PDS_CACHE.insert(did.to_string(), ep.clone()).await;
-    Ok(ep)
-}
 // ----- built-in provisioning ----------------------------------------------
 
 /// Provision a brand-new stewarded PDS account (`town.muni.arbiter.createArbiter`).
@@ -214,8 +182,8 @@ async fn resolve_pds_endpoint(
 async fn create_arbiter(state: &AppState, caller: &str) -> Result<Response, AppError> {
     let pds_url = CONFIG.default_pds.clone();
     let password = random_secret(24);
-    let handle = random_handle()
-        .map_err(|e| AppError::Other(anyhow::anyhow!("invalid handle: {e}")))?;
+    let handle =
+        random_handle().map_err(|e| AppError::Other(anyhow::anyhow!("invalid handle: {e}")))?;
 
     let provisioning = Agent::new(CredentialSession::new(
         ReqwestClient::new(&pds_url),
@@ -245,25 +213,22 @@ async fn create_arbiter(state: &AppState, caller: &str) -> Result<Response, AppE
 
     let new_did = account.data.did.as_str().to_string();
 
-    // Persist credentials so future proxy requests can authenticate as it.
-    state
-        .store
-        .store(
-            new_did.clone(),
-            PdsCredentials {
-                pds_url: pds_url.clone(),
-                password: password.clone(),
-            },
-        )
-        .await
-        .map_err(AppError::from)?;
-
     // Write the service + recovery records from the new account's session.
     let writer = login_session(&new_did, &password, &pds_url).await?;
     write_service_and_recovery(&writer, &new_did, caller).await?;
 
     // Bring the arbiter online (loads policies + lifecycle checks).
     policy::load_and_onboard(state, &new_did)
+        .await
+        .map_err(AppError::from)?;
+
+    // Persist credentials last, only once the account is fully provisioned and
+    // the arbiter is online. If any earlier step failed we return an error
+    // without storing credentials, so startup never retries an arbiter against
+    // a half-created account.
+    state
+        .store
+        .store(new_did, PdsCredentials { pds_url, password })
         .await
         .map_err(AppError::from)?;
 
@@ -295,25 +260,28 @@ async fn create_app_password_arbiter(
         .to_string();
     let pds_url = match body_json.get("pdsUrl").and_then(|v| v.as_str()) {
         Some(u) => u.to_string(),
-        None => resolve_pds_endpoint(&*state.resolver, &arbiter_did).await?,
+        None => resolver::resolve_pds_endpoint(&*state.resolver, &arbiter_did).await?,
     };
-
-    state
-        .store
-        .store(
-            arbiter_did.clone(),
-            PdsCredentials {
-                pds_url: pds_url.clone(),
-                password: app_password.clone(),
-            },
-        )
-        .await
-        .map_err(AppError::from)?;
 
     let writer = login_session(&arbiter_did, &app_password, &pds_url).await?;
     write_service_and_recovery(&writer, &arbiter_did, caller).await?;
 
     policy::load_and_onboard(state, &arbiter_did)
+        .await
+        .map_err(AppError::from)?;
+
+    // Persist credentials last, only once the account is fully provisioned and
+    // the arbiter is online. If any earlier step failed we return an error
+    // without storing credentials.
+    state
+        .store
+        .store(
+            arbiter_did,
+            PdsCredentials {
+                pds_url,
+                password: app_password,
+            },
+        )
         .await
         .map_err(AppError::from)?;
 
@@ -323,7 +291,8 @@ async fn create_app_password_arbiter(
 /// Log in as `did`/`password` against `pds_url` and wrap the session in an
 /// `Agent` for typed record writes.
 async fn login_session(did: &str, password: &str, pds_url: &str) -> Result<SessionAgent, AppError> {
-    let session = CredentialSession::new(ReqwestClient::new(pds_url), MemorySessionStore::default());
+    let session =
+        CredentialSession::new(ReqwestClient::new(pds_url), MemorySessionStore::default());
     session
         .login(did, password)
         .await
@@ -339,7 +308,14 @@ async fn write_service_and_recovery(
     repo: &str,
     caller: &str,
 ) -> Result<(), AppError> {
-    write_record(agent, repo, "town.muni.arbiter.service", "self", &CONFIG.server_did).await?;
+    write_record(
+        agent,
+        repo,
+        "town.muni.arbiter.service",
+        "self",
+        &CONFIG.server_did,
+    )
+    .await?;
     write_record(agent, repo, "town.muni.arbiter.recovery", "self", caller).await?;
     Ok(())
 }
@@ -364,8 +340,7 @@ async fn write_record(
             .parse::<AtIdentifier>()
             .map_err(|e| AppError::Other(anyhow::anyhow!("invalid repo `{repo}`: {e}")))?,
         rkey: Some(
-            rkey
-                .parse::<RecordKey>()
+            rkey.parse::<RecordKey>()
                 .map_err(|e| AppError::Other(anyhow::anyhow!("invalid rkey `{rkey}`: {e}")))?,
         ),
         swap_commit: None,

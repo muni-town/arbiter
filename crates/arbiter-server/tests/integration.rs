@@ -10,30 +10,31 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
 use arbiter_core::arbiter::{ArbiterReqMachineStep, RequestCtx};
 use arbiter_core::xrpc::{XrpcOutput, XrpcRequest};
 use async_trait::async_trait;
-use atproto_identity::key::{generate_key, to_public, KeyData, KeyType};
+use atproto_identity::key::{KeyData, KeyType, generate_key, to_public};
 use atproto_identity::model::{Document, Service, VerificationMethod};
 use atproto_identity::traits::IdentityResolver;
-use atproto_oauth::jwt::{mint, Claims, Header, JoseClaims};
+use atproto_oauth::jwt::{Claims, Header, JoseClaims, mint};
+use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use arbiter_server::credstore::{MemoryCredentialStore, PdsCredentials};
+use arbiter_server::AppState;
+use arbiter_server::credstore::PdsCredentials;
 use arbiter_server::handlers;
 use arbiter_server::policy;
 use arbiter_server::state::ArbiterCollection;
-use arbiter_server::AppState;
+use arbiter_server::storage::TursoCredentialStore;
 
 /// The mock PDS record map keyed by `(repo, collection, rkey)`.
 type RecordMap = Arc<Mutex<HashMap<(String, String, String), Value>>>;
@@ -49,7 +50,8 @@ const ROOT_RKEY: &str = "self";
 const SERVER_DID: &str = "did:web:localhost:8203";
 
 /// Root policy that echoes `input.nsid` back in `output.got`.
-const ECHO_POLICY: &str = "package arbiter\nresult := { \"ok\": true, \"output\": { \"got\": input.nsid } }";
+const ECHO_POLICY: &str =
+    "package arbiter\nresult := { \"ok\": true, \"output\": { \"got\": input.nsid } }";
 
 // ─── small shared helpers ───────────────────────────────────────────────────
 
@@ -63,13 +65,14 @@ fn unique_did(tag: &str) -> String {
     format!("did:plc:{tag}{n:020x}")
 }
 
-/// Monotonic counter yielding unique credential-store data dirs per run, so a
-/// persisted `credentials.json` from a previous run is never re-read.
-static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Monotonic counter yielding unique Turso database file paths per run, so a
+/// persisted credential DB from a previous run is never re-read across tests
+/// running in parallel.
+static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn fresh_data_dir() -> std::path::PathBuf {
-    let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("arbiter-test-{}-{}", std::process::id(), n))
+fn fresh_creds_db() -> std::path::PathBuf {
+    let n = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("arbiter-test-{}-{}.db", std::process::id(), n))
 }
 
 fn now_secs() -> u64 {
@@ -127,7 +130,10 @@ impl IdentityResolver for MockResolver {
 fn make_state(resolver: Arc<dyn IdentityResolver>) -> Arc<AppState> {
     Arc::new(AppState {
         arbiters: ArbiterCollection::new(),
-        store: Box::new(MemoryCredentialStore::new(fresh_data_dir())),
+        store: Box::new(
+            TursoCredentialStore::new(fresh_creds_db().to_string_lossy().into_owned())
+                .expect("fresh credential store"),
+        ),
         resolver,
     })
 }
@@ -141,6 +147,17 @@ fn make_req() -> XrpcRequest {
         input: None,
         encoding: None,
     }
+}
+
+/// Whether the server is currently serving an arbiter for `did` (i.e. it is
+/// onboarded and active). Mirrors the removed `ArbiterCollection::contains`
+/// check that this test file used to rely on.
+async fn is_serving(state: &AppState, did: &str) -> bool {
+    state
+        .arbiters
+        .begin_request(did, make_req(), RequestCtx::default())
+        .await
+        .is_ok()
 }
 
 // ─── mock PDS ───────────────────────────────────────────────────────────────
@@ -247,18 +264,22 @@ async fn start_mock_pds(records: RecordMap) -> SocketAddr {
 
 /// Populate the service + root policy records for `steward_did` (no
 /// sub-policies). The mock PDS is responsible for serving these.
-async fn populate_standard_records(
-    records: &RecordMap,
-    steward_did: &str,
-    policy_source: &str,
-) {
+async fn populate_standard_records(records: &RecordMap, steward_did: &str, policy_source: &str) {
     let mut m = records.lock().await;
     m.insert(
-        (steward_did.to_string(), SERVICE_COLLECTION.into(), SERVICE_RKEY.into()),
+        (
+            steward_did.to_string(),
+            SERVICE_COLLECTION.into(),
+            SERVICE_RKEY.into(),
+        ),
         json!({ "did": SERVER_DID }),
     );
     m.insert(
-        (steward_did.to_string(), ROOT_COLLECTION.into(), ROOT_RKEY.into()),
+        (
+            steward_did.to_string(),
+            ROOT_COLLECTION.into(),
+            ROOT_RKEY.into(),
+        ),
         json!({ "source": policy_source }),
     );
 }
@@ -372,7 +393,10 @@ async fn auth_setup() -> AuthEnv {
     let pds_url = format!("http://{pds_addr}");
 
     let mut docs = HashMap::new();
-    docs.insert(pds_did.clone(), did_doc(&pds_did, &pds_url, Some(&multibase)));
+    docs.insert(
+        pds_did.clone(),
+        did_doc(&pds_did, &pds_url, Some(&multibase)),
+    );
     docs.insert(steward_did.clone(), did_doc(&steward_did, &pds_url, None));
     let resolver: Arc<dyn IdentityResolver> = Arc::new(MockResolver { docs });
 
@@ -401,7 +425,11 @@ async fn auth_setup() -> AuthEnv {
 
 /// Send `GET /xrpc/com.example.foo` to the running server, optionally with a
 /// Bearer JWT and the `arbiter-did`/`arbiter-proxy` headers.
-async fn xrpc_get(env: &AuthEnv, jwt: Option<String>, arbiter_did: Option<&str>) -> reqwest::Response {
+async fn xrpc_get(
+    env: &AuthEnv,
+    jwt: Option<String>,
+    arbiter_did: Option<&str>,
+) -> reqwest::Response {
     let url = format!("http://{}/xrpc/com.example.foo", env.addr);
     let client = reqwest::Client::new();
     let mut req = client.get(&url);
@@ -439,7 +467,7 @@ async fn policy_loading() {
     let env = policy_setup(ECHO_POLICY).await;
 
     assert!(
-        env.state.arbiters.contains(&env.steward_did).await,
+        is_serving(&env.state, &env.steward_did).await,
         "steward must be onboarded"
     );
 
@@ -450,10 +478,7 @@ async fn policy_loading() {
         .await
         .expect("begin_request succeeds for onboarded arbiter");
 
-    assert_policy_output(
-        drive.machine.start(),
-        json!({ "got": "com.example.foo" }),
-    );
+    assert_policy_output(drive.machine.start(), json!({ "got": "com.example.foo" }));
 }
 
 // ─── 2. fail-closed when the PDS is unreachable ──────────────────────────────
@@ -488,7 +513,7 @@ async fn fail_closed_when_pds_unreachable() {
 
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(
-        !state.arbiters.contains(&did).await,
+        !is_serving(&state, &did).await,
         "PDS unreachable must not onboard the arbiter"
     );
     handle.abort();
@@ -500,7 +525,11 @@ async fn fail_closed_when_pds_unreachable() {
 async fn auth_valid_token() {
     let env = auth_setup().await;
     let resp = xrpc_get(&env, Some(valid_jwt(&env)), Some(env.steward_did.as_str())).await;
-    assert_eq!(resp.status(), StatusCode::OK, "valid token must be accepted");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "valid token must be accepted"
+    );
     let body: Value = resp.json().await.expect("json body");
     assert_eq!(body, json!({ "got": "com.example.foo" }));
 }
@@ -520,7 +549,11 @@ async fn auth_invalid_signature() {
         now_secs() + 60,
     );
     let resp = xrpc_get(&env, Some(jwt), Some(env.steward_did.as_str())).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "bad signature must be rejected");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "bad signature must be rejected"
+    );
 }
 
 #[tokio::test]
@@ -535,7 +568,11 @@ async fn auth_expired_token() {
         now_secs().saturating_sub(10),
     );
     let resp = xrpc_get(&env, Some(jwt), Some(env.steward_did.as_str())).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "expired token must be rejected");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "expired token must be rejected"
+    );
 }
 
 #[tokio::test]
@@ -571,7 +608,11 @@ async fn auth_wrong_aud() {
         now_secs() + 60,
     );
     let resp = xrpc_get(&env, Some(jwt), Some(env.steward_did.as_str())).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "wrong aud must be rejected");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "wrong aud must be rejected"
+    );
 }
 
 #[tokio::test]
@@ -579,7 +620,11 @@ async fn auth_missing_header() {
     let env = auth_setup().await;
     // No Authorization header at all.
     let resp = xrpc_get(&env, None, Some(env.steward_did.as_str())).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "missing Authorization must be rejected");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "missing Authorization must be rejected"
+    );
 }
 
 #[tokio::test]
@@ -587,7 +632,11 @@ async fn auth_missing_arbiter_did() {
     let env = auth_setup().await;
     // Valid JWT, but no arbiter-did header → MissingHeader → 400.
     let resp = xrpc_get(&env, Some(valid_jwt(&env)), None).await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "missing arbiter-did must be a 400");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "missing arbiter-did must be a 400"
+    );
 }
 
 // ─── 4. hot reload updates policy ───────────────────────────────────────────
@@ -652,7 +701,7 @@ async fn auto_delete_service_absent() {
         )
         .await
         .expect("store creds");
-    assert!(env.state.arbiters.contains(&env.steward_did).await);
+    assert!(is_serving(&env.state, &env.steward_did).await);
 
     // Remove the service record → §4 lifecycle offboards but keeps credentials.
     {
@@ -668,7 +717,7 @@ async fn auto_delete_service_absent() {
         .expect("reload after service removal");
 
     assert!(
-        !env.state.arbiters.contains(&env.steward_did).await,
+        !is_serving(&env.state, &env.steward_did).await,
         "absent service record must offboard the arbiter"
     );
     let creds = env
@@ -698,7 +747,7 @@ async fn auto_delete_service_repointed() {
         )
         .await
         .expect("store creds");
-    assert!(env.state.arbiters.contains(&env.steward_did).await);
+    assert!(is_serving(&env.state, &env.steward_did).await);
 
     // Repoint the service record at a different arbiter server.
     {
@@ -717,7 +766,7 @@ async fn auto_delete_service_repointed() {
         .expect("reload after service repoint");
 
     assert!(
-        !env.state.arbiters.contains(&env.steward_did).await,
+        !is_serving(&env.state, &env.steward_did).await,
         "repointed service record must offboard the arbiter"
     );
     let creds = env

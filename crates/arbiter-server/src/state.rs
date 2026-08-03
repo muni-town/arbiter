@@ -55,24 +55,10 @@ impl ArbiterCollection {
         );
     }
 
-    /// Replace an existing arbiter's policies (hot reload), keeping its PDS
-    /// endpoint and rev tracking. No-op if the arbiter is not active.
-    pub async fn update_policies(&self, did: &str, arbiter: Arbiter) {
-        let mut map = self.inner.lock().await;
-        if let Some(entry) = map.get_mut(did) {
-            entry.arbiter = arbiter;
-        }
-    }
-
     /// Stop serving an arbiter (e.g. its service record disappeared). Keeps
     /// credentials; the arbiter may be re-onboarded later. Returns was-active.
     pub async fn offboard(&self, did: &str) -> bool {
         self.inner.lock().await.remove(did).is_some()
-    }
-
-    /// Whether an arbiter is currently active (policies loaded).
-    pub async fn contains(&self, did: &str) -> bool {
-        self.inner.lock().await.contains_key(did)
     }
 
     /// Begin a request against the arbiter for `did`. Fail-closed: a missing
@@ -100,10 +86,7 @@ impl ArbiterCollection {
     pub async fn is_newer(&self, did: &str, key: &str, rev: &str) -> bool {
         let map = self.inner.lock().await;
         match map.get(did) {
-            Some(entry) => entry
-                .revs
-                .get(key)
-                .is_none_or(|old| rev > old.as_str()),
+            Some(entry) => entry.revs.get(key).is_none_or(|old| rev > old.as_str()),
             None => false,
         }
     }

@@ -2,8 +2,11 @@
 //!
 //! Subscribes to ATProto Jetstream using the `atproto-jetstream` consumer
 //! library (typed events, WebSocket + parsing handled by the library). The
-//! subscription is filtered to the stewarded accounts' repos and the record
-//! collections this server cares about:
+//! subscription is *not* DID-filtered server-side — it watches every repo — and
+//! each event is accepted or dropped by whether the server currently stewards
+//! the affected account. This way an arbiter created *after* the subscription
+//! is live still receives policy hot-reload and auto-delete without waiting for
+//! a reconnect. Only the record collections this server cares about are watched:
 //!
 //! - `town.muni.arbiter.service` (the `self` service record) — arbiter
 //!   lifecycle (absent or repointed -> offboard).
@@ -24,11 +27,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
+use async_trait::async_trait;
 use atproto_jetstream::{
     CancellationToken, Consumer, ConsumerTaskConfig, EventHandler, JetstreamEvent,
 };
-use async_trait::async_trait;
 
 use crate::policy::load_and_onboard;
 use crate::{AppState, CONFIG};
@@ -40,11 +43,15 @@ const WATCHED_COLLECTIONS: &[&str] = &[
     "town.muni.arbiter.policy.sub",
 ];
 
-/// Subscribe to Jetstream for all stewarded accounts and drive:
+/// Subscribe to Jetstream and drive:
 ///  - `town.muni.arbiter.policy.*` writes -> monotonic-rev reload
 ///    (`load_and_onboard`, gated by `is_newer`/`set_rev`)
 ///  - `town.muni.arbiter.service/self` writes/deletes -> auto-delete lifecycle
 ///    (absent -> offboard; repointed at another server -> offboard + store.remove)
+///
+/// The subscription is not DID-filtered: every event is evaluated against the
+/// current set of stewarded accounts, so accounts created while the stream is
+/// live are picked up immediately.
 ///
 /// Runs forever, reconnecting with bounded backoff on disconnect or error. The
 /// underlying `atproto-jetstream` consumer does not reconnect itself; this loop
@@ -72,22 +79,12 @@ pub async fn subscribe(state: Arc<AppState>) {
 }
 
 /// Connect once and pump events until the stream closes or errors.
+///
+/// The consumer is deliberately not DID-filtered: it subscribes to every repo,
+/// and `ReloadHandler` accepts only events for accounts the server currently
+/// stewards. An account created after this subscription is live therefore still
+/// gets hot-reload/auto-delete without a reconnect.
 async fn run_subscription(state: &Arc<AppState>) -> anyhow::Result<()> {
-    let dids = state
-        .store
-        .list()
-        .await
-        .map_err(|e| anyhow!("listing stewarded DIDs: {e:#}"))?;
-    if dids.is_empty() {
-        tracing::info!("no stewarded accounts; jetstream subscription idle until one is added");
-        // Nothing to subscribe to; wait and let the outer loop retry so newly
-        // bootstrapped arbiters are picked up.
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        return Ok(());
-    }
-
-    let steward_dids: Vec<String> = dids.into_iter().map(|(d, _)| d).collect();
-
     let host = jetstream_host(&CONFIG.jetstream_url);
     let config = ConsumerTaskConfig {
         user_agent: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
@@ -100,7 +97,9 @@ async fn run_subscription(state: &Arc<AppState>) -> anyhow::Result<()> {
         zstd_dictionary_location: String::new(),
         jetstream_hostname: host.to_string(),
         collections: WATCHED_COLLECTIONS.iter().map(|s| s.to_string()).collect(),
-        dids: steward_dids.clone(),
+        // Subscribe to all DIDs; each event is filtered per-event by whether the
+        // server stewards the affected account (see `ReloadHandler`).
+        dids: Vec::new(),
         max_message_size_bytes: None,
         cursor: None,
         require_hello: false,
@@ -109,7 +108,6 @@ async fn run_subscription(state: &Arc<AppState>) -> anyhow::Result<()> {
     let consumer = Consumer::new(config);
     let handler = Arc::new(ReloadHandler {
         state: Arc::clone(state),
-        dids: steward_dids,
     });
     consumer
         .register_handler(handler)
@@ -138,17 +136,15 @@ fn jetstream_host(url: &str) -> &str {
         .strip_prefix("wss://")
         .or_else(|| trimmed.strip_prefix("ws://"))
         .unwrap_or(trimmed);
-    after_scheme
-        .split('/')
-        .next()
-        .unwrap_or(after_scheme)
+    after_scheme.split('/').next().unwrap_or(after_scheme)
 }
 
 /// Handler that reloads arbiters on watched policy/service-record events.
+///
+/// The subscription is not DID-filtered (see [`subscribe`]), so this handler
+/// checks, per event, that the server currently stewards the affected account.
 struct ReloadHandler {
     state: Arc<AppState>,
-    /// Stewarded DIDs at connect time (guards against a stale server-side filter).
-    dids: Vec<String>,
 }
 
 #[async_trait]
@@ -177,11 +173,9 @@ impl EventHandler for ReloadHandler {
             return Ok(());
         }
         // Only process accounts we actually steward (have credentials for).
-        // Jetstream filters server-side via wantedDids, but this guards against a
-        // stale filter or a DID purged after a repoint.
-        if !self.dids.iter().any(|d| d == did) {
-            return Ok(());
-        }
+        // The subscription is not DID-filtered, so this per-event check is what
+        // limits the stream to our stewarded accounts. It also handles a DID
+        // purged after a repoint.
         let stewarded = match self.state.store.get(did).await {
             Ok(Some(_)) => true,
             Ok(None) => false,
@@ -213,7 +207,10 @@ impl EventHandler for ReloadHandler {
         // events cannot regress policy.
         match load_and_onboard(&self.state, did).await {
             Ok(pds) => {
-                self.state.arbiters.set_rev(did, &path, rev.to_string()).await;
+                self.state
+                    .arbiters
+                    .set_rev(did, &path, rev.to_string())
+                    .await;
                 tracing::debug!(did, pds = %pds, "reloaded arbiter from jetstream event");
             }
             Err(e) => {
@@ -236,7 +233,5 @@ impl EventHandler for ReloadHandler {
 
 /// Whether a Jetstream record collection is one this server watches.
 fn is_watched_collection(collection: &str) -> bool {
-    WATCHED_COLLECTIONS
-        .iter()
-        .any(|c| c == &collection)
+    WATCHED_COLLECTIONS.iter().any(|c| c == &collection)
 }

@@ -11,27 +11,35 @@
 //! against the caller's own DID-document keys.
 
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
-use atproto_identity::key::{identify_key, KeyData};
+use atproto_identity::key::{KeyData, identify_key};
 use atproto_identity::traits::IdentityResolver;
 use atproto_oauth::encoding::FromBase64;
-use atproto_oauth::jwt::{verify, Claims};
+use atproto_oauth::jwt::{Claims, verify};
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use moka::future::Cache;
 
-use crate::error::AppError;
-use crate::CONFIG;
 use crate::AppState;
+use crate::CONFIG;
+use crate::error::AppError;
 
 /// Cache of PDS signing keys, keyed by PDS DID (the JWT `iss` claim).
 ///
 /// serviceAuth tokens are signed by the caller's PDS, so the verifying key is
 /// read from the PDS DID document (not the account's). Resolving a DID document
 /// on every request would be expensive and rate-limit-prone, so the extracted
-/// `KeyData` is memoized here.
-static PDS_SIGNING_KEYS: LazyLock<Cache<String, KeyData>> = LazyLock::new(|| Cache::new(256));
+/// `KeyData` is memoized here. PDS signing keys are expected to rotate rarely;
+/// a long TTL (12h) keeps the cache effective while still eventually picking up
+/// a rotation.
+static PDS_SIGNING_KEYS: LazyLock<Cache<String, KeyData>> = LazyLock::new(|| {
+    Cache::builder()
+        .max_capacity(256)
+        .time_to_live(Duration::from_secs(12 * 60 * 60))
+        .build()
+});
 
 /// The verified caller, extracted from a `Authorization: Bearer <serviceAuth>`
 /// token. `did` is the token `sub`; `lxm` is the bound XRPC method. The
@@ -94,9 +102,8 @@ impl FromRequestParts<Arc<AppState>> for CallerDid {
 
         // 4. Verify the JWT signature against the PDS signing key. `verify`
         //    also rejects expired (`exp` past) and not-yet-valid (`nbf`) tokens.
-        let claims = verify(jwt, &key_data).map_err(|e| {
-            AppError::Unauthorized(format!("serviceAuth verification failed: {e}"))
-        })?;
+        let claims = verify(jwt, &key_data)
+            .map_err(|e| AppError::Unauthorized(format!("serviceAuth verification failed: {e}")))?;
 
         // 5. Check `aud == CONFIG.server_did`.
         let aud = claims
@@ -136,9 +143,10 @@ pub async fn resolve_pds_signing_key(
     let doc = resolver.resolve(pds_did).await.map_err(|e| {
         AppError::Unauthorized(format!("unable to resolve PDS DID `{pds_did}`: {e}"))
     })?;
-    let multibase = doc.did_keys().into_iter().next().ok_or_else(|| {
-        AppError::Unauthorized(format!("PDS `{pds_did}` exposes no signing key"))
-    })?;
+    let multibase =
+        doc.did_keys().into_iter().next().ok_or_else(|| {
+            AppError::Unauthorized(format!("PDS `{pds_did}` exposes no signing key"))
+        })?;
     // `did_keys()` returns the raw multibase value; `identify_key` expects a
     // `did:key:`-prefixed (or bare multibase) string.
     let full = if multibase.starts_with("did:key:") {
@@ -146,6 +154,5 @@ pub async fn resolve_pds_signing_key(
     } else {
         format!("did:key:{multibase}")
     };
-    identify_key(&full)
-        .map_err(|e| AppError::Unauthorized(format!("invalid PDS signing key: {e}")))
+    identify_key(&full).map_err(|e| AppError::Unauthorized(format!("invalid PDS signing key: {e}")))
 }

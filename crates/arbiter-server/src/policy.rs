@@ -14,13 +14,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use crate::resolver;
+use crate::{AppState, CONFIG};
+use anyhow::{Context, Result, anyhow};
 use arbiter_core::arbiter::{Arbiter, Policies};
 use arbiter_core::policy::PolicyVm;
 use regorus::Value;
 use serde_json::Value as Json;
-use atproto_identity::traits::IdentityResolver;
-use crate::{AppState, CONFIG};
 /// Service record collection + rkey (`town.muni.arbiter.service/self`).
 const SERVICE_COLLECTION: &str = "town.muni.arbiter.service";
 const SERVICE_RKEY: &str = "self";
@@ -41,7 +41,11 @@ const ENTRYPOINT: &str = "data.arbiter.result";
 /// returning `ArbiterNotReady` for un-onboarded DIDs; this task just brings them
 /// online. Retry each load with exponential backoff until it succeeds.
 pub async fn startup_onboard(state: Arc<AppState>) -> Result<()> {
-    let entries = state.store.list().await.context("listing stored credentials")?;
+    let entries = state
+        .store
+        .list()
+        .await
+        .context("listing stored credentials")?;
     if entries.is_empty() {
         tracing::info!("no stewarded accounts to onboard at startup");
         return Ok(());
@@ -77,9 +81,9 @@ pub async fn startup_onboard(state: Arc<AppState>) -> Result<()> {
 /// -> `state.arbiters.offboard(did)`; if its `did` field != `CONFIG.server_did`
 /// -> `offboard` + `state.store.remove(did)`.
 pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
-    let pds_endpoint = resolve_pds_endpoint(&*state.resolver, did)
+    let pds_endpoint = resolver::resolve_pds_endpoint(&*state.resolver, did)
         .await
-        .with_context(|| format!("resolving PDS endpoint for {did}"))?;
+        .map_err(|e| anyhow::anyhow!("resolving PDS endpoint for {did}: {e:#}"))?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -93,7 +97,10 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
         Some(creds) => match pds_session(&client, &pds_endpoint, did, &creds.password).await {
             Ok(Some(t)) => Some(t),
             Ok(None) => {
-                tracing::debug!(did, "PDS session creation failed; trying unauthenticated reads");
+                tracing::debug!(
+                    did,
+                    "PDS session creation failed; trying unauthenticated reads"
+                );
                 None
             }
             Err(e) => {
@@ -105,9 +112,16 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
     };
 
     // --- lifecycle: service record ----------------------------------------
-    let service = get_record(&client, &pds_endpoint, token.as_deref(), did, SERVICE_COLLECTION, SERVICE_RKEY)
-        .await
-        .with_context(|| format!("fetching {SERVICE_COLLECTION}/{SERVICE_RKEY}"))?;
+    let service = get_record(
+        &client,
+        &pds_endpoint,
+        token.as_deref(),
+        did,
+        SERVICE_COLLECTION,
+        SERVICE_RKEY,
+    )
+    .await
+    .with_context(|| format!("fetching {SERVICE_COLLECTION}/{SERVICE_RKEY}"))?;
     match service {
         None => {
             // Record absent: stop serving but keep credentials (may re-onboard).
@@ -146,21 +160,34 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
     }
 
     // --- root policy -------------------------------------------------------
-    let root_rec = get_record(&client, &pds_endpoint, token.as_deref(), did, ROOT_COLLECTION, ROOT_RKEY)
-        .await
-        .with_context(|| format!("fetching {ROOT_COLLECTION}/{ROOT_RKEY}"))?
-        .ok_or_else(|| {
-            anyhow!("root policy record {ROOT_COLLECTION}/{ROOT_RKEY} not found for {did}")
-        })?;
+    let root_rec = get_record(
+        &client,
+        &pds_endpoint,
+        token.as_deref(),
+        did,
+        ROOT_COLLECTION,
+        ROOT_RKEY,
+    )
+    .await
+    .with_context(|| format!("fetching {ROOT_COLLECTION}/{ROOT_RKEY}"))?
+    .ok_or_else(|| {
+        anyhow!("root policy record {ROOT_COLLECTION}/{ROOT_RKEY} not found for {did}")
+    })?;
     let root_src = rego_source(&root_rec)
         .with_context(|| format!("extracting root policy source for {did}"))?;
     let root = PolicyVm::new(&root_src, Value::new_object(), ENTRYPOINT, HOST_FNS)
         .with_context(|| format!("compiling root policy for {did}"))?;
 
     // --- sub-policies ------------------------------------------------------
-    let sub_records = list_records(&client, &pds_endpoint, token.as_deref(), did, SUB_COLLECTION)
-        .await
-        .with_context(|| format!("listing {SUB_COLLECTION} records"))?;
+    let sub_records = list_records(
+        &client,
+        &pds_endpoint,
+        token.as_deref(),
+        did,
+        SUB_COLLECTION,
+    )
+    .await
+    .with_context(|| format!("listing {SUB_COLLECTION} records"))?;
     let mut subs = std::collections::HashMap::new();
     for (rkey, rec) in sub_records {
         match rego_source(&rec) {
@@ -185,23 +212,6 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
         .onboard(did.to_string(), arbiter, pds_endpoint.clone())
         .await;
     Ok(pds_endpoint)
-}
-
-/// Resolve `did` -> PDS endpoint via the `#atproto_pds` service in its DID doc.
-pub(crate) async fn resolve_pds_endpoint(
-    resolver: &dyn IdentityResolver,
-    did: &str,
-) -> Result<String> {
-    let doc = resolver
-        .resolve(did)
-        .await
-        .map_err(|e| anyhow!("identity resolution failed for {did}: {e:#}"))?;
-    for svc in &doc.service {
-        if svc.id == "#atproto_pds" {
-            return Ok(svc.service_endpoint.clone());
-        }
-    }
-    Err(anyhow!("no #atproto_pds service in DID document for {did}"))
 }
 
 /// Create a PDS session (`com.atproto.server.createSession`) and return its
@@ -235,7 +245,9 @@ async fn pds_session(
         return Ok(None);
     }
     let v: Json = serde_json::from_slice(&body).context("createSession json")?;
-    Ok(v.get("accessJwt").and_then(|t| t.as_str()).map(String::from))
+    Ok(v.get("accessJwt")
+        .and_then(|t| t.as_str())
+        .map(String::from))
 }
 
 /// Fetch a single record via `com.atproto.repo.getRecord`.
@@ -254,11 +266,10 @@ async fn get_record(
         "{}/xrpc/com.atproto.repo.getRecord",
         pds_url.trim_end_matches('/')
     );
-    let mut req = client.get(&url).query(&[
-        ("repo", repo),
-        ("collection", collection),
-        ("rkey", rkey),
-    ]);
+    let mut req =
+        client
+            .get(&url)
+            .query(&[("repo", repo), ("collection", collection), ("rkey", rkey)]);
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }

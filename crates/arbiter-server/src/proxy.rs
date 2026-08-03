@@ -13,9 +13,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use arbiter_core::xrpc::{XrpcError, XrpcOutput, XrpcRequest, XrpcResult};
-use atrium_api::agent::atp_agent::store::MemorySessionStore;
-use atrium_api::agent::atp_agent::CredentialSession;
 use atrium_api::agent::CloneWithProxy;
+use atrium_api::agent::atp_agent::CredentialSession;
+use atrium_api::agent::atp_agent::store::MemorySessionStore;
 use atrium_api::types::string::Did;
 use atrium_xrpc::error::{ErrorResponseBody, XrpcErrorKind};
 use atrium_xrpc::{OutputDataOrBytes, XrpcClient};
@@ -50,7 +50,10 @@ fn upstream_error(status: axum::http::StatusCode, msg: impl Into<String>) -> Xrp
 }
 
 /// Fetch (or create + login) the authenticated session for `stewarded_did`.
-async fn get_or_login(stewarded_did: &str, creds: &PdsCredentials) -> Result<Arc<Session>, XrpcError> {
+async fn get_or_login(
+    stewarded_did: &str,
+    creds: &PdsCredentials,
+) -> Result<Arc<Session>, XrpcError> {
     if let Some(session) = SESSIONS.get(stewarded_did).await {
         return Ok(session);
     }
@@ -62,9 +65,15 @@ async fn get_or_login(stewarded_did: &str, creds: &PdsCredentials) -> Result<Arc
 /// Used both for first-time login and for the re-login fallback when a cached
 /// session's access **and** refresh tokens have both been revoked. Overwrites
 /// any stale cached session for the steward.
-async fn login_fresh(stewarded_did: &str, creds: &PdsCredentials) -> Result<Arc<Session>, XrpcError> {
+async fn login_fresh(
+    stewarded_did: &str,
+    creds: &PdsCredentials,
+) -> Result<Arc<Session>, XrpcError> {
     let client = ReqwestClient::new(&creds.pds_url);
-    let session = Arc::new(CredentialSession::new(client, MemorySessionStore::default()));
+    let session = Arc::new(CredentialSession::new(
+        client,
+        MemorySessionStore::default(),
+    ));
     if let Err(e) = session.login(stewarded_did, &creds.password).await {
         warn!(stewarded_did, pds = %creds.pds_url, "proxy session login failed: {e:?}");
         return Err(upstream_error(
@@ -137,7 +146,10 @@ pub async fn execute_remote(
     if let Err(atrium_xrpc::Error::XrpcResponse(xrpc_err)) = &result
         && is_expired_token(xrpc_err)
     {
-        warn!(stewarded_did, "proxy session token fully revoked; re-logging in");
+        warn!(
+            stewarded_did,
+            "proxy session token fully revoked; re-logging in"
+        );
         match login_fresh(stewarded_did, creds).await {
             Ok(fresh) => {
                 let retried = fresh
@@ -147,9 +159,7 @@ pub async fn execute_remote(
                 return Ok(match retried {
                     Ok(OutputDataOrBytes::Data(json)) => XrpcOutput::Data(json),
                     Ok(OutputDataOrBytes::Bytes(bytes)) => XrpcOutput::Bytes(bytes),
-                    Err(atrium_xrpc::Error::XrpcResponse(xrpc_err)) => {
-                        return Err(xrpc_err)
-                    }
+                    Err(atrium_xrpc::Error::XrpcResponse(xrpc_err)) => return Err(xrpc_err),
                     Err(e) => {
                         warn!(endpoint, "proxy retry send_xrpc failed: {e:?}");
                         return Err(upstream_error(

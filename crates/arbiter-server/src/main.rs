@@ -7,17 +7,15 @@
 use std::sync::Arc;
 
 use arbiter_server::{
-    credstore::{CredentialStore, MemoryCredentialStore},
-    handlers, jetstream, policy, resolver::RESOLVER, state::ArbiterCollection, storage,
-    AppState, CONFIG,
+    AppState, CONFIG, credstore::CredentialStore, handlers, jetstream, policy, resolver::RESOLVER,
+    state::ArbiterCollection, storage,
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -27,11 +25,10 @@ async fn main() -> anyhow::Result<()> {
         CONFIG.server_did
     );
 
-    // Credential store: Turso (local file) when configured, else the in-memory/JSON store.
-    let store: Box<dyn CredentialStore> = match &CONFIG.turso_url {
-        Some(path) => Box::new(storage::TursoCredentialStore::new(path.clone())?),
-        None => Box::new(MemoryCredentialStore::new(CONFIG.data_dir.clone())),
-    };
+    // Credential store: Turso (local SQLite file).
+    let store: Box<dyn CredentialStore> = Box::new(storage::TursoCredentialStore::new(
+        CONFIG.turso_url.clone(),
+    )?);
 
     let state = Arc::new(AppState {
         arbiters: ArbiterCollection::new(),
