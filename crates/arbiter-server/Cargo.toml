@@ -39,6 +39,5 @@ rand = "0.9"
 # base64 encoding for steward passwords (handlers.rs).
 base64 = "0.22"
 # --- Jetstream subscription (policy/service-record hot reload) ---
-# Raw WebSocket consumer for ATProto Jetstream commit events.
-tokio-tungstenite = { version = "0.26", features = ["connect", "rustls-tls-native-roots"] }
-futures-util = "0.3"
+# Typed ATProto Jetstream consumer (WebSocket + parsing handled by the library).
+atproto-jetstream = "0.14.5"
