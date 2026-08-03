@@ -33,14 +33,10 @@ atrium-xrpc-client = { version = "0.5.15", features = ["reqwest"], default-featu
 atrium-xrpc = "0.12.4"
 atrium-api = { version = "0.25.8", default-features = false, features = ["agent"] }
 regorus = { version = "0.11.0", default-features = false, features = ["rvm", "arc", "std"] }
-# --- Turso/libSQL durable credential storage (storage agent) ---
-# libSQL client: connects to a local libSQL file or a remote Turso Cloud database.
-libsql = { version = "0.9", default-features = false, features = ["core", "remote", "tls"] }
-# AES-256-GCM for encrypting the password field at rest.
-aes-gcm = "0.11"
+turso = "0.8.0-pre.2"
 # CSPRNG for steward passwords.
 rand = "0.9"
-# base64 encoding of the encryption key and encrypted password blobs.
+# base64 encoding for steward passwords (handlers.rs).
 base64 = "0.22"
 # --- Jetstream subscription (policy/service-record hot reload) ---
 # Raw WebSocket consumer for ATProto Jetstream commit events.

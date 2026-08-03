@@ -23,8 +23,8 @@ pub struct PdsCredentials {
 /// stewarded account when proxying XRPC requests and writing policy records.
 ///
 /// Implementations: [`MemoryCredentialStore`] (dev, JSON-file backed). A Turso
-/// backend lives in `storage.rs`. **Encryption at rest is required** for the
-/// password field; the in-memory store does not encrypt.
+/// backend lives in `storage.rs`. Neither store encrypts the password field at
+/// rest for now (see `storage.rs` module docs for the tradeoff).
 #[async_trait]
 pub trait CredentialStore: Send + Sync {
     async fn store(&self, did: String, creds: PdsCredentials) -> Result<()>;

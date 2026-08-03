@@ -35,8 +35,8 @@ pub struct ServerConfig {
     #[arg(long = "data-dir", env = "DATA_DIR", default_value = "./data/arbiters")]
     pub data_dir: std::path::PathBuf,
 
-    /// Turso (libSQL) database URL. If set, the Turso credential store is used;
-    /// otherwise the in-memory/JSON store is used.
+    /// Turso local database file path. If set, the Turso credential store is
+    /// used; otherwise the in-memory/JSON store is used.
     #[arg(long = "turso-url", env = "TURSO_URL")]
     pub turso_url: Option<String>,
 

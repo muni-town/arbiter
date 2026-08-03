@@ -28,9 +28,9 @@ async fn main() -> anyhow::Result<()> {
         CONFIG.server_did
     );
 
-    // Credential store: Turso when configured, else the in-memory/JSON store.
+    // Credential store: Turso (local file) when configured, else the in-memory/JSON store.
     let store: Box<dyn CredentialStore> = match &CONFIG.turso_url {
-        Some(url) => Box::new(storage::TursoCredentialStore::new(url.clone())?),
+        Some(path) => Box::new(storage::TursoCredentialStore::new(path.clone())?),
         None => Box::new(MemoryCredentialStore::new(CONFIG.data_dir.clone())),
     };
 
