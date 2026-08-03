@@ -101,7 +101,10 @@ impl ArbiterCollection {
     pub async fn is_newer(&self, did: &str, key: &str, rev: &str) -> bool {
         let map = self.inner.lock().await;
         match map.get(did) {
-            Some(entry) => entry.revs.get(key).map_or(true, |old| rev > old.as_str()),
+            Some(entry) => entry
+                .revs
+                .get(key)
+                .is_none_or(|old| rev > old.as_str()),
             None => false,
         }
     }

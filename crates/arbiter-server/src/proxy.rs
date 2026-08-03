@@ -54,7 +54,15 @@ async fn get_or_login(stewarded_did: &str, creds: &PdsCredentials) -> Result<Arc
     if let Some(session) = SESSIONS.get(stewarded_did).await {
         return Ok(session);
     }
+    login_fresh(stewarded_did, creds).await
+}
 
+/// Always create a fresh session via `createSession`, cache it, and return it.
+///
+/// Used both for first-time login and for the re-login fallback when a cached
+/// session's access **and** refresh tokens have both been revoked. Overwrites
+/// any stale cached session for the steward.
+async fn login_fresh(stewarded_did: &str, creds: &PdsCredentials) -> Result<Arc<Session>, XrpcError> {
     let client = ReqwestClient::new(&creds.pds_url);
     let session = Arc::new(CredentialSession::new(client, MemorySessionStore::default()));
     if let Err(e) = session.login(stewarded_did, &creds.password).await {
@@ -70,6 +78,18 @@ async fn get_or_login(stewarded_did: &str, creds: &PdsCredentials) -> Result<Arc
         .insert(stewarded_did.to_string(), Arc::clone(&session))
         .await;
     Ok(session)
+}
+
+/// Whether an XRPC error envelope is a PDS `ExpiredToken` response.
+///
+/// Mirrors `atrium`'s `is_expired`: the upstream rejected our access token
+/// (usually because the refresh token is also dead and `refreshSession` failed,
+/// since a live refresh token is handled transparently by the client).
+fn is_expired_token(err: &XrpcError) -> bool {
+    match &err.error {
+        Some(XrpcErrorKind::Undefined(body)) => body.error.as_deref() == Some("ExpiredToken"),
+        _ => false,
+    }
 }
 
 /// Send `request` to `endpoint` (`did#service`), authenticating to the
@@ -104,12 +124,46 @@ pub async fn execute_remote(
     // Clone with a per-request proxy header targeting the policy-supplied
     // endpoint. The clone shares the authenticated session store but gets its
     // own inner client, so the proxy header isn't raced across requests.
-    let proxied = session.clone_with_proxy(target_did, &service);
+    let proxied = session.clone_with_proxy(target_did.clone(), &service);
 
-    match proxied
+    let result = proxied
         .send_xrpc::<Value, Value, Value, Value>(request)
-        .await
+        .await;
+
+    // Re-login fallback: if the upstream rejected the token (both access and
+    // refresh are dead — atrium already retried via refreshSession once), drop
+    // the cached session, log in fresh with the steward password, and retry
+    // exactly once. If the fresh login itself fails, propagate the original.
+    if let Err(atrium_xrpc::Error::XrpcResponse(xrpc_err)) = &result
+        && is_expired_token(xrpc_err)
     {
+        warn!(stewarded_did, "proxy session token fully revoked; re-logging in");
+        match login_fresh(stewarded_did, creds).await {
+            Ok(fresh) => {
+                let retried = fresh
+                    .clone_with_proxy(target_did, &service)
+                    .send_xrpc::<Value, Value, Value, Value>(request)
+                    .await;
+                return Ok(match retried {
+                    Ok(OutputDataOrBytes::Data(json)) => XrpcOutput::Data(json),
+                    Ok(OutputDataOrBytes::Bytes(bytes)) => XrpcOutput::Bytes(bytes),
+                    Err(atrium_xrpc::Error::XrpcResponse(xrpc_err)) => {
+                        return Err(xrpc_err)
+                    }
+                    Err(e) => {
+                        warn!(endpoint, "proxy retry send_xrpc failed: {e:?}");
+                        return Err(upstream_error(
+                            axum::http::StatusCode::BAD_GATEWAY,
+                            format!("proxy retry failed: {e}"),
+                        ));
+                    }
+                });
+            }
+            Err(_) => warn!(stewarded_did, "re-login failed after ExpiredToken"),
+        }
+    }
+
+    match result {
         Ok(OutputDataOrBytes::Data(json)) => Ok(XrpcOutput::Data(json)),
         Ok(OutputDataOrBytes::Bytes(bytes)) => Ok(XrpcOutput::Bytes(bytes)),
         Err(atrium_xrpc::Error::XrpcResponse(xrpc_err)) => {

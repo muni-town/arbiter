@@ -164,6 +164,7 @@ dependencies = [
  "futures-util",
  "libsql",
  "moka",
+ "rand 0.9.4",
  "regorus",
  "reqwest",
  "serde",

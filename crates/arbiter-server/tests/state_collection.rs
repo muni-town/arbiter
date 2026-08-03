@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use arbiter_core::arbiter::{Arbiter, ArbiterReqMachineStep, Policies, RequestCtx};
 use arbiter_core::policy::PolicyVm;
 use arbiter_core::xrpc::{XrpcOutput, XrpcRequest};
-use atrium_xrpc::InputDataOrBytes;
 use atrium_xrpc::http;
 use regorus::Value;
 
@@ -97,7 +96,7 @@ async fn onboard_then_request_succeeds() {
         ArbiterReqMachineStep::Completed(Ok(XrpcOutput::Data(json))) => {
             assert_eq!(json, serde_json::json!({ "got": "com.example.foo" }));
         }
-        ArbiterReqMachineStep::Completed(Ok(other)) => {
+        ArbiterReqMachineStep::Completed(Ok(_other)) => {
             panic!("expected Data output, got a different output variant");
         }
         other => panic!("expected immediate completion, got {other:?}"),
@@ -149,7 +148,7 @@ async fn update_policies_keeps_pds_endpoint() {
         ArbiterReqMachineStep::Completed(Ok(XrpcOutput::Data(json))) => {
             assert_eq!(json, serde_json::json!({ "got": "v2" }));
         }
-        ArbiterReqMachineStep::Completed(Ok(other)) => {
+        ArbiterReqMachineStep::Completed(Ok(_other)) => {
             panic!("expected Data output, got a different output variant");
         }
         other => panic!("expected completion with v2 policy, got {other:?}"),

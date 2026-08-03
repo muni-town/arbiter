@@ -14,6 +14,8 @@ pub enum AppError {
     MissingHeader(&'static str),
     #[error("invalid header {0}: {1}")]
     InvalidHeader(&'static str, String),
+    #[error("no #atproto_pds service for {0}")]
+    MissingPdsEndpoint(String),
     #[error("unauthorized: {0}")]
     Unauthorized(String),
     #[error(transparent)]
@@ -25,7 +27,7 @@ impl IntoResponse for AppError {
         let status = match &self {
             AppError::ArbiterNotFound(_) => StatusCode::NOT_FOUND,
             AppError::ArbiterNotReady(_) => StatusCode::SERVICE_UNAVAILABLE,
-            AppError::MissingHeader(_) | AppError::InvalidHeader(_, _) => StatusCode::BAD_REQUEST,
+            AppError::MissingHeader(_) | AppError::InvalidHeader(_, _) | AppError::MissingPdsEndpoint(_) => StatusCode::BAD_REQUEST,
             AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             AppError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };

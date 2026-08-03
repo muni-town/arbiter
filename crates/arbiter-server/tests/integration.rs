@@ -35,6 +35,9 @@ use arbiter_server::policy;
 use arbiter_server::state::ArbiterCollection;
 use arbiter_server::AppState;
 
+/// The mock PDS record map keyed by `(repo, collection, rkey)`.
+type RecordMap = Arc<Mutex<HashMap<(String, String, String), Value>>>;
+
 // ─── constants matching the server's policy record layout ───────────────────
 
 const SERVICE_COLLECTION: &str = "town.muni.arbiter.service";
@@ -144,7 +147,7 @@ fn make_req() -> XrpcRequest {
 
 #[derive(Clone)]
 struct PdsState {
-    records: Arc<Mutex<HashMap<(String, String, String), Value>>>,
+    records: RecordMap,
 }
 
 async fn get_record_handler(
@@ -212,7 +215,7 @@ async fn create_account_handler() -> Response {
 
 /// Start a mock PDS on a random port backed by the shared record map. The
 /// server runs for the lifetime of the test's tokio runtime.
-async fn start_mock_pds(records: Arc<Mutex<HashMap<(String, String, String), Value>>>) -> SocketAddr {
+async fn start_mock_pds(records: RecordMap) -> SocketAddr {
     let state = PdsState { records };
     let app = axum::Router::new()
         .route(
@@ -245,7 +248,7 @@ async fn start_mock_pds(records: Arc<Mutex<HashMap<(String, String, String), Val
 /// Populate the service + root policy records for `steward_did` (no
 /// sub-policies). The mock PDS is responsible for serving these.
 async fn populate_standard_records(
-    records: &Arc<Mutex<HashMap<(String, String, String), Value>>>,
+    records: &RecordMap,
     steward_did: &str,
     policy_source: &str,
 ) {
@@ -264,7 +267,7 @@ async fn populate_standard_records(
 
 struct PolicyEnv {
     state: Arc<AppState>,
-    records: Arc<Mutex<HashMap<(String, String, String), Value>>>,
+    records: RecordMap,
     steward_did: String,
 }
 

@@ -38,6 +38,8 @@ regorus = { version = "0.11.0", default-features = false, features = ["rvm", "ar
 libsql = { version = "0.9", default-features = false, features = ["core", "remote", "tls"] }
 # AES-256-GCM for encrypting the password field at rest.
 aes-gcm = "0.11"
+# CSPRNG for steward passwords.
+rand = "0.9"
 # base64 encoding of the encryption key and encrypted password blobs.
 base64 = "0.22"
 # --- Jetstream subscription (policy/service-record hot reload) ---

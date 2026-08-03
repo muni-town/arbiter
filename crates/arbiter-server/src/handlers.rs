@@ -28,6 +28,7 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use moka::future::Cache;
+use rand::RngCore;
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 
@@ -198,7 +199,7 @@ async fn resolve_pds_endpoint(
         .iter()
         .find(|s| s.id == "#atproto_pds" || s.id == "atproto_pds")
         .map(|s| s.service_endpoint.clone())
-        .ok_or_else(|| AppError::Other(anyhow::anyhow!("no #atproto_pds service for {did}")))?;
+        .ok_or_else(|| AppError::MissingPdsEndpoint(did.to_string()))?;
     PDS_CACHE.insert(did.to_string(), ep.clone()).await;
     Ok(ep)
 }
@@ -388,20 +389,21 @@ fn ok_response() -> Response {
 
 // ----- small helpers ------------------------------------------------------
 
-/// A random-ish opaque secret (not cryptographically strong, but sufficient
-/// for a server-generated steward password; the password is stored locally).
+/// A random opaque secret used as a server-generated steward password.
+///
+/// Drawn from a CSPRNG (`rand`) and base64-encoded (URL-safe, unpadded) so the
+/// password has full entropy per byte and no ambiguous characters. The password
+/// is stored encrypted-at-rest locally and used to authenticate as the steward.
 fn random_secret(len: usize) -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let base = format!("arb-{pid:x}-{nanos:x}");
-    if base.len() >= len {
-        base[..len].to_string()
-    } else {
-        format!("{base:0>len$}")
-    }
+    use base64::Engine;
+    // `len` is the number of *base64 characters* we return, not bytes. Each byte
+    // of output carries `len * 6/8` bits of entropy; round up to a whole number
+    // of bytes and let the encoding trim to the requested length.
+    let byte_len = (len * 6).div_ceil(8);
+    let mut bytes = vec![0u8; byte_len];
+    rand::rng().fill_bytes(&mut bytes);
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
+    encoded.chars().take(len).collect()
 }
 
 /// A random-ish valid handle using the configured suffix

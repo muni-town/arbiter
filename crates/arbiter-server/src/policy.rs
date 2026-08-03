@@ -274,10 +274,10 @@ async fn get_record(
     }
     // Distinguish "record not found" (absent) from real errors.
     let parsed: Option<Json> = serde_json::from_slice(&body).ok();
-    if let Some(j) = &parsed {
-        if j.get("error").and_then(|e| e.as_str()) == Some("RecordNotFound") {
-            return Ok(None);
-        }
+    if let Some(j) = &parsed
+        && j.get("error").and_then(|e| e.as_str()) == Some("RecordNotFound")
+    {
+        return Ok(None);
     }
     if status == reqwest::StatusCode::NOT_FOUND || (status.as_u16() == 400 && parsed.is_none()) {
         return Ok(None);
@@ -288,7 +288,8 @@ async fn get_record(
     ))
 }
 
-/// List records in a collection via `com.atproto.repo.listRecords`. Returns
+/// List records in a collection via `com.atproto.repo.listRecords`, following
+/// the `cursor` pagination until every record is fetched. Returns
 /// `(rkey, record_value)` pairs, keyed by the record rkey (the segment after the
 /// final `/` in each record's `uri`).
 async fn list_records(
@@ -298,45 +299,57 @@ async fn list_records(
     repo: &str,
     collection: &str,
 ) -> Result<Vec<(String, Json)>> {
-    let url = format!(
+    let base = format!(
         "{}/xrpc/com.atproto.repo.listRecords",
         pds_url.trim_end_matches('/')
     );
-    let mut req = client.get(&url).query(&[
-        ("repo", repo),
-        ("collection", collection),
-        ("limit", "100"),
-    ]);
-    if let Some(t) = token {
-        req = req.bearer_auth(t);
-    }
-    let resp = req.send().await.context("listRecords request")?;
-    let status = resp.status();
-    let body = resp.bytes().await.context("listRecords body")?;
-    if !status.is_success() {
-        return Err(anyhow!(
-            "listRecords {collection} failed: {status}: {}",
-            String::from_utf8_lossy(&body)
-        ));
-    }
-    let v: Json = serde_json::from_slice(&body).context("listRecords json")?;
-    let records = v
-        .get("records")
-        .and_then(|r| r.as_array())
-        .ok_or_else(|| anyhow!("listRecords response missing 'records' array"))?;
-    let mut out = Vec::with_capacity(records.len());
-    for rec in records {
-        let uri = rec
-            .get("uri")
-            .and_then(|u| u.as_str())
-            .ok_or_else(|| anyhow!("listRecords entry missing 'uri'"))?;
-        let value = rec
-            .get("value")
-            .cloned()
-            .ok_or_else(|| anyhow!("listRecords entry missing 'value'"))?;
-        // at-uri: at://<did>/<collection>/<rkey> -> rkey is the last segment.
-        let rkey = uri.rsplit('/').next().unwrap_or("").to_string();
-        out.push((rkey, value));
+    const PAGE_SIZE: &str = "100";
+    let mut cursor: Option<String> = None;
+    let mut out = Vec::new();
+    loop {
+        let mut req = client.get(&base).query(&[
+            ("repo", repo),
+            ("collection", collection),
+            ("limit", PAGE_SIZE),
+        ]);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        if let Some(c) = &cursor {
+            req = req.query(&[("cursor", c)]);
+        }
+        let resp = req.send().await.context("listRecords request")?;
+        let status = resp.status();
+        let body = resp.bytes().await.context("listRecords body")?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "listRecords {collection} failed: {status}: {}",
+                String::from_utf8_lossy(&body)
+            ));
+        }
+        let v: Json = serde_json::from_slice(&body).context("listRecords json")?;
+        let records = v
+            .get("records")
+            .and_then(|r| r.as_array())
+            .ok_or_else(|| anyhow!("listRecords response missing 'records' array"))?;
+        for rec in records {
+            let uri = rec
+                .get("uri")
+                .and_then(|u| u.as_str())
+                .ok_or_else(|| anyhow!("listRecords entry missing 'uri'"))?;
+            let value = rec
+                .get("value")
+                .cloned()
+                .ok_or_else(|| anyhow!("listRecords entry missing 'value'"))?;
+            // at-uri: at://<did>/<collection>/<rkey> -> rkey is the last segment.
+            let rkey = uri.rsplit('/').next().unwrap_or("").to_string();
+            out.push((rkey, value));
+        }
+        // Follow the pagination cursor until the server stops returning one.
+        cursor = v.get("cursor").and_then(|c| c.as_str()).map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
     }
     Ok(out)
 }
