@@ -4,6 +4,8 @@
 //! arbiter. It is relatively low-level, providing a state machine for Rego
 //! execution with custom host functions, but no arbiter-specific functionality.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use regorus::{
     PolicyModule, Value,
@@ -12,6 +14,7 @@ use regorus::{
         RegoVM,
         vm::{ExecutionState, SuspendReason},
     },
+    utils::limits::ExecutionTimerConfig,
 };
 
 /// A thin wrapper around a [Rego][`regorus`] [VM][`RegoVM`] that makes it
@@ -20,7 +23,29 @@ use regorus::{
 #[derive(Debug)]
 pub struct PolicyVm {
     data: Value,
+    /// Wall-clock budget per evaluation (`None` disables the limit).
+    time_limit: Option<Duration>,
     vm: RegoVM,
+}
+
+/// Default wall-clock budget for a single policy evaluation.
+///
+/// The limit is enforced cooperatively by the [`RegoVM`]'s execution timer: it
+/// ticks once per VM instruction and only counts wall-clock time spent *inside*
+/// the policy evaluator. Time spent in async host functions (e.g. `xrpc` and
+/// `policy` calls) is suspended out, so the budget bounds the work the untrusted
+/// policy can perform, not host latency. A tight infinite loop will burn this
+/// budget and be aborted with a time-limit error.
+const DEFAULT_EXECUTION_TIME_LIMIT: Duration = Duration::from_millis(100);
+
+/// Build an [`ExecutionTimerConfig`] from a wall-clock budget, checking the
+/// clock every 1 VM instruction so a tight loop is caught as soon as the budget
+/// is exceeded.
+fn execution_timer_config(limit: Duration) -> ExecutionTimerConfig {
+    ExecutionTimerConfig {
+        limit,
+        check_interval: std::num::NonZeroU32::new(1).expect("1 is non-zero"),
+    }
 }
 
 impl Clone for PolicyVm {
@@ -42,9 +67,11 @@ impl Clone for PolicyVm {
         vm.set_data(self.data.clone())
             .expect("clone preserves the program+data pair that new() already validated");
         vm.set_execution_mode(regorus::rvm::vm::ExecutionMode::Suspendable);
+        vm.set_execution_timer_config(self.time_limit.map(execution_timer_config));
 
         Self {
             data: self.data.clone(),
+            time_limit: self.time_limit,
             vm,
         }
     }
@@ -59,7 +86,25 @@ pub enum PolicyVmOutput {
 }
 
 impl PolicyVm {
-    /// Create a new policy VM.
+    /// Create a new policy VM with the default execution time limit.
+    ///
+    /// See [`Self::with_time_limit`] for configuring (or disabling) the budget.
+    pub fn new(
+        policy: &str,
+        data: Value,
+        entrypoint: &str,
+        async_host_fns: &[&str],
+    ) -> Result<Self> {
+        Self::with_time_limit(
+            policy,
+            data,
+            entrypoint,
+            async_host_fns,
+            Some(DEFAULT_EXECUTION_TIME_LIMIT),
+        )
+    }
+
+    /// Create a new policy VM with a configurable execution time limit.
     ///
     /// - `policy`: the Rego policy source code to create the VM for.
     /// - `data`: the value of the static `data` global that will be available
@@ -72,11 +117,16 @@ impl PolicyVm {
     ///   opportunity to make any requests or do any processing and provide the
     ///   result to the VM before resuming execution. Host functions that need a
     ///   different arity are not currently supported.
-    pub fn new(
+    /// - `time_limit`: the maximum wall-clock budget per evaluation, enforced
+    ///   cooperatively by the [`RegoVM`]. Only time the VM spends executing policy
+    ///   instructions counts against it; time spent in async host functions does
+    ///   not. Passing `None` disables the limit.
+    pub fn with_time_limit(
         policy: &str,
         data: Value,
         entrypoint: &str,
         async_host_fns: &[&str],
+        time_limit: Option<Duration>,
     ) -> Result<Self> {
         // First compile the module into a compiled policy
         let compiled_policy = regorus::compile_policy_with_entrypoint(
@@ -102,8 +152,13 @@ impl PolicyVm {
         vm.load_program(program);
         vm.set_data(data.clone())?;
         vm.set_execution_mode(regorus::rvm::vm::ExecutionMode::Suspendable);
+        vm.set_execution_timer_config(time_limit.map(execution_timer_config));
 
-        Ok(Self { data, vm })
+        Ok(Self {
+            data,
+            time_limit,
+            vm,
+        })
     }
 
     /// Start evaluating a policy. The provided input will be set as the `input`
