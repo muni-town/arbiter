@@ -19,14 +19,14 @@ pub struct ServerConfig {
     )]
     pub server_did: String,
 
-    /// Jetstream endpoint (wss) to subscribe to for policy/service-record hot
-    /// reload and auto-delete.
+    /// Jetstream hostname (host[:port]) to subscribe to for policy/service-record
+    /// hot reload and auto-delete.
     #[arg(
-        long = "jetstream-url",
-        env = "JETSTREAM_URL",
-        default_value = "wss://jetstream.atproto.tools/subscribe"
+        long = "jetstream-host",
+        env = "JETSTREAM_HOST",
+        default_value = "jetstream.atproto.tools"
     )]
-    pub jetstream_url: String,
+    pub jetstream_host: String,
 
     /// Default PDS URL to create new stewarded accounts against.
     #[arg(

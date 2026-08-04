@@ -85,7 +85,6 @@ pub async fn subscribe(state: Arc<AppState>) {
 /// stewards. An account created after this subscription is live therefore still
 /// gets hot-reload/auto-delete without a reconnect.
 async fn run_subscription(state: &Arc<AppState>) -> anyhow::Result<()> {
-    let host = jetstream_host(&CONFIG.jetstream_url);
     let config = ConsumerTaskConfig {
         user_agent: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
         // TODO(compression): consider enabling Zstandard compression to save on
@@ -95,7 +94,7 @@ async fn run_subscription(state: &Arc<AppState>) -> anyhow::Result<()> {
         // dictionary fails the whole subscription). Deferred for simplicity.
         compression: false,
         zstd_dictionary_location: String::new(),
-        jetstream_hostname: host.to_string(),
+        jetstream_hostname: CONFIG.jetstream_host.clone(),
         collections: WATCHED_COLLECTIONS.iter().map(|s| s.to_string()).collect(),
         // Subscribe to all DIDs; each event is filtered per-event by whether the
         // server stewards the affected account (see `ReloadHandler`).
@@ -123,20 +122,6 @@ async fn run_subscription(state: &Arc<AppState>) -> anyhow::Result<()> {
         Ok(Err(e)) => Err(e),
         Err(e) => Err(anyhow!("jetstream consumer task panicked: {e}")),
     }
-}
-
-/// Derive the `host[:port]` for the Jetstream consumer from the configured URL.
-///
-/// `CONFIG.jetstream_url` is a full `wss://host[:port]/subscribe` URL; the
-/// library builds its own subscribe path from a bare hostname, so we strip the
-/// scheme and path.
-fn jetstream_host(url: &str) -> &str {
-    let trimmed = url.trim_end_matches('/');
-    let after_scheme = trimmed
-        .strip_prefix("wss://")
-        .or_else(|| trimmed.strip_prefix("ws://"))
-        .unwrap_or(trimmed);
-    after_scheme.split('/').next().unwrap_or(after_scheme)
 }
 
 /// Handler that reloads arbiters on watched policy/service-record events.
