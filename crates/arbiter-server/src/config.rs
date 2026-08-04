@@ -50,11 +50,11 @@ pub struct ServerConfig {
 
     /// Local Turso database file for the credential store (e.g. `./data/arbiter-server.db`).
     #[arg(
-        long = "turso-url",
-        env = "TURSO_URL",
+        long = "db-file",
+        env = "DB_FILE",
         default_value = "./data/arbiter-server.db"
     )]
-    pub turso_url: String,
+    pub db_file: String,
 
     /// Handle domain suffix for newly created stewarded accounts
     /// (e.g. `.muni.town` → handle `arbiter-<random>.muni.town`).
