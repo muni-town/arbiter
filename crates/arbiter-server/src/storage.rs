@@ -19,15 +19,15 @@ use tokio::sync::OnceCell;
 use crate::credstore::{CredentialStore, PdsCredentials};
 
 /// Schema for the credentials table. `password` is stored in plaintext (see module docs).
+/// Only the password is persisted; the PDS endpoint is resolved from the DID doc.
 const SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS arbiter_credentials (\n\
     did       TEXT PRIMARY KEY NOT NULL,\n\
-    pds_url   TEXT NOT NULL,\n\
     password  TEXT NOT NULL\n\
 );";
 
 /// Upsert a credential row, keyed by DID.
-const UPSERT_SQL: &str = "INSERT INTO arbiter_credentials (did, pds_url, password) VALUES (?, ?, ?)\n\
-     ON CONFLICT(did) DO UPDATE SET pds_url = excluded.pds_url, password = excluded.password";
+const UPSERT_SQL: &str = "INSERT INTO arbiter_credentials (did, password) VALUES (?, ?)\n\
+     ON CONFLICT(did) DO UPDATE SET password = excluded.password";
 
 /// Durable credential store backed by a local Turso database file.
 ///
@@ -84,7 +84,7 @@ impl CredentialStore for TursoCredentialStore {
         let conn = self.conn().await?;
         conn.execute(
             UPSERT_SQL,
-            turso::params![did, creds.pds_url, creds.password],
+            turso::params![did, creds.password],
         )
         .await
         .context("failed to store credentials")?;
@@ -95,16 +95,15 @@ impl CredentialStore for TursoCredentialStore {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
-                "SELECT pds_url, password FROM arbiter_credentials WHERE did = ?",
+                "SELECT password FROM arbiter_credentials WHERE did = ?",
                 turso::params![did],
             )
             .await
-            .context("failed to query credentials")?;
+            .context("failed to get credentials")?;
         match rows.next().await? {
             Some(row) => {
-                let pds_url: String = row.get(0)?;
-                let password: String = row.get(1)?;
-                Ok(Some(PdsCredentials { pds_url, password }))
+                let password: String = row.get(0)?;
+                Ok(Some(PdsCredentials { password }))
             }
             None => Ok(None),
         }
@@ -124,15 +123,14 @@ impl CredentialStore for TursoCredentialStore {
     async fn list(&self) -> Result<Vec<(String, PdsCredentials)>> {
         let conn = self.conn().await?;
         let mut rows = conn
-            .query("SELECT did, pds_url, password FROM arbiter_credentials", ())
+            .query("SELECT did, password FROM arbiter_credentials", ())
             .await
             .context("failed to list credentials")?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             let did: String = row.get(0)?;
-            let pds_url: String = row.get(1)?;
-            let password: String = row.get(2)?;
-            out.push((did, PdsCredentials { pds_url, password }));
+            let password: String = row.get(1)?;
+            out.push((did, PdsCredentials { password }));
         }
         Ok(out)
     }

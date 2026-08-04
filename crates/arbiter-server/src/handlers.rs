@@ -133,7 +133,9 @@ async fn xrpc_handler(
                             "no stored credentials for arbiter {arbiter_did}"
                         ))
                     })?;
-                let resp = proxy::execute_remote(&arbiter_did, &endpoint, &request, &creds).await;
+                let resp =
+                    proxy::execute_remote(&arbiter_did, &pds_endpoint, &creds.password, &endpoint, &request)
+                        .await;
                 step = machine.resume(resp);
             }
         }
@@ -225,10 +227,11 @@ async fn create_arbiter(state: &AppState, caller: &str) -> Result<Response, AppE
     // Persist credentials last, only once the account is fully provisioned and
     // the arbiter is online. If any earlier step failed we return an error
     // without storing credentials, so startup never retries an arbiter against
-    // a half-created account.
+    // a half-created account. Only the password is stored; the PDS endpoint is
+    // always resolved from the account's DID doc.
     state
         .store
-        .store(new_did, PdsCredentials { pds_url, password })
+        .store(new_did, PdsCredentials { password })
         .await
         .map_err(AppError::from)?;
 
@@ -237,10 +240,11 @@ async fn create_arbiter(state: &AppState, caller: &str) -> Result<Response, AppE
 
 /// Import an existing account (`town.muni.arbiter.createAppPasswordArbiter`).
 ///
-/// Input carries `arbiterDid` + `appPassword` (+ optional `pdsUrl`, else
-/// resolved from the DID). Stores credentials, writes the
-/// `service/self` + `recovery/self` records from the account's session, then
-/// brings the arbiter online.
+/// Input carries `arbiterDid` + `appPassword`. The PDS endpoint is always
+/// resolved from the account's DID doc (`#atproto_pds`); no URL override is
+/// permitted. Stores the password, writes the `service/self` +
+/// `recovery/self` records from the account's session, then brings the arbiter
+/// online.
 async fn create_app_password_arbiter(
     state: &AppState,
     caller: &str,
@@ -258,12 +262,9 @@ async fn create_app_password_arbiter(
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::Other(anyhow::anyhow!("missing appPassword")))?
         .to_string();
-    let pds_url = match body_json.get("pdsUrl").and_then(|v| v.as_str()) {
-        Some(u) => u.to_string(),
-        None => resolver::resolve_pds_endpoint(&*state.resolver, &arbiter_did).await?,
-    };
+    let pds_endpoint = resolver::resolve_pds_endpoint(&*state.resolver, &arbiter_did).await?;
 
-    let writer = login_session(&arbiter_did, &app_password, &pds_url).await?;
+    let writer = login_session(&arbiter_did, &app_password, &pds_endpoint).await?;
     write_service_and_recovery(&writer, &arbiter_did, caller).await?;
 
     policy::load_and_onboard(state, &arbiter_did)
@@ -272,16 +273,11 @@ async fn create_app_password_arbiter(
 
     // Persist credentials last, only once the account is fully provisioned and
     // the arbiter is online. If any earlier step failed we return an error
-    // without storing credentials.
+    // without storing credentials. Only the password is stored; the PDS
+    // endpoint is always resolved from the account's DID doc.
     state
         .store
-        .store(
-            arbiter_did,
-            PdsCredentials {
-                pds_url,
-                password: app_password,
-            },
-        )
+        .store(arbiter_did, PdsCredentials { password: app_password })
         .await
         .map_err(AppError::from)?;
 

@@ -6,9 +6,12 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 /// Credentials for acting as a stewarded account against its PDS.
+///
+/// The PDS endpoint is *not* stored here — it is always resolved from the
+/// account's DID document (`#atproto_pds`), so the DID doc is the single
+/// authority for where the account lives.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PdsCredentials {
-    pub pds_url: String,
     pub password: String,
 }
 
