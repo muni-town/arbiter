@@ -8,9 +8,18 @@ use std::collections::HashMap;
 
 use arbiter_core::arbiter::{Arbiter, ArbiterReqMachine, RequestCtx};
 use arbiter_core::xrpc::XrpcRequest;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use crate::error::AppError;
+
+/// The set of currently-active arbiters.
+#[derive(Default)]
+pub struct ArbiterCollection {
+    /// `RwLock` so concurrent requests for *different* DIDs can clone their
+    /// request machines in parallel (the hot path only reads). Writes are the
+    /// rare jetstream lifecycle events (`onboard`/`offboard`/`set_rev`).
+    inner: RwLock<HashMap<String, ArbiterEntry>>,
+}
 
 /// A loaded arbiter plus its per-arbiter state.
 struct ArbiterEntry {
@@ -30,12 +39,6 @@ pub struct RequestDrive {
     pub pds_endpoint: String,
 }
 
-/// The set of currently-active arbiters.
-#[derive(Default)]
-pub struct ArbiterCollection {
-    inner: Mutex<HashMap<String, ArbiterEntry>>,
-}
-
 impl ArbiterCollection {
     pub fn new() -> Self {
         Self::default()
@@ -44,7 +47,7 @@ impl ArbiterCollection {
     /// Onboard (or replace) an arbiter for the given DID with freshly loaded
     /// policies. Resets rev tracking.
     pub async fn onboard(&self, did: String, arbiter: Arbiter, pds_endpoint: String) {
-        let mut map = self.inner.lock().await;
+        let mut map = self.inner.write().await;
         map.insert(
             did,
             ArbiterEntry {
@@ -58,7 +61,7 @@ impl ArbiterCollection {
     /// Stop serving an arbiter (e.g. its service record disappeared). Keeps
     /// credentials; the arbiter may be re-onboarded later. Returns was-active.
     pub async fn offboard(&self, did: &str) -> bool {
-        self.inner.lock().await.remove(did).is_some()
+        self.inner.write().await.remove(did).is_some()
     }
 
     /// Begin a request against the arbiter for `did`. Fail-closed: a missing
@@ -69,9 +72,9 @@ impl ArbiterCollection {
         req: XrpcRequest,
         ctx: RequestCtx,
     ) -> Result<RequestDrive, AppError> {
-        let mut map = self.inner.lock().await;
+        let map = self.inner.read().await;
         let entry = map
-            .get_mut(did)
+            .get(did)
             .ok_or_else(|| AppError::ArbiterNotReady(did.to_string()))?;
         let machine = entry.arbiter.handle_request(req, ctx);
         Ok(RequestDrive {
@@ -84,7 +87,7 @@ impl ArbiterCollection {
     /// `key` (string comparison; atproto repo revs are TID-based and
     /// lexicographically ordered), or if no rev is stored yet.
     pub async fn is_newer(&self, did: &str, key: &str, rev: &str) -> bool {
-        let map = self.inner.lock().await;
+        let map = self.inner.read().await;
         match map.get(did) {
             Some(entry) => entry.revs.get(key).is_none_or(|old| rev > old.as_str()),
             None => false,
@@ -93,7 +96,7 @@ impl ArbiterCollection {
 
     /// Record the last-applied `rev` for a record key.
     pub async fn set_rev(&self, did: &str, key: &str, rev: String) {
-        let mut map = self.inner.lock().await;
+        let mut map = self.inner.write().await;
         if let Some(entry) = map.get_mut(did) {
             entry.revs.insert(key.to_string(), rev);
         }

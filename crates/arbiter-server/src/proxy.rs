@@ -12,13 +12,13 @@
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use arbiter_core::xrpc::{XrpcError, XrpcOutput, XrpcRequest, XrpcResult};
+use arbiter_core::xrpc::{XrpcError, XrpcRequest, XrpcResult};
 use atrium_api::agent::CloneWithProxy;
 use atrium_api::agent::atp_agent::CredentialSession;
 use atrium_api::agent::atp_agent::store::MemorySessionStore;
 use atrium_api::types::string::Did;
 use atrium_xrpc::error::{ErrorResponseBody, XrpcErrorKind};
-use atrium_xrpc::{OutputDataOrBytes, XrpcClient};
+use atrium_xrpc::XrpcClient;
 use atrium_xrpc_client::reqwest::ReqwestClient;
 use moka::future::Cache;
 use serde_json::Value;
@@ -156,9 +156,8 @@ pub async fn execute_remote(
                     .clone_with_proxy(target_did, &service)
                     .send_xrpc::<Value, Value, Value, Value>(request)
                     .await;
-                return Ok(match retried {
-                    Ok(OutputDataOrBytes::Data(json)) => XrpcOutput::Data(json),
-                    Ok(OutputDataOrBytes::Bytes(bytes)) => XrpcOutput::Bytes(bytes),
+                return match retried {
+                    Ok(ok) => Ok(ok),
                     Err(atrium_xrpc::Error::XrpcResponse(xrpc_err)) => return Err(xrpc_err),
                     Err(e) => {
                         warn!(endpoint, "proxy retry send_xrpc failed: {e:?}");
@@ -167,15 +166,14 @@ pub async fn execute_remote(
                             format!("proxy retry failed: {e}"),
                         ));
                     }
-                });
+                };
             }
             Err(_) => warn!(stewarded_did, "re-login failed after ExpiredToken"),
         }
     }
 
     match result {
-        Ok(OutputDataOrBytes::Data(json)) => Ok(XrpcOutput::Data(json)),
-        Ok(OutputDataOrBytes::Bytes(bytes)) => Ok(XrpcOutput::Bytes(bytes)),
+        Ok(ok) => Ok(ok),
         Err(atrium_xrpc::Error::XrpcResponse(xrpc_err)) => {
             // The upstream returned an XRPC error envelope; surface it as-is.
             Err(xrpc_err)

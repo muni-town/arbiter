@@ -3,13 +3,6 @@
 //! `TursoCredentialStore` implements [`CredentialStore`](crate::credstore::CredentialStore)
 //! against a local Turso database file using the `turso` crate (the successor to `libsql`).
 //!
-//! ## Why a raw `turso::Connection` and not an ORM
-//!
-//! [`CredentialStore`] methods take `&self`; the Toasty ORM requires `&mut Db` on every
-//! call, which would force a `Mutex` serializing every credential operation. A single
-//! `turso::Connection` (cheaply clonable, `&self` query methods) is shared across all
-//! operations instead.
-//!
 //! ## No encryption at rest (for now)
 //!
 //! Passwords are stored **in plaintext** in the `password` column. This is a deliberate

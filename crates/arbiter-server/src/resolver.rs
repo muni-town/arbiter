@@ -15,8 +15,8 @@ use moka::future::Cache;
 use crate::CONFIG;
 use crate::error::AppError;
 
+/// Identity resolver
 pub static RESOLVER: LazyLock<Arc<dyn IdentityResolver>> = LazyLock::new(|| {
-    // Identity resolver
     let resolver_client = reqwest::Client::builder().use_rustls_tls().build().unwrap();
     let dns_resolver = HickoryDnsResolver::create_resolver(&[]);
     let identity_resolver = SharedIdentityResolver(Arc::new(InnerIdentityResolver {
@@ -40,9 +40,9 @@ static PDS_CACHE: LazyLock<Cache<String, String>> = LazyLock::new(|| {
 /// Resolve a DID's `#atproto_pds` service endpoint from its DID document, with
 /// a short-lived cache.
 ///
-/// Matches the service id in either canonical form (`#atproto_pds` or the
-/// bare `atproto_pds`). Returns [`AppError::MissingPdsEndpoint`] when the DID
-/// doc declares no such service.
+/// Matches the service id in its canonical fragment form (`#atproto_pds`).
+/// Returns [`AppError::MissingPdsEndpoint`] when the DID doc declares no such
+/// service.
 pub async fn resolve_pds_endpoint(
     resolver: &dyn IdentityResolver,
     did: &str,
@@ -57,7 +57,7 @@ pub async fn resolve_pds_endpoint(
     let ep = doc
         .service
         .iter()
-        .find(|s| s.id == "#atproto_pds" || s.id == "atproto_pds")
+        .find(|s| s.id == "#atproto_pds")
         .map(|s| s.service_endpoint.clone())
         .ok_or_else(|| AppError::MissingPdsEndpoint(did.to_string()))?;
     PDS_CACHE.insert(did.to_string(), ep.clone()).await;
