@@ -37,29 +37,39 @@ static PDS_CACHE: LazyLock<Cache<String, String>> = LazyLock::new(|| {
         .build()
 });
 
-/// Resolve a DID's `#atproto_pds` service endpoint from its DID document, with
-/// a short-lived cache.
+/// Extension trait providing `#atproto_pds` resolution on top of
+/// [`atproto_identity::traits::IdentityResolver`].
 ///
-/// Matches the service id in its canonical fragment form (`#atproto_pds`).
-/// Returns [`AppError::MissingPdsEndpoint`] when the DID doc declares no such
-/// service.
-pub async fn resolve_pds_endpoint(
-    resolver: &dyn IdentityResolver,
-    did: &str,
-) -> Result<String, AppError> {
-    if let Some(ep) = PDS_CACHE.get(did).await {
-        return Ok(ep);
+/// The base trait is from `atproto_identity` and can't gain methods directly,
+/// so this extension lets callers write `resolver.resolve_pds_endpoint(did)`
+/// instead of calling a free function.
+#[async_trait::async_trait]
+pub trait IdentityResolverExt: IdentityResolver {
+    /// Resolve a DID's `#atproto_pds` service endpoint from its DID document,
+    /// with a short-lived cache.
+    ///
+    /// Matches the service id in its canonical fragment form (`#atproto_pds`).
+    /// Returns [`AppError::MissingPdsEndpoint`] when the DID doc declares no
+    /// such service.
+    async fn resolve_pds_endpoint(&self, did: &str) -> Result<String, AppError> {
+        if let Some(ep) = PDS_CACHE.get(did).await {
+            return Ok(ep);
+        }
+        let doc = self
+            .resolve(did)
+            .await
+            .map_err(|e| AppError::Other(anyhow::anyhow!("resolve {did}: {e:#}")))?;
+        let ep = doc
+            .service
+            .iter()
+            .find(|s| s.id == "#atproto_pds")
+            .map(|s| s.service_endpoint.clone())
+            .ok_or_else(|| AppError::MissingPdsEndpoint(did.to_string()))?;
+        PDS_CACHE.insert(did.to_string(), ep.clone()).await;
+        Ok(ep)
     }
-    let doc = resolver
-        .resolve(did)
-        .await
-        .map_err(|e| AppError::Other(anyhow::anyhow!("resolve {did}: {e:#}")))?;
-    let ep = doc
-        .service
-        .iter()
-        .find(|s| s.id == "#atproto_pds")
-        .map(|s| s.service_endpoint.clone())
-        .ok_or_else(|| AppError::MissingPdsEndpoint(did.to_string()))?;
-    PDS_CACHE.insert(did.to_string(), ep.clone()).await;
-    Ok(ep)
 }
+
+// Blanket impl so the method works on any concrete resolver or `dyn
+// IdentityResolver` trait object (e.g. `Arc<dyn IdentityResolver>`).
+impl<T: IdentityResolver + ?Sized> IdentityResolverExt for T {}

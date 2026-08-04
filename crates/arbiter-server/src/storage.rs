@@ -82,12 +82,9 @@ impl TursoCredentialStore {
 impl CredentialStore for TursoCredentialStore {
     async fn store(&self, did: String, creds: PdsCredentials) -> Result<()> {
         let conn = self.conn().await?;
-        conn.execute(
-            UPSERT_SQL,
-            turso::params![did, creds.password],
-        )
-        .await
-        .context("failed to store credentials")?;
+        conn.execute(UPSERT_SQL, turso::params![did, creds.password])
+            .await
+            .context("failed to store credentials")?;
         Ok(())
     }
 

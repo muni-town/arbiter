@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::resolver;
+use crate::resolver::IdentityResolverExt;
 use crate::{AppState, CONFIG};
 use anyhow::{Context, Result, anyhow};
 use arbiter_core::arbiter::{Arbiter, Policies};
@@ -75,7 +75,7 @@ pub async fn startup_onboard(state: Arc<AppState>) -> Result<()> {
                         "load_and_onboard failed; retrying in {delay:?}"
                     );
                     tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(Duration::from_secs(60));
+                    delay *= 2;
                 }
             }
         }
@@ -91,7 +91,9 @@ pub async fn startup_onboard(state: Arc<AppState>) -> Result<()> {
 /// -> `state.arbiters.offboard(did)`; if its `did` field != `CONFIG.server_did`
 /// -> `offboard` + `state.store.remove(did)`.
 pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
-    let pds_endpoint = resolver::resolve_pds_endpoint(&*state.resolver, did)
+    let pds_endpoint = state
+        .resolver
+        .resolve_pds_endpoint(did)
         .await
         .map_err(|e| anyhow::anyhow!("resolving PDS endpoint for {did}: {e:#}"))?;
 
@@ -248,9 +250,7 @@ async fn list_records(
         let params = atrium_api::com::atproto::repo::list_records::ParametersData {
             collection: parse_nsid(collection)?,
             cursor: cursor.clone(),
-            limit: Some(
-                atrium_api::types::LimitedNonZeroU8::<100>::MAX,
-            ),
+            limit: Some(atrium_api::types::LimitedNonZeroU8::<100>::MAX),
             repo: repo.clone(),
             reverse: None,
         }
@@ -266,7 +266,12 @@ async fn list_records(
         for record in output.data.records {
             // at-uri: at://<did>/<collection>/<rkey> -> rkey is the last segment.
             let rkey = record.data.uri.rsplit('/').next().unwrap_or("").to_string();
-            out.push((rkey, RecordSource { source: record.data.value }));
+            out.push((
+                rkey,
+                RecordSource {
+                    source: record.data.value,
+                },
+            ));
         }
         // Follow the pagination cursor until the server stops returning one.
         cursor = output.data.cursor.clone();
@@ -290,9 +295,7 @@ impl RecordSource {
     /// field without depending on ipld internals.
     fn field(&self, name: &str) -> Option<String> {
         let json = serde_json::to_value(&self.source).ok()?;
-        json.get(name)
-            .and_then(|v| v.as_str())
-            .map(String::from)
+        json.get(name).and_then(|v| v.as_str()).map(String::from)
     }
 }
 
@@ -305,10 +308,12 @@ fn rego_source(record: &RecordSource) -> Result<String> {
 
 /// Parse an NSID collection name.
 fn parse_nsid(s: &str) -> Result<Nsid> {
-    s.parse::<Nsid>().map_err(|e| anyhow!("invalid nsid `{s}`: {e}"))
+    s.parse::<Nsid>()
+        .map_err(|e| anyhow!("invalid nsid `{s}`: {e}"))
 }
 
 /// Parse a record key.
 fn parse_record_key(s: &str) -> Result<RecordKey> {
-    s.parse::<RecordKey>().map_err(|e| anyhow!("invalid rkey `{s}`: {e}"))
+    s.parse::<RecordKey>()
+        .map_err(|e| anyhow!("invalid rkey `{s}`: {e}"))
 }

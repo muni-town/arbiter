@@ -26,9 +26,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Credential store: Turso (local SQLite file).
-    let store: Box<dyn CredentialStore> = Box::new(storage::TursoCredentialStore::new(
-        CONFIG.db_file.clone(),
-    )?);
+    let store: Box<dyn CredentialStore> =
+        Box::new(storage::TursoCredentialStore::new(CONFIG.db_file.clone())?);
 
     let state = Arc::new(AppState {
         arbiters: ArbiterCollection::new(),

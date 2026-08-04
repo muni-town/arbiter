@@ -37,7 +37,7 @@ use crate::credstore::PdsCredentials;
 use crate::error::AppError;
 use crate::policy;
 use crate::proxy;
-use crate::resolver;
+use crate::resolver::IdentityResolverExt;
 
 /// Built-in NSID: provision a brand-new stewarded PDS account.
 const NSID_CREATE_ARBITER: &str = "town.muni.arbiter.createArbiter";
@@ -85,7 +85,7 @@ async fn xrpc_handler(
     let arbiter_proxy = header_str(&headers, "arbiter-proxy")?
         .ok_or_else(|| AppError::MissingHeader("arbiter-proxy"))?;
 
-    let pds_endpoint = resolver::resolve_pds_endpoint(&*state.resolver, &arbiter_did).await?;
+    let pds_endpoint = state.resolver.resolve_pds_endpoint(&arbiter_did).await?;
 
     // Build the XRPC request the arbiter policy will evaluate. Query params are
     // surfaced to the policy for GET; the body is parsed as JSON for non-GET.
@@ -133,9 +133,14 @@ async fn xrpc_handler(
                             "no stored credentials for arbiter {arbiter_did}"
                         ))
                     })?;
-                let resp =
-                    proxy::execute_remote(&arbiter_did, &pds_endpoint, &creds.password, &endpoint, &request)
-                        .await;
+                let resp = proxy::execute_remote(
+                    &arbiter_did,
+                    &pds_endpoint,
+                    &creds.password,
+                    &endpoint,
+                    &request,
+                )
+                .await;
                 step = machine.resume(resp);
             }
         }
@@ -262,7 +267,7 @@ async fn create_app_password_arbiter(
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::Other(anyhow::anyhow!("missing appPassword")))?
         .to_string();
-    let pds_endpoint = resolver::resolve_pds_endpoint(&*state.resolver, &arbiter_did).await?;
+    let pds_endpoint = state.resolver.resolve_pds_endpoint(&arbiter_did).await?;
 
     let writer = login_session(&arbiter_did, &app_password, &pds_endpoint).await?;
     write_service_and_recovery(&writer, &arbiter_did, caller).await?;
@@ -277,7 +282,12 @@ async fn create_app_password_arbiter(
     // endpoint is always resolved from the account's DID doc.
     state
         .store
-        .store(arbiter_did, PdsCredentials { password: app_password })
+        .store(
+            arbiter_did,
+            PdsCredentials {
+                password: app_password,
+            },
+        )
         .await
         .map_err(AppError::from)?;
 

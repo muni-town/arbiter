@@ -120,8 +120,7 @@ fn with_time_limit_none_disables_limit() {
     "#;
 
     // A non-looping policy still completes when the limit is disabled.
-    let mut vm =
-        PolicyVm::with_time_limit(policy, data, "data.test.allow", &[], None).unwrap();
+    let mut vm = PolicyVm::with_time_limit(policy, data, "data.test.allow", &[], None).unwrap();
     let input = Value::new_object();
     let PolicyVmOutput::Completed(value) = vm.start(input).unwrap() else {
         panic!("Unexpected suspension");
@@ -130,9 +129,14 @@ fn with_time_limit_none_disables_limit() {
 
     // A custom, non-default limit is honored (fast policy finishes under it).
     let data = Value::new_object();
-    let mut vm =
-        PolicyVm::with_time_limit(policy, data, "data.test.allow", &[], Some(Duration::from_secs(5)))
-            .unwrap();
+    let mut vm = PolicyVm::with_time_limit(
+        policy,
+        data,
+        "data.test.allow",
+        &[],
+        Some(Duration::from_secs(5)),
+    )
+    .unwrap();
     let PolicyVmOutput::Completed(value) = vm.start(Value::new_object()).unwrap() else {
         panic!("Unexpected suspension");
     };

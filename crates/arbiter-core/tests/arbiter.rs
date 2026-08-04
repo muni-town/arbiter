@@ -19,13 +19,8 @@ fn arbiter_policy(src: &str) -> PolicyVm {
 fn arbiter_policy_with_host_fns(src: &str, extra_host_fns: &[&str]) -> PolicyVm {
     let mut host_fns: Vec<&str> = vec!["xrpc", "policy"];
     host_fns.extend_from_slice(extra_host_fns);
-    PolicyVm::new(
-        src,
-        Value::new_object(),
-        "data.arbiter.result",
-        &host_fns,
-    )
-    .expect("policy compiles")
+    PolicyVm::new(src, Value::new_object(), "data.arbiter.result", &host_fns)
+        .expect("policy compiles")
 }
 
 fn make_req(
@@ -52,7 +47,10 @@ fn immediate_completion() {
         "#,
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
+    let mut machine = arbiter.handle_request(
+        make_req(http::Method::GET, "com.example.foo", None),
+        RequestCtx::default(),
+    );
 
     match machine.start() {
         ArbiterReqMachineStep::Completed(Ok(XrpcOutput::Data(json))) => {
@@ -74,7 +72,10 @@ fn xrpc_host_call_roundtrip() {
         "#,
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
+    let mut machine = arbiter.handle_request(
+        make_req(http::Method::GET, "com.example.foo", None),
+        RequestCtx::default(),
+    );
 
     let step = machine.start();
     let request = match step {
@@ -109,14 +110,14 @@ fn xrpc_host_call_targeting_remote() {
         "#,
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
+    let mut machine = arbiter.handle_request(
+        make_req(http::Method::GET, "com.example.foo", None),
+        RequestCtx::default(),
+    );
 
     match machine.start() {
         ArbiterReqMachineStep::RemoteXrpcRequest { endpoint, request } => {
-            assert_eq!(
-                endpoint,
-                "did:web:example.com#atproto_pds".to_string()
-            );
+            assert_eq!(endpoint, "did:web:example.com#atproto_pds".to_string());
             assert_eq!(request.method, http::Method::POST);
             assert_eq!(request.nsid, "com.example.bar");
             // JSON body is passed through as data.
@@ -159,7 +160,10 @@ fn sub_policy_invocation() {
     let mut subs = HashMap::new();
     subs.insert("moderation".to_string(), sub);
     let arbiter = Arbiter::new(Policies::new(root, subs));
-    let mut machine = arbiter.handle_request(make_req(http::Method::POST, "com.example.foo", None), RequestCtx::default());
+    let mut machine = arbiter.handle_request(
+        make_req(http::Method::POST, "com.example.foo", None),
+        RequestCtx::default(),
+    );
 
     match machine.start() {
         ArbiterReqMachineStep::Completed(Ok(XrpcOutput::Data(json))) => {
@@ -191,7 +195,10 @@ fn sub_policy_with_remote_call() {
     let mut subs = HashMap::new();
     subs.insert("moderation".to_string(), sub);
     let arbiter = Arbiter::new(Policies::new(root, subs));
-    let mut machine = arbiter.handle_request(make_req(http::Method::POST, "com.example.foo", None), RequestCtx::default());
+    let mut machine = arbiter.handle_request(
+        make_req(http::Method::POST, "com.example.foo", None),
+        RequestCtx::default(),
+    );
 
     match machine.start() {
         ArbiterReqMachineStep::RemoteXrpcRequest { endpoint, .. } => {
@@ -223,11 +230,14 @@ fn bytes_request_body_roundtrips_through_host_call() {
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
     let payload = b"\x00\x01\x02\xff binary".to_vec();
-    let mut machine = arbiter.handle_request(make_req(
-        http::Method::POST,
-        "com.example.upload",
-        Some(InputDataOrBytes::Bytes(payload.clone())),
-    ), RequestCtx::default());
+    let mut machine = arbiter.handle_request(
+        make_req(
+            http::Method::POST,
+            "com.example.upload",
+            Some(InputDataOrBytes::Bytes(payload.clone())),
+        ),
+        RequestCtx::default(),
+    );
 
     let request = match machine.start() {
         ArbiterReqMachineStep::RemoteXrpcRequest { endpoint, request } => {
@@ -263,7 +273,10 @@ fn error_envelope_becomes_xrpc_error() {
         "#,
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
+    let mut machine = arbiter.handle_request(
+        make_req(http::Method::GET, "com.example.foo", None),
+        RequestCtx::default(),
+    );
 
     match machine.start() {
         ArbiterReqMachineStep::Completed(Err(err)) => {
@@ -292,7 +305,10 @@ fn internal_error_becomes_500_xrpc_error() {
         "#,
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
+    let mut machine = arbiter.handle_request(
+        make_req(http::Method::GET, "com.example.foo", None),
+        RequestCtx::default(),
+    );
 
     match machine.start() {
         ArbiterReqMachineStep::Completed(Err(err)) => {
@@ -324,7 +340,10 @@ fn resume_without_pending_request_panics() {
         "#,
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
+    let mut machine = arbiter.handle_request(
+        make_req(http::Method::GET, "com.example.foo", None),
+        RequestCtx::default(),
+    );
     let _ = machine.start();
     let _ = machine.resume(Ok(XrpcOutput::Data(serde_json::Value::Null)));
 }
@@ -340,7 +359,10 @@ fn start_called_twice_panics() {
         "#,
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
+    let mut machine = arbiter.handle_request(
+        make_req(http::Method::GET, "com.example.foo", None),
+        RequestCtx::default(),
+    );
     let _ = machine.start();
     let _ = machine.start();
 }
@@ -363,7 +385,10 @@ fn policy_call_depth_limit_terminates() {
     let mut subs = HashMap::new();
     subs.insert("loop".to_string(), arbiter_policy(call));
     let arbiter = Arbiter::new(Policies::new(root, subs));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
+    let mut machine = arbiter.handle_request(
+        make_req(http::Method::GET, "com.example.foo", None),
+        RequestCtx::default(),
+    );
     match machine.start() {
         ArbiterReqMachineStep::Completed(Err(e)) => {
             assert_eq!(e.status, http::StatusCode::INTERNAL_SERVER_ERROR);
@@ -493,7 +518,10 @@ fn sub_policy_encoding_defaults_to_null() {
     subs.insert("echo".to_string(), sub);
     let arbiter = Arbiter::new(Policies::new(root, subs));
 
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
+    let mut machine = arbiter.handle_request(
+        make_req(http::Method::GET, "com.example.foo", None),
+        RequestCtx::default(),
+    );
     match machine.start() {
         ArbiterReqMachineStep::Completed(Ok(XrpcOutput::Data(json))) => {
             assert_eq!(json, serde_json::Value::Null);
@@ -515,7 +543,10 @@ fn unknown_host_function_returns_error_envelope() {
         &["unknown_fn"],
     );
     let arbiter = Arbiter::new(Policies::new(root, HashMap::new()));
-    let mut machine = arbiter.handle_request(make_req(http::Method::GET, "com.example.foo", None), RequestCtx::default());
+    let mut machine = arbiter.handle_request(
+        make_req(http::Method::GET, "com.example.foo", None),
+        RequestCtx::default(),
+    );
 
     match machine.start() {
         ArbiterReqMachineStep::Completed(Err(err)) => {

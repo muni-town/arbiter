@@ -506,7 +506,12 @@ async fn fail_closed_when_pds_unreachable() {
     // Seed the credential store so `startup_onboard` has an account to load.
     state
         .store
-        .store(did.clone(), PdsCredentials { password: "irrelevant".to_string() })
+        .store(
+            did.clone(),
+            PdsCredentials {
+                password: "irrelevant".to_string(),
+            },
+        )
         .await
         .expect("store creds");
 
@@ -698,7 +703,9 @@ async fn auto_delete_service_absent() {
         .store
         .store(
             env.steward_did.clone(),
-            PdsCredentials { password: "kept".to_string() },
+            PdsCredentials {
+                password: "kept".to_string(),
+            },
         )
         .await
         .expect("store creds");
@@ -741,7 +748,9 @@ async fn auto_delete_service_repointed() {
         .store
         .store(
             env.steward_did.clone(),
-            PdsCredentials { password: "purge-me".to_string() },
+            PdsCredentials {
+                password: "purge-me".to_string(),
+            },
         )
         .await
         .expect("store creds");

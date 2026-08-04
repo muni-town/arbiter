@@ -494,10 +494,22 @@ impl ArbiterReqMachine {
             req.encoding.clone().map(Value::from).unwrap_or(Value::Null),
         );
         // Per-request context (see `RequestCtx`).
-        input.insert(Value::from("arbiterDid"), Value::from(ctx.arbiter_did.as_str()));
-        input.insert(Value::from("pdsEndpoint"), Value::from(ctx.pds_endpoint.as_str()));
-        input.insert(Value::from("callerDid"), Value::from(ctx.caller_did.as_str()));
-        input.insert(Value::from("xrpcEndpoint"), Value::from(ctx.xrpc_endpoint.as_str()));
+        input.insert(
+            Value::from("arbiterDid"),
+            Value::from(ctx.arbiter_did.as_str()),
+        );
+        input.insert(
+            Value::from("pdsEndpoint"),
+            Value::from(ctx.pds_endpoint.as_str()),
+        );
+        input.insert(
+            Value::from("callerDid"),
+            Value::from(ctx.caller_did.as_str()),
+        );
+        input.insert(
+            Value::from("xrpcEndpoint"),
+            Value::from(ctx.xrpc_endpoint.as_str()),
+        );
         Ok(input.into_value())
     }
 
@@ -593,11 +605,8 @@ impl ArbiterReqMachine {
             let json = serde_json::to_value(&output)?;
             return Ok(Ok(XrpcOutput::Data(json)));
         }
-        let err = field(value, "error")
-            .context("policy error result missing `error`")?;
-        let err_obj = err
-            .as_object()
-            .context("`error` must be an object")?;
+        let err = field(value, "error").context("policy error result missing `error`")?;
+        let err_obj = err.as_object().context("`error` must be an object")?;
         let status = field_u16(err, "status")?;
         let status = http::StatusCode::from_u16(status).map_err(anyhow::Error::msg)?;
         let kind = match err_obj.get(&Value::from("body")) {
@@ -690,9 +699,7 @@ impl ArbiterReqMachine {
 
     /// Read a string field from a host-call argument object.
     fn field_string(arg: &Value, key: &str) -> Result<String> {
-        let obj = arg
-            .as_object()
-            .context("host call arg must be an object")?;
+        let obj = arg.as_object().context("host call arg must be an object")?;
         let v = obj
             .get(&Value::from(key))
             .with_context(|| format!("host call arg missing string field `{key}`"))?;
