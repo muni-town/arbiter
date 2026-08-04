@@ -4,17 +4,17 @@
   "defs": {
     "main": {
       "type": "record",
-      "description": "Root Rego policy for an arbiter. The `source` field contains the\nRego source text. Maps to Policies::new(root, sub_policies).",
+      "description": "Root Rego policy for an arbiter. The `policy` field contains the\nRego source text. Maps to Policies::new(root, sub_policies).",
       "key": "literal:self",
       "record": {
         "type": "object",
         "properties": {
-          "source": {
+          "policy": {
             "type": "string",
             "description": "Rego source text for the root policy."
           }
         },
-        "required": ["source"]
+        "required": ["policy"]
       }
     }
   }

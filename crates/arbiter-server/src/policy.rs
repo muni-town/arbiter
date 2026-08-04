@@ -9,7 +9,7 @@
 //! - `town.muni.arbiter.policy.sub/<name>` — named sub-policies (listed via
 //!   `com.atproto.repo.listRecords`, keyed by record rkey).
 //!
-//! Each policy record carries the Rego source in its `source` string field.
+//! Each policy record carries the Rego source in its `policy` string field.
 //!
 //! Reads are performed with an unauthenticated atrium client: policy/service
 //! records are public ATProto records that do not require auth, so no PDS
@@ -299,11 +299,11 @@ impl RecordSource {
     }
 }
 
-/// Extract the Rego source string from a policy record's `source` field.
+/// Extract the Rego source string from a policy record's `policy` field.
 fn rego_source(record: &RecordSource) -> Result<String> {
     record
-        .field("source")
-        .ok_or_else(|| anyhow!("policy record is missing a string 'source' field"))
+        .field("policy")
+        .ok_or_else(|| anyhow!("policy record is missing a string 'policy' field"))
 }
 
 /// Parse an NSID collection name.

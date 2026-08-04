@@ -290,7 +290,7 @@ async fn populate_standard_records(records: &RecordMap, steward_did: &str, polic
             ROOT_COLLECTION.into(),
             ROOT_RKEY.into(),
         ),
-        json!({ "source": policy_source }),
+        json!({ "policy": policy_source }),
     );
 }
 
@@ -676,7 +676,7 @@ async fn hot_reload_updates_policy() {
                 ROOT_COLLECTION.into(),
                 ROOT_RKEY.into(),
             ),
-            json!({ "source": "package arbiter\nresult := { \"ok\": true, \"output\": { \"got\": \"v2\" } }" }),
+            json!({ "policy": "package arbiter\nresult := { \"ok\": true, \"output\": { \"got\": \"v2\" } }" }),
         );
     }
     policy::load_and_onboard(&env.state, &env.steward_did)

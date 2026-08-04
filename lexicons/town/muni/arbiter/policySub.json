@@ -9,12 +9,12 @@
       "record": {
         "type": "object",
         "properties": {
-          "source": {
+          "policy": {
             "type": "string",
             "description": "Rego source text for the sub-policy."
           }
         },
-        "required": ["source"]
+        "required": ["policy"]
       }
     }
   }
