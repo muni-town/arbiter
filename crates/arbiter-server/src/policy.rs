@@ -10,6 +10,11 @@
 //!   `com.atproto.repo.listRecords`, keyed by record rkey).
 //!
 //! Each policy record carries the Rego source in its `source` string field.
+//!
+//! Reads are performed with an unauthenticated atrium client: policy/service
+//! records are public ATProto records that do not require auth, so no PDS
+//! session is established here. (The credential store only holds the steward
+//! password for *writing* records during provisioning, not for these reads.)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,8 +24,13 @@ use crate::{AppState, CONFIG};
 use anyhow::{Context, Result, anyhow};
 use arbiter_core::arbiter::{Arbiter, Policies};
 use arbiter_core::policy::PolicyVm;
+use atrium_api::client::AtpServiceClient;
+use atrium_api::com::atproto::repo::get_record;
+use atrium_api::types::string::{AtIdentifier, Nsid, RecordKey};
+use atrium_xrpc::error::XrpcErrorKind;
+use atrium_xrpc_client::reqwest::ReqwestClientBuilder;
 use regorus::Value;
-use serde_json::Value as Json;
+
 /// Service record collection + rkey (`town.muni.arbiter.service/self`).
 const SERVICE_COLLECTION: &str = "town.muni.arbiter.service";
 const SERVICE_RKEY: &str = "self";
@@ -85,43 +95,24 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
         .await
         .map_err(|e| anyhow::anyhow!("resolving PDS endpoint for {did}: {e:#}"))?;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("building HTTP client")?;
+    // Unauthenticated client for public record reads. A bounded timeout keeps a
+    // hung PDS from stalling onboarding.
+    let client = ReqwestClientBuilder::new(&pds_endpoint)
+        .client(
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .context("building HTTP client")?,
+        )
+        .build();
+    let api = AtpServiceClient::new(client);
 
-    // Authenticate as the stewarded account so record reads work on PDSs that
-    // require auth. Fall back to unauthenticated reads if no credentials are
-    // stored or session creation fails.
-    let token = match state.store.get(did).await.context("fetching credentials")? {
-        Some(creds) => match pds_session(&client, &pds_endpoint, did, &creds.password).await {
-            Ok(Some(t)) => Some(t),
-            Ok(None) => {
-                tracing::debug!(
-                    did,
-                    "PDS session creation failed; trying unauthenticated reads"
-                );
-                None
-            }
-            Err(e) => {
-                tracing::warn!(did, error = %format!("{e:#}"), "PDS session error; trying unauthenticated reads");
-                None
-            }
-        },
-        None => None,
-    };
+    let repo = parse_at_identifier(did)?;
 
     // --- lifecycle: service record ----------------------------------------
-    let service = get_record(
-        &client,
-        &pds_endpoint,
-        token.as_deref(),
-        did,
-        SERVICE_COLLECTION,
-        SERVICE_RKEY,
-    )
-    .await
-    .with_context(|| format!("fetching {SERVICE_COLLECTION}/{SERVICE_RKEY}"))?;
+    let service = fetch_record(&api, &repo, SERVICE_COLLECTION, SERVICE_RKEY)
+        .await
+        .with_context(|| format!("fetching {SERVICE_COLLECTION}/{SERVICE_RKEY}"))?;
     match service {
         None => {
             // Record absent: stop serving but keep credentials (may re-onboard).
@@ -130,8 +121,8 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
             return Ok(pds_endpoint);
         }
         Some(rec) => {
-            let svc_did = rec.get("did").and_then(|v| v.as_str());
-            match svc_did {
+            let svc_did = rec.field("did");
+            match svc_did.as_deref() {
                 None => {
                     // Malformed service record: treat as absent (keep credentials).
                     tracing::warn!(did, "service record missing 'did' field; offboarding");
@@ -160,34 +151,21 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
     }
 
     // --- root policy -------------------------------------------------------
-    let root_rec = get_record(
-        &client,
-        &pds_endpoint,
-        token.as_deref(),
-        did,
-        ROOT_COLLECTION,
-        ROOT_RKEY,
-    )
-    .await
-    .with_context(|| format!("fetching {ROOT_COLLECTION}/{ROOT_RKEY}"))?
-    .ok_or_else(|| {
-        anyhow!("root policy record {ROOT_COLLECTION}/{ROOT_RKEY} not found for {did}")
-    })?;
+    let root_rec = fetch_record(&api, &repo, ROOT_COLLECTION, ROOT_RKEY)
+        .await
+        .with_context(|| format!("fetching {ROOT_COLLECTION}/{ROOT_RKEY}"))?
+        .ok_or_else(|| {
+            anyhow!("root policy record {ROOT_COLLECTION}/{ROOT_RKEY} not found for {did}")
+        })?;
     let root_src = rego_source(&root_rec)
         .with_context(|| format!("extracting root policy source for {did}"))?;
     let root = PolicyVm::new(&root_src, Value::new_object(), ENTRYPOINT, HOST_FNS)
         .with_context(|| format!("compiling root policy for {did}"))?;
 
     // --- sub-policies ------------------------------------------------------
-    let sub_records = list_records(
-        &client,
-        &pds_endpoint,
-        token.as_deref(),
-        did,
-        SUB_COLLECTION,
-    )
-    .await
-    .with_context(|| format!("listing {SUB_COLLECTION} records"))?;
+    let sub_records = list_records(&api, &repo, SUB_COLLECTION)
+        .await
+        .with_context(|| format!("listing {SUB_COLLECTION} records"))?;
     let mut subs = std::collections::HashMap::new();
     for (rkey, rec) in sub_records {
         match rego_source(&rec) {
@@ -214,90 +192,45 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
     Ok(pds_endpoint)
 }
 
-/// Create a PDS session (`com.atproto.server.createSession`) and return its
-/// `accessJwt`. Returns `Ok(None)` if authentication could not be established
-/// (caller falls back to unauthenticated reads).
-async fn pds_session(
-    client: &reqwest::Client,
-    pds_url: &str,
-    identifier: &str,
-    password: &str,
-) -> Result<Option<String>> {
-    let url = format!(
-        "{}/xrpc/com.atproto.server.createSession",
-        pds_url.trim_end_matches('/')
-    );
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({ "identifier": identifier, "password": password }))
-        .send()
-        .await
-        .context("createSession request")?;
-    let status = resp.status();
-    let body = resp.bytes().await.context("createSession body")?;
-    if !status.is_success() {
-        // Non-success => no token; public reads may still work.
-        tracing::debug!(
-            pds_url,
-            status = %status,
-            "createSession failed; proceeding without auth"
-        );
-        return Ok(None);
-    }
-    let v: Json = serde_json::from_slice(&body).context("createSession json")?;
-    Ok(v.get("accessJwt")
-        .and_then(|t| t.as_str())
-        .map(String::from))
+/// Parse a repo identifier (handle or DID) for the atrium typed client.
+fn parse_at_identifier(repo: &str) -> Result<AtIdentifier> {
+    repo.parse::<AtIdentifier>()
+        .map_err(|e| anyhow!("invalid repo identifier `{repo}`: {e}"))
 }
 
 /// Fetch a single record via `com.atproto.repo.getRecord`.
 ///
 /// Returns `Ok(None)` when the record does not exist (treated as absent for the
-/// lifecycle). Other HTTP errors are propagated.
-async fn get_record(
-    client: &reqwest::Client,
-    pds_url: &str,
-    token: Option<&str>,
-    repo: &str,
+/// lifecycle). Other errors are propagated.
+async fn fetch_record(
+    api: &AtpServiceClient<atrium_xrpc_client::reqwest::ReqwestClient>,
+    repo: &AtIdentifier,
     collection: &str,
     rkey: &str,
-) -> Result<Option<Json>> {
-    let url = format!(
-        "{}/xrpc/com.atproto.repo.getRecord",
-        pds_url.trim_end_matches('/')
-    );
-    let mut req =
-        client
-            .get(&url)
-            .query(&[("repo", repo), ("collection", collection), ("rkey", rkey)]);
-    if let Some(t) = token {
-        req = req.bearer_auth(t);
+) -> Result<Option<RecordSource>> {
+    let params = get_record::ParametersData {
+        cid: None,
+        collection: parse_nsid(collection)?,
+        repo: repo.clone(),
+        rkey: parse_record_key(rkey)?,
     }
-    let resp = req.send().await.context("getRecord request")?;
-    let status = resp.status();
-    let body = resp.bytes().await.context("getRecord body")?;
-    if status.is_success() {
-        let v: Json = serde_json::from_slice(&body).context("getRecord json")?;
-        let value = v
-            .get("value")
-            .cloned()
-            .ok_or_else(|| anyhow!("getRecord response missing 'value'"))?;
-        return Ok(Some(value));
+    .into();
+    match api.service.com.atproto.repo.get_record(params).await {
+        Ok(output) => Ok(Some(RecordSource {
+            source: output.data.value,
+        })),
+        Err(atrium_xrpc::Error::XrpcResponse(xrpc_err)) => {
+            if matches!(
+                xrpc_err.error,
+                Some(XrpcErrorKind::Custom(get_record::Error::RecordNotFound(_)))
+            ) {
+                Ok(None)
+            } else {
+                Err(anyhow!("getRecord {collection}/{rkey}: {xrpc_err}"))
+            }
+        }
+        Err(e) => Err(anyhow!("getRecord {collection}/{rkey}: {e}")),
     }
-    // Distinguish "record not found" (absent) from real errors.
-    let parsed: Option<Json> = serde_json::from_slice(&body).ok();
-    if let Some(j) = &parsed
-        && j.get("error").and_then(|e| e.as_str()) == Some("RecordNotFound")
-    {
-        return Ok(None);
-    }
-    if status == reqwest::StatusCode::NOT_FOUND || (status.as_u16() == 400 && parsed.is_none()) {
-        return Ok(None);
-    }
-    Err(anyhow!(
-        "getRecord {collection}/{rkey} failed: {status}: {}",
-        String::from_utf8_lossy(&body)
-    ))
 }
 
 /// List records in a collection via `com.atproto.repo.listRecords`, following
@@ -305,60 +238,38 @@ async fn get_record(
 /// `(rkey, record_value)` pairs, keyed by the record rkey (the segment after the
 /// final `/` in each record's `uri`).
 async fn list_records(
-    client: &reqwest::Client,
-    pds_url: &str,
-    token: Option<&str>,
-    repo: &str,
+    api: &AtpServiceClient<atrium_xrpc_client::reqwest::ReqwestClient>,
+    repo: &AtIdentifier,
     collection: &str,
-) -> Result<Vec<(String, Json)>> {
-    let base = format!(
-        "{}/xrpc/com.atproto.repo.listRecords",
-        pds_url.trim_end_matches('/')
-    );
-    const PAGE_SIZE: &str = "100";
+) -> Result<Vec<(String, RecordSource)>> {
     let mut cursor: Option<String> = None;
     let mut out = Vec::new();
     loop {
-        let mut req = client.get(&base).query(&[
-            ("repo", repo),
-            ("collection", collection),
-            ("limit", PAGE_SIZE),
-        ]);
-        if let Some(t) = token {
-            req = req.bearer_auth(t);
+        let params = atrium_api::com::atproto::repo::list_records::ParametersData {
+            collection: parse_nsid(collection)?,
+            cursor: cursor.clone(),
+            limit: Some(
+                atrium_api::types::LimitedNonZeroU8::<100>::MAX,
+            ),
+            repo: repo.clone(),
+            reverse: None,
         }
-        if let Some(c) = &cursor {
-            req = req.query(&[("cursor", c)]);
-        }
-        let resp = req.send().await.context("listRecords request")?;
-        let status = resp.status();
-        let body = resp.bytes().await.context("listRecords body")?;
-        if !status.is_success() {
-            return Err(anyhow!(
-                "listRecords {collection} failed: {status}: {}",
-                String::from_utf8_lossy(&body)
-            ));
-        }
-        let v: Json = serde_json::from_slice(&body).context("listRecords json")?;
-        let records = v
-            .get("records")
-            .and_then(|r| r.as_array())
-            .ok_or_else(|| anyhow!("listRecords response missing 'records' array"))?;
-        for rec in records {
-            let uri = rec
-                .get("uri")
-                .and_then(|u| u.as_str())
-                .ok_or_else(|| anyhow!("listRecords entry missing 'uri'"))?;
-            let value = rec
-                .get("value")
-                .cloned()
-                .ok_or_else(|| anyhow!("listRecords entry missing 'value'"))?;
+        .into();
+        let output = api
+            .service
+            .com
+            .atproto
+            .repo
+            .list_records(params)
+            .await
+            .context("listRecords")?;
+        for record in output.data.records {
             // at-uri: at://<did>/<collection>/<rkey> -> rkey is the last segment.
-            let rkey = uri.rsplit('/').next().unwrap_or("").to_string();
-            out.push((rkey, value));
+            let rkey = record.data.uri.rsplit('/').next().unwrap_or("").to_string();
+            out.push((rkey, RecordSource { source: record.data.value }));
         }
         // Follow the pagination cursor until the server stops returning one.
-        cursor = v.get("cursor").and_then(|c| c.as_str()).map(str::to_owned);
+        cursor = output.data.cursor.clone();
         if cursor.is_none() {
             break;
         }
@@ -366,11 +277,38 @@ async fn list_records(
     Ok(out)
 }
 
+/// A record value loaded from the PDS.
+struct RecordSource {
+    /// The raw record value as an atrium [`Unknown`].
+    source: atrium_api::types::Unknown,
+}
+
+impl RecordSource {
+    /// Read a top-level string field from the record value.
+    ///
+    /// `Unknown` is an untagged serde enum; materialize it as JSON to read the
+    /// field without depending on ipld internals.
+    fn field(&self, name: &str) -> Option<String> {
+        let json = serde_json::to_value(&self.source).ok()?;
+        json.get(name)
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    }
+}
+
 /// Extract the Rego source string from a policy record's `source` field.
-fn rego_source(record: &Json) -> Result<String> {
+fn rego_source(record: &RecordSource) -> Result<String> {
     record
-        .get("source")
-        .and_then(|v| v.as_str())
-        .map(String::from)
+        .field("source")
         .ok_or_else(|| anyhow!("policy record is missing a string 'source' field"))
+}
+
+/// Parse an NSID collection name.
+fn parse_nsid(s: &str) -> Result<Nsid> {
+    s.parse::<Nsid>().map_err(|e| anyhow!("invalid nsid `{s}`: {e}"))
+}
+
+/// Parse a record key.
+fn parse_record_key(s: &str) -> Result<RecordKey> {
+    s.parse::<RecordKey>().map_err(|e| anyhow!("invalid rkey `{s}`: {e}"))
 }

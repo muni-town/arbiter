@@ -184,7 +184,12 @@ async fn get_record_handler(
             let uri = format!("at://{repo}/{collection}/{rkey}");
             (
                 StatusCode::OK,
-                Json(json!({ "uri": uri, "cid": "fake-cid", "value": v })),
+                Json(json!({
+                    "uri": uri,
+                    // atrium's `Cid` type requires a real (multihash) CID.
+                    "cid": "bafkreibme22gw2h7y2h7tg2fhqotaqjucnbc24deqo72b6mkl2egezxhvy",
+                    "value": v
+                })),
             )
                 .into_response()
         }
@@ -207,7 +212,12 @@ async fn list_records_handler(
         .iter()
         .filter_map(|((r, c, rk), v)| {
             if r == &repo && c == &collection {
-                Some(json!({ "uri": format!("at://{r}/{c}/{rk}"), "value": v }))
+                Some(json!({
+                    "uri": format!("at://{r}/{c}/{rk}"),
+                    // atrium's `Cid` type requires a real (multihash) CID.
+                    "cid": "bafkreibme22gw2h7y2h7tg2fhqotaqjucnbc24deqo72b6mkl2egezxhvy",
+                    "value": v
+                }))
             } else {
                 None
             }
