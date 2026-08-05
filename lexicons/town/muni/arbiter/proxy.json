@@ -17,7 +17,6 @@
             },
             "target": {
               "type": "string",
-              "format": "at-uri",
               "description": "The destination DID#service for the proxied request (e.g. did:plc:xyz#atproto_pds)."
             },
             "method": {
@@ -29,11 +28,11 @@
               "description": "The inner XRPC request NSID."
             },
             "parameters": {
-              "type": "object",
+              "type": "unknown",
               "description": "Optional query parameters for the inner request."
             },
             "body": {
-              "type": "object",
+              "type": "unknown",
               "description": "Optional JSON body for the inner request."
             }
           },
@@ -43,7 +42,9 @@
       "output": {
         "encoding": "application/json",
         "schema": {
-          "type": "object"
+          "type": "object",
+          "description": "The body of the inner XRPC response.",
+          "properties": {}
         }
       },
       "errors": [

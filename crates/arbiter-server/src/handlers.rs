@@ -8,14 +8,15 @@
 //! machine and proxies any `RemoteXrpcRequest` it emits to the policy-supplied
 //! endpoint authenticated as the stewarded account.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use arbiter_core::arbiter::{ArbiterReqMachineStep, RequestCtx};
 use arbiter_core::xrpc::{XrpcOutput, XrpcRequest, XrpcResult};
 use atrium_api::agent::Agent;
 use atrium_api::agent::atp_agent::CredentialSession;
 use atrium_api::agent::atp_agent::store::MemorySessionStore;
-use atrium_api::com::atproto::repo::create_record;
+use atrium_api::com::atproto::repo::put_record;
 use atrium_api::com::atproto::server::create_account;
 use atrium_api::types::TryIntoUnknown;
 use atrium_api::types::string::{AtIdentifier, Handle, Nsid, RecordKey};
@@ -24,6 +25,7 @@ use atrium_xrpc_client::reqwest::ReqwestClient;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
+use axum::extract::DefaultBodyLimit;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use rand::RngCore;
@@ -51,10 +53,28 @@ const NSID_RESET_POLICY: &str = "town.muni.arbiter.resetPolicy";
 /// A typed agent over an authenticated `CredentialSession` against a PDS.
 type SessionAgent = Agent<CredentialSession<MemorySessionStore, ReqwestClient>>;
 
+/// Cap on inbound request body size. The policy machine copies request bodies
+/// into memory (and may proxy them), so a client must not be able to force
+/// unbounded buffering.
+const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
+
+/// Cap on the total response body size returned to the client. A proxied
+/// upstream response is buffered before being relayed, so we bound it here to
+/// avoid relaying an arbitrarily large payload.
+const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+
 pub fn router(state: Arc<AppState>) -> axum::Router {
     axum::Router::new()
         .route("/xrpc/{nsid}", axum::routing::any(xrpc_handler))
         .with_state(state)
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        // Arbitrary web clients are a goal, so we allow any origin. This is safe
+        // for a Bearer-token API: the caller's token travels in the Authorization
+        // header set by the client's own JS, which a cross-origin site cannot read
+        // or set, so permissive CORS does not let a malicious site act on the
+        // caller's behalf (no cookie-based ambient credentials). A hostile site
+        // can only trigger requests *without* a token, which are rejected as
+        // unauthorized.
         .layer(CorsLayer::permissive())
 }
 
@@ -104,6 +124,11 @@ struct ProxyBody {
     body: Option<Value>,
 }
 
+/// Maximum number of remote XRPC calls a single policy evaluation may issue
+/// while servicing one request. Bounds the outbound amplification a hostile or
+/// compromised policy can cause per request.
+const MAX_REMOTE_XRPC_CALLS: usize = 12;
+
 /// Handle a `town.muni.arbiter.proxy` request: drive the named arbiter's Rego
 /// policy over the inner request, executing any proxied XRPC call it emits.
 async fn proxy_request(state: &AppState, caller: &str, body: &Bytes) -> Result<Response, AppError> {
@@ -135,10 +160,22 @@ async fn proxy_request(state: &AppState, caller: &str, body: &Bytes) -> Result<R
     let mut machine = drive.machine;
 
     let mut step = machine.start();
+    let mut remote_calls = 0usize;
     let result: XrpcResult = loop {
         match step {
             ArbiterReqMachineStep::Completed(result) => break result,
             ArbiterReqMachineStep::RemoteXrpcRequest { endpoint, request } => {
+                remote_calls += 1;
+                if remote_calls > MAX_REMOTE_XRPC_CALLS {
+                    tracing::warn!(
+                        arbiter_did,
+                        remote_calls,
+                        "policy exceeded max remote xrpc calls; aborting request"
+                    );
+                    break Err(proxy::policy_aborted(
+                        "policy exceeded max remote xrpc calls",
+                    ));
+                }
                 let creds = state
                     .store
                     .get(&arbiter_did)
@@ -212,7 +249,17 @@ async fn reset_policy(state: &AppState, caller: &str, body: &Bytes) -> Result<Re
             ))
         })?;
     let writer = login_session(&body.arbiter_did, &creds.password, &pds_endpoint).await?;
-    put_root_policy(&writer, &body.arbiter_did, &body.policy).await?;
+
+    // Optimistic concurrency: fetch the current repo head commit CID and
+    // require the write to swap against it. If the repo changed between this
+    // read and the write (e.g. another reset or any other concurrent repo
+    // write won the race), putRecord fails and this reset does not clobber it.
+    // The repo head (not the root-policy record CID) is used so the very first
+    // policy install — when no root policy record exists yet — is also guarded.
+    let swap_commit = policy::repo_head_cid(state, &body.arbiter_did)
+        .await
+        .map_err(AppError::from)?;
+    put_root_policy(&writer, &body.arbiter_did, &body.policy, swap_commit.as_deref()).await?;
 
     // Re-onboard so the new policy is active.
     policy::load_and_onboard(state, &body.arbiter_did)
@@ -223,10 +270,25 @@ async fn reset_policy(state: &AppState, caller: &str, body: &Bytes) -> Result<Re
 }
 
 /// Map a final `XrpcResult` to an axum `Response`.
+///
+/// The response is buffered (the policy machine and the atrium proxy both
+/// buffer bodies), so refuse to relay anything over
+/// [`MAX_RESPONSE_BODY_BYTES`] rather than returning an unbounded payload.
 fn xrpc_result_to_response(result: XrpcResult) -> Response {
     match result {
-        Ok(XrpcOutput::Data(json)) => (StatusCode::OK, Json(json)).into_response(),
-        Ok(XrpcOutput::Bytes(bytes)) => (StatusCode::OK, bytes).into_response(),
+        Ok(XrpcOutput::Data(json)) => {
+            let body = serde_json::to_vec(&json).unwrap_or_default();
+            if body.len() > MAX_RESPONSE_BODY_BYTES {
+                return oversized_response();
+            }
+            (StatusCode::OK, Json(json)).into_response()
+        }
+        Ok(XrpcOutput::Bytes(bytes)) => {
+            if bytes.len() > MAX_RESPONSE_BODY_BYTES {
+                return oversized_response();
+            }
+            (StatusCode::OK, bytes).into_response()
+        }
         Err(xrpc_err) => {
             let body = json!({
                 "$type": "town.muni.arbiter.server.v1.xrpcError",
@@ -237,15 +299,73 @@ fn xrpc_result_to_response(result: XrpcResult) -> Response {
     }
 }
 
+/// A 502 response for an upstream body that exceeded the size cap.
+fn oversized_response() -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({
+            "$type": "town.muni.arbiter.server.v1.error",
+            "error": "upstream response exceeded size limit",
+        })),
+    )
+        .into_response()
+}
+
 // ----- built-in provisioning ----------------------------------------------
+
+/// Per-caller rate limiter for `createArbiter`, keyed by caller DID. Bulk
+/// creation is not allowed unless the admin raises the limit explicitly via
+/// config (`CREATE_ARBITER_RATE_LIMIT`). The counter is approximate (get/insert)
+/// which is acceptable for a rate limit.
+static CREATE_ARBITER_COUNTS: LazyLock<moka::future::Cache<String, u64>> = LazyLock::new(|| {
+    moka::future::Cache::builder()
+        .max_capacity(10_000)
+        .time_to_live(Duration::from_secs(
+            CONFIG.create_arbiter_rate_window_secs,
+        ))
+        .build()
+});
+
+/// Enforce the per-caller `createArbiter` rate limit. Returns an error if the
+/// caller has exceeded `CREATE_ARBITER_RATE_LIMIT` calls in the window (or if
+/// the limit is 0, meaning creation is disabled).
+async fn check_create_arbiter_rate(caller: &str) -> Result<(), AppError> {
+    let limit = CONFIG.create_arbiter_rate_limit;
+    if limit == 0 {
+        return Err(AppError::Forbidden(
+            "createArbiter is disabled (CREATE_ARBITER_RATE_LIMIT=0)".into(),
+        ));
+    }
+    let count = CREATE_ARBITER_COUNTS
+        .get(caller)
+        .await
+        .unwrap_or(0);
+    if count >= limit {
+        return Err(AppError::Forbidden(format!(
+            "createArbiter rate limit exceeded ({limit} per {}s)",
+            CONFIG.create_arbiter_rate_window_secs
+        )));
+    }
+    CREATE_ARBITER_COUNTS.insert(caller.to_string(), count + 1).await;
+    Ok(())
+}
 
 /// Provision a brand-new stewarded PDS account (`town.muni.arbiter.createArbiter`).
 ///
 /// Creates the account against `CONFIG.default_pds` with a random password +
 /// `CONFIG.invite_code`, stores the credentials, writes the
 /// `town.muni.arbiter.service/self` + `town.muni.arbiter.recovery/self` records
-/// from the new account's session, then brings the arbiter online.
+/// from the new account's session, then returns. No initial policy is written:
+/// the arbiter stays offline (fail-closed) until the recovery admin calls
+/// `resetPolicy` to install the first policy — the same flow an imported
+/// account uses.
+///
+/// Credentials are persisted **before** the record writes so a half-provisioned
+/// account is never orphaned: if a write fails, startup onboarding will retry
+/// it (and the arbiter remains offline until the policy lands).
 async fn create_arbiter(state: &AppState, caller: &str) -> Result<Response, AppError> {
+    check_create_arbiter_rate(caller).await?;
+
     let pds_url = CONFIG.default_pds.clone();
     let password = random_secret(24);
     let handle =
@@ -279,25 +399,16 @@ async fn create_arbiter(state: &AppState, caller: &str) -> Result<Response, AppE
 
     let new_did = account.data.did.as_str().to_string();
 
-    // Write the service + recovery records from the new account's session.
-    let writer = login_session(&new_did, &password, &pds_url).await?;
-    write_service_and_recovery(&writer, &new_did, caller).await?;
-
-    // Bring the arbiter online (loads policies + lifecycle checks).
-    policy::load_and_onboard(state, &new_did)
-        .await
-        .map_err(AppError::from)?;
-
-    // Persist credentials last, only once the account is fully provisioned and
-    // the arbiter is online. If any earlier step failed we return an error
-    // without storing credentials, so startup never retries an arbiter against
-    // a half-created account. Only the password is stored; the PDS endpoint is
-    // always resolved from the account's DID doc.
+    // Persist credentials first: even if the record writes below fail, the
+    // account is not orphaned — startup onboarding will find it and retry.
     state
         .store
-        .store(new_did, PdsCredentials { password })
+        .store(new_did.clone(), PdsCredentials { password: password.clone() })
         .await
         .map_err(AppError::from)?;
+
+    let writer = login_session(&new_did, &password, &pds_url).await?;
+    write_service_and_recovery(&writer, &new_did, caller).await?;
 
     Ok(ok_response())
 }
@@ -306,9 +417,17 @@ async fn create_arbiter(state: &AppState, caller: &str) -> Result<Response, AppE
 ///
 /// Input carries `arbiterDid` + `appPassword`. The PDS endpoint is always
 /// resolved from the account's DID doc (`#atproto_pds`); no URL override is
-/// permitted. Stores the password, writes the `service/self` +
-/// `recovery/self` records from the account's session, then brings the arbiter
-/// online.
+/// permitted.
+///
+/// The caller authenticates as the account (via the app password), which is the
+/// authorization to take stewardship: the account's `service/self` record is
+/// (re)written to point at this server and `recovery/self` to the caller. Any
+/// holder of a valid app password may assume stewardship without the previous
+/// arbiter's permission. No policy is written; the arbiter stays offline until
+/// `resetPolicy` installs the first policy.
+///
+/// Credentials are persisted before the record writes so a partial failure is
+/// retried by startup onboarding rather than lost.
 async fn create_app_password_arbiter(
     state: &AppState,
     caller: &str,
@@ -328,27 +447,24 @@ async fn create_app_password_arbiter(
         .to_string();
     let pds_endpoint = state.resolver.resolve_pds_endpoint(&arbiter_did).await?;
 
+    // Authenticating as the account proves control (app password) and is what
+    // authorizes stewardship takeover.
     let writer = login_session(&arbiter_did, &app_password, &pds_endpoint).await?;
-    write_service_and_recovery(&writer, &arbiter_did, caller).await?;
 
-    policy::load_and_onboard(state, &arbiter_did)
-        .await
-        .map_err(AppError::from)?;
-
-    // Persist credentials last, only once the account is fully provisioned and
-    // the arbiter is online. If any earlier step failed we return an error
-    // without storing credentials. Only the password is stored; the PDS
-    // endpoint is always resolved from the account's DID doc.
+    // Persist credentials first so startup onboarding can finish the job if a
+    // record write below fails.
     state
         .store
         .store(
-            arbiter_did,
+            arbiter_did.clone(),
             PdsCredentials {
                 password: app_password,
             },
         )
         .await
         .map_err(AppError::from)?;
+
+    write_service_and_recovery(&writer, &arbiter_did, caller).await?;
 
     Ok(ok_response())
 }
@@ -365,15 +481,25 @@ async fn login_session(did: &str, password: &str, pds_url: &str) -> Result<Sessi
     Ok(Agent::new(session))
 }
 
+/// Number of attempts for each bootstrap record write during provisioning.
+/// Records are written idempotently (via `putRecord`), so a retry cannot
+/// duplicate or corrupt state.
+const BOOTSTRAP_WRITE_ATTEMPTS: u32 = 5;
+
 /// Write the `town.muni.arbiter.service/self` (did = server) and
 /// `town.muni.arbiter.recovery/self` (did = caller) records into `repo`'s
 /// repository, authenticated via `agent`.
+///
+/// Each record write is retried with a short backoff so a transient PDS blip
+/// during provisioning does not leave the account half-configured (credentials
+/// are already persisted by the caller, so startup onboarding would retry, but
+/// finishing here is cleaner).
 async fn write_service_and_recovery(
     agent: &SessionAgent,
     repo: &str,
     caller: &str,
 ) -> Result<(), AppError> {
-    write_record(
+    write_record_retry(
         agent,
         repo,
         "town.muni.arbiter.service",
@@ -381,11 +507,38 @@ async fn write_service_and_recovery(
         &CONFIG.server_did,
     )
     .await?;
-    write_record(agent, repo, "town.muni.arbiter.recovery", "self", caller).await?;
+    write_record_retry(agent, repo, "town.muni.arbiter.recovery", "self", caller).await?;
     Ok(())
 }
 
-/// Create a single record in `collection`/`rkey` with a `did` field.
+/// Write `collection`/`rkey` with a `did` field, retrying transient failures.
+async fn write_record_retry(
+    agent: &SessionAgent,
+    repo: &str,
+    collection: &str,
+    rkey: &str,
+    did: &str,
+) -> Result<(), AppError> {
+    let mut attempt = 0u32;
+    loop {
+        match write_record(agent, repo, collection, rkey, did).await {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < BOOTSTRAP_WRITE_ATTEMPTS => {
+                attempt += 1;
+                tracing::warn!(
+                    repo, collection, rkey, attempt,
+                    error = %e,
+                    "bootstrap record write failed; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(250 * u64::from(attempt))).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Write (upsert) a single record in `collection`/`rkey` with a `did` field,
+/// via `com.atproto.repo.putRecord` (idempotent, so retries are safe).
 async fn write_record(
     agent: &SessionAgent,
     repo: &str,
@@ -396,7 +549,7 @@ async fn write_record(
     let record = serde_json::json!({ "$type": collection, "did": did })
         .try_into_unknown()
         .map_err(|e| AppError::Other(anyhow::anyhow!("build record: {e}")))?;
-    let input = create_record::InputData {
+    let input = put_record::InputData {
         collection: collection
             .parse::<Nsid>()
             .map_err(|e| AppError::Other(anyhow::anyhow!("invalid nsid `{collection}`: {e}")))?,
@@ -404,11 +557,11 @@ async fn write_record(
         repo: repo
             .parse::<AtIdentifier>()
             .map_err(|e| AppError::Other(anyhow::anyhow!("invalid repo `{repo}`: {e}")))?,
-        rkey: Some(
-            rkey.parse::<RecordKey>()
-                .map_err(|e| AppError::Other(anyhow::anyhow!("invalid rkey `{rkey}`: {e}")))?,
-        ),
+        rkey: rkey
+            .parse::<RecordKey>()
+            .map_err(|e| AppError::Other(anyhow::anyhow!("invalid rkey `{rkey}`: {e}")))?,
         swap_commit: None,
+        swap_record: None,
         validate: None,
     }
     .into();
@@ -417,18 +570,25 @@ async fn write_record(
         .com
         .atproto
         .repo
-        .create_record(input)
+        .put_record(input)
         .await
-        .map_err(|e| AppError::Other(anyhow::anyhow!("createRecord {collection}/{rkey}: {e}")))?;
+        .map_err(|e| AppError::Other(anyhow::anyhow!("putRecord {collection}/{rkey}: {e}")))?;
     Ok(())
 }
 
 /// Overwrite the `town.muni.arbiter.policy.root/self` record with `policy`
 /// (the Rego source), authenticated as the steward.
+///
+/// `swap_commit`, if present, is the repo head commit CID the repo must
+/// currently be at for the write to succeed (compare-and-swap on the whole
+/// repo). Using the repo head rather than the record CID means the very first
+/// policy install (no root policy record yet) is also guarded. Pass `None` to
+/// overwrite unconditionally.
 async fn put_root_policy(
     agent: &SessionAgent,
     repo: &str,
     policy: &str,
+    swap_commit: Option<&str>,
 ) -> Result<(), AppError> {
     let record = serde_json::json!({
         "$type": policy::ROOT_COLLECTION,
@@ -436,6 +596,13 @@ async fn put_root_policy(
     })
     .try_into_unknown()
     .map_err(|e| AppError::Other(anyhow::anyhow!("build root policy record: {e}")))?;
+    let swap_commit = match swap_commit {
+        Some(cid) => Some(
+            cid.parse::<atrium_api::types::string::Cid>()
+                .map_err(|e| AppError::Other(anyhow::anyhow!("invalid swap CID `{cid}`: {e}")))?,
+        ),
+        None => None,
+    };
     let input = atrium_api::com::atproto::repo::put_record::InputData {
         collection: policy::ROOT_COLLECTION
             .parse::<Nsid>()
@@ -447,7 +614,7 @@ async fn put_root_policy(
         rkey: policy::ROOT_RKEY
             .parse::<RecordKey>()
             .map_err(|e| AppError::Other(anyhow::anyhow!("invalid rkey: {e}")))?,
-        swap_commit: None,
+        swap_commit,
         swap_record: None,
         validate: None,
     }
@@ -472,13 +639,14 @@ fn ok_response() -> Response {
 /// A random opaque secret used as a server-generated steward password.
 ///
 /// Drawn from a CSPRNG (`rand`) and base64-encoded (URL-safe, unpadded) so the
-/// password has full entropy per byte and no ambiguous characters. The password
-/// is stored by the credential store and used to authenticate as the steward.
+/// password carries no ambiguous characters. `len` is the number of *base64
+/// characters* returned, not bytes: each character carries 6 bits of entropy,
+/// so `len` characters encode `len*6` bits. For the default `24` chars that is
+/// 144 bits of entropy.
 fn random_secret(len: usize) -> String {
     use base64::Engine;
-    // `len` is the number of *base64 characters* we return, not bytes. Each byte
-    // of output carries `len * 6/8` bits of entropy; round up to a whole number
-    // of bytes and let the encoding trim to the requested length.
+    // Round the requested bit count up to a whole number of bytes, then let the
+    // encoding trim to the requested length.
     let byte_len = (len * 6).div_ceil(8);
     let mut bytes = vec![0u8; byte_len];
     rand::rng().fill_bytes(&mut bytes);
@@ -489,14 +657,19 @@ fn random_secret(len: usize) -> String {
 /// A random valid handle using the configured suffix (`<base32><suffix>`).
 ///
 /// The local label is a cryptographically random value (CSPRNG) base32-encoded
-/// (RFC 4648, no padding). Base32 uses only `[A-Z2-7]`, a strict subset of the
-/// characters permitted in a handle label, and is more compact than hex for
-/// the same entropy (13 chars vs 16 for 8 bytes). The trailing suffix supplies
-/// the TLD, which must start with a letter.
+/// (RFC 4648, no padding, lowercased). Base32 uses only `[a-z2-7]`, a strict
+/// subset of the characters permitted in a handle label, and lowercase matches
+/// the ecosystem's handle normalization (some PDSes lowercase handles on
+/// registration), so the created account's handle equals the generated value.
+/// 8 bytes of entropy → 13 base32 chars. The trailing suffix supplies the TLD,
+/// which must start with a letter.
 fn random_handle() -> Result<Handle, &'static str> {
     use data_encoding::BASE32_NOPAD;
     let mut bytes = [0u8; 8];
     rand::rng().fill_bytes(&mut bytes);
-    let encoded = BASE32_NOPAD.encode(&bytes);
+    // Encode (uppercase `[A-Z2-7]`), then lowercase to match the ecosystem's
+    // handle normalization. `data-encoding` has no lowercase base32 output
+    // encoding constant.
+    let encoded = BASE32_NOPAD.encode(&bytes).to_ascii_lowercase();
     Handle::new(format!("{encoded}{}", CONFIG.handle_suffix))
 }

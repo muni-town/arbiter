@@ -6,7 +6,6 @@
   import SetupStepIntro from '$lib/components/setup/SetupStepIntro.svelte';
   import SetupStepOAuth from '$lib/components/setup/SetupStepOAuth.svelte';
   import SetupStepAppPassword from '$lib/components/setup/SetupStepAppPassword.svelte';
-  import SetupStepEmailCode from '$lib/components/setup/SetupStepEmailCode.svelte';
   import SetupStepSelectAdmin from '$lib/components/setup/SetupStepSelectAdmin.svelte';
   import SetupStepComplete from '$lib/components/setup/SetupStepComplete.svelte';
 
@@ -20,10 +19,10 @@
     class="px-6 py-4 border-b border-base-100 dark:border-base-800 flex items-center justify-center gap-4"
   >
     <div class="flex items-center gap-2 text-xs font-medium">
-      {#each ['intro', 'oauth', 'app-password', 'email-code', 'select-admin', 'complete'] as s, i}
+      {#each ['intro', 'oauth', 'app-password', 'select-admin', 'complete'] as s, i}
         {@const active = step === s}
         {@const done =
-          ['intro', 'oauth', 'app-password', 'email-code', 'select-admin', 'complete'].indexOf(
+          ['intro', 'oauth', 'app-password', 'select-admin', 'complete'].indexOf(
             step,
           ) > i}
         <div class="flex items-center gap-2">
@@ -59,9 +58,7 @@
                 ? 'Sign In'
                 : s === 'app-password'
                   ? 'App Password'
-                  : s === 'email-code'
-                    ? 'Email Code'
-                    : s === 'select-admin'
+                  : s === 'select-admin'
                       ? 'Admin'
                       : 'Done'}
           </span>
@@ -95,8 +92,6 @@
         <SetupStepOAuth />
       {:else if step === 'app-password'}
         <SetupStepAppPassword />
-      {:else if step === 'email-code'}
-        <SetupStepEmailCode />
       {:else if step === 'select-admin'}
         <SetupStepSelectAdmin />
       {:else if step === 'complete'}

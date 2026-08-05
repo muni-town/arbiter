@@ -26,7 +26,7 @@ use arbiter_core::arbiter::{Arbiter, Policies};
 use arbiter_core::policy::PolicyVm;
 use atrium_api::client::AtpServiceClient;
 use atrium_api::com::atproto::repo::get_record;
-use atrium_api::types::string::{AtIdentifier, Nsid, RecordKey};
+use atrium_api::types::string::{AtIdentifier, Nsid, RecordKey, Tid};
 use atrium_xrpc::error::XrpcErrorKind;
 use atrium_xrpc_client::reqwest::ReqwestClientBuilder;
 use regorus::Value;
@@ -48,11 +48,19 @@ const HOST_FNS: &[&str] = &["xrpc", "policy"];
 /// Rego entrypoint evaluated to produce a request's result.
 const ENTRYPOINT: &str = "data.arbiter.result";
 
+/// Maximum number of `load_and_onboard` attempts per arbiter during startup
+/// onboarding. After this many consecutive failures the arbiter is left
+/// offboarded (fail-closed) and we move on, so a permanently unreachable PDS
+/// cannot spin this task forever. A subsequent Jetstream event or restart
+/// retries.
+const STARTUP_MAX_RETRIES: u32 = 5;
+
 /// On startup, load + onboard every arbiter the server holds credentials for.
 ///
 /// Per-arbiter fail-closed is already enforced by `ArbiterCollection::begin_request`
 /// returning `ArbiterNotReady` for un-onboarded DIDs; this task just brings them
-/// online. Retry each load with exponential backoff until it succeeds.
+/// online. Retry each load with bounded exponential backoff, giving up after
+/// [`STARTUP_MAX_RETRIES`] consecutive failures per arbiter.
 pub async fn startup_onboard(state: Arc<AppState>) -> Result<()> {
     let entries = state
         .store
@@ -64,6 +72,7 @@ pub async fn startup_onboard(state: Arc<AppState>) -> Result<()> {
         return Ok(());
     }
     for (did, _creds) in entries {
+        let mut attempt: u32 = 0;
         let mut delay = Duration::from_secs(1);
         loop {
             match load_and_onboard(&state, &did).await {
@@ -71,19 +80,79 @@ pub async fn startup_onboard(state: Arc<AppState>) -> Result<()> {
                     tracing::info!(did = %did, pds = %pds_endpoint, "onboarded arbiter");
                     break;
                 }
+                Err(e) if attempt >= STARTUP_MAX_RETRIES => {
+                    // Fail closed: leave the arbiter offboarded and move on.
+                    tracing::error!(
+                        did = %did,
+                        error = %format!("{e:#}"),
+                        "giving up onboarding arbiter after {STARTUP_MAX_RETRIES} attempts"
+                    );
+                    break;
+                }
                 Err(e) => {
+                    attempt += 1;
                     tracing::warn!(
                         did = %did,
+                        attempt,
                         error = %format!("{e:#}"),
                         "load_and_onboard failed; retrying in {delay:?}"
                     );
                     tokio::time::sleep(delay).await;
-                    delay *= 2;
+                    delay = (delay * 2).min(Duration::from_secs(30));
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Re-load + onboard every stewarded arbiter after a Jetstream reconnect.
+///
+/// A disconnect means the subscription missed any policy/service-record writes
+/// that happened while it was down, and `load_and_onboard` re-fetches the
+/// *current* PDS state, so this closes the fail-open window where the server
+/// would otherwise keep enforcing the last-loaded (possibly revoked/permissive)
+/// policy. Each failed load is left fail-closed (offboarded) and retried a
+/// bounded number of times.
+pub async fn refresh_all_after_reconnect(state: Arc<AppState>) {
+    let entries = match state.store.list().await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "failed to list credentials for reconnect refresh");
+            return;
+        }
+    };
+    for (did, _creds) in entries {
+        let mut attempt: u32 = 0;
+        let mut delay = Duration::from_secs(1);
+        loop {
+            match load_and_onboard(&state, &did).await {
+                Ok(pds) => {
+                    tracing::info!(did = %did, pds = %pds, "refreshed arbiter after reconnect");
+                    break;
+                }
+                Err(e) if attempt >= STARTUP_MAX_RETRIES => {
+                    tracing::error!(
+                        did = %did,
+                        error = %format!("{e:#}"),
+                        "giving up refreshing arbiter after reconnect ({STARTUP_MAX_RETRIES} attempts)"
+                    );
+                    break;
+                }
+                Err(e) => {
+                    attempt += 1;
+                    tracing::warn!(
+                        did = %did,
+                        attempt,
+                        error = %format!("{e:#}"),
+                        "reconnect refresh failed; retrying in {delay:?}"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(30));
+                }
+            }
+        }
+    }
 }
 
 /// Fetch the latest root + sub-policy records and the service record for `did`
@@ -147,6 +216,30 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
         }
     }
 
+    // Compute the load-time rev floor BEFORE reading the records so the floor
+    // provably dominates the records we load: the records are read at or after
+    // the moment the floor was captured, so they reflect state at least as new
+    // as the floor. (Fetching the floor after the reads would let a concurrent
+    // load read stale records and then capture a raised floor, permanently
+    // dropping the events it is missing.) If the floor can't be determined we
+    // use no floor (accept everything), which only risks redundant reloads —
+    // never a missed update.
+    let rev_floor = match fetch_repo_rev(&api, &repo).await {
+        Ok(Some(rev)) => Some(rev.as_str().to_string()),
+        Ok(None) => {
+            tracing::warn!(did, "repo inactive or no rev reported; leaving rev floor unset");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                did,
+                error = %format!("{e:#}"),
+                "repo rev unavailable; leaving rev floor unset"
+            );
+            None
+        }
+    };
+
     // --- root policy -------------------------------------------------------
     let root_rec = fetch_record(&api, &repo, ROOT_COLLECTION, ROOT_RKEY)
         .await
@@ -182,9 +275,10 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
 
     let policies = Policies::new(root, subs);
     let arbiter = Arbiter::new(policies);
+
     state
         .arbiters
-        .onboard(did.to_string(), arbiter, pds_endpoint.clone())
+        .onboard(did.to_string(), arbiter, pds_endpoint.clone(), rev_floor)
         .await;
     Ok(pds_endpoint)
 }
@@ -209,6 +303,28 @@ fn pds_read_client(pds_endpoint: &str) -> Result<AtpServiceClient<atrium_xrpc_cl
     Ok(AtpServiceClient::new(client))
 }
 
+/// Fetch the current repo `rev` (head commit) for `repo` via
+/// `com.atproto.sync.getRepoStatus`. This is the load-time monotonic floor for
+/// Jetstream gating.
+///
+/// Returns `Ok(None)` when the repo is inactive or the PDS reports no rev.
+async fn fetch_repo_rev(
+    api: &AtpServiceClient<atrium_xrpc_client::reqwest::ReqwestClient>,
+    repo: &AtIdentifier,
+) -> Result<Option<Tid>> {
+    let did = match repo {
+        AtIdentifier::Did(did) => did.clone(),
+        // Handle-based repo identifiers have no stable DID here; callers always
+        // pass a DID, so this is defensive.
+        AtIdentifier::Handle(_) => return Ok(None),
+    };
+    let params = atrium_api::com::atproto::sync::get_repo_status::ParametersData { did }.into();
+    match api.service.com.atproto.sync.get_repo_status(params).await {
+        Ok(output) => Ok(output.data.rev),
+        Err(e) => Err(anyhow!("getRepoStatus: {e}")),
+    }
+}
+
 /// Fetch the designated recovery admin DID from `town.muni.arbiter.recovery/self`
 /// on `did`'s PDS, if the record exists and carries a `did` field.
 ///
@@ -225,6 +341,35 @@ pub async fn recovery_admin(state: &AppState, did: &str) -> Result<Option<String
         .await
         .with_context(|| format!("fetching {RECOVERY_COLLECTION}/{RECOVERY_RKEY}"))?;
     Ok(rec.and_then(|r| r.field("did")))
+}
+
+/// Fetch the current repo head commit CID for `did` via
+/// `com.atproto.sync.getLatestCommit`.
+///
+/// This is the compare-and-swap token for a `resetPolicy` write: passing it as
+/// `swap_commit` makes the `putRecord` fail if the repo's head commit changed
+/// between the read and the write, so two concurrent policy resets (or any
+/// other concurrent repo write) cannot silently clobber each other. Using the
+/// repo head rather than the root-policy record CID also covers the very first
+/// policy install, when no root policy record exists yet but the repo still has
+/// a head commit to guard.
+pub async fn repo_head_cid(state: &AppState, did: &str) -> Result<Option<String>> {
+    let pds_endpoint = state
+        .resolver
+        .resolve_pds_endpoint(did)
+        .await
+        .map_err(|e| anyhow::anyhow!("resolving PDS endpoint for {did}: {e:#}"))?;
+    let api = pds_read_client(&pds_endpoint)?;
+    let repo_did = match parse_at_identifier(did)? {
+        AtIdentifier::Did(d) => d,
+        AtIdentifier::Handle(_) => return Ok(None),
+    };
+    let params = atrium_api::com::atproto::sync::get_latest_commit::ParametersData { did: repo_did }
+        .into();
+    match api.service.com.atproto.sync.get_latest_commit(params).await {
+        Ok(output) => Ok(Some(output.data.cid.as_ref().to_string())),
+        Err(e) => Err(anyhow!("getLatestCommit: {e}")),
+    }
 }
 
 /// Compile a root policy from Rego `source`, returning a freshly compiled

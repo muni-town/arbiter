@@ -20,7 +20,7 @@ use atrium_api::agent::atp_agent::store::MemorySessionStore;
 use atrium_api::types::string::Did;
 use atrium_xrpc::XrpcClient;
 use atrium_xrpc::error::{ErrorResponseBody, XrpcErrorKind};
-use atrium_xrpc_client::reqwest::ReqwestClient;
+use atrium_xrpc_client::reqwest::{ReqwestClient, ReqwestClientBuilder};
 use moka::future::Cache;
 use serde_json::Value;
 use tracing::warn;
@@ -30,6 +30,12 @@ type Session = CredentialSession<MemorySessionStore, ReqwestClient>;
 
 /// Per-stewarded-account authenticated sessions, keyed by the steward DID.
 /// Reused across requests so we don't re-`createSession` on every proxy call.
+///
+/// A cached session is kept until it stops working: the proxy transparently
+/// refreshes the access token while the refresh token is valid, and re-logins
+/// from the stored steward password when both are revoked (`ExpiredToken`). A
+/// session is only dropped when that re-login happens, so a valid session is
+/// reused rather than discarded speculatively.
 static SESSIONS: LazyLock<Cache<String, Arc<Session>>> = LazyLock::new(|| {
     Cache::builder()
         .max_capacity(10_000)
@@ -48,6 +54,18 @@ fn upstream_error(status: axum::http::StatusCode, msg: impl Into<String>) -> Xrp
     }
 }
 
+/// Build an XRPC error envelope for a server-side policy abort (e.g. a policy
+/// exceeding the per-request remote-call limit).
+pub fn policy_aborted(msg: &str) -> XrpcError {
+    XrpcError {
+        status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        error: Some(XrpcErrorKind::Undefined(ErrorResponseBody {
+            error: Some("PolicyAborted".into()),
+            message: Some(msg.to_string()),
+        })),
+    }
+}
+
 /// Fetch (or create + login) the authenticated session for `stewarded_did`
 /// against the PDS at `pds_endpoint` (resolved from the steward's DID doc).
 async fn get_or_login(
@@ -61,6 +79,12 @@ async fn get_or_login(
     login_fresh(stewarded_did, pds_endpoint, password).await
 }
 
+/// Total timeout for a single proxied upstream HTTP request (including body
+/// read). reqwest's defaults impose no total timeout, so a PDS that accepts a
+/// connection but never responds would otherwise pin the request (and the
+/// policy machine task) indefinitely.
+const PROXY_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Always create a fresh session via `createSession`, cache it, and return it.
 ///
 /// Used both for first-time login and for the re-login fallback when a cached
@@ -71,7 +95,21 @@ async fn login_fresh(
     pds_endpoint: &str,
     password: &str,
 ) -> Result<Arc<Session>, XrpcError> {
-    let client = ReqwestClient::new(pds_endpoint);
+    // Build the client with a total timeout so a hung PDS cannot stall the
+    // request forever (mirrors `policy::pds_read_client`).
+    let client = ReqwestClientBuilder::new(pds_endpoint)
+        .client(
+            reqwest::Client::builder()
+                .timeout(PROXY_HTTP_TIMEOUT)
+                .build()
+                .map_err(|e| {
+                    upstream_error(
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("building proxy HTTP client: {e}"),
+                    )
+                })?,
+        )
+        .build();
     let session = Arc::new(CredentialSession::new(
         client,
         MemorySessionStore::default(),
@@ -102,6 +140,39 @@ fn is_expired_token(err: &XrpcError) -> bool {
         _ => false,
     }
 }
+
+/// Reject a proxied upstream response whose body exceeds
+/// [`MAX_PROXIED_RESPONSE_BYTES`], replacing it with a 502. Operates on the raw
+/// `send_xrpc` result (before the caller maps the error into an `XrpcError`),
+/// so an oversized upstream body never reaches the policy machine's buffers.
+fn enforce_response_size(
+    result: atrium_xrpc::Result<atrium_xrpc::OutputDataOrBytes<Value>, Value>,
+) -> atrium_xrpc::Result<atrium_xrpc::OutputDataOrBytes<Value>, Value> {
+    let output = match result {
+        Ok(output) => output,
+        Err(e) => return Err(e),
+    };
+    let len = match &output {
+        atrium_xrpc::OutputDataOrBytes::Data(json) => {
+            serde_json::to_vec(json).map_or(0, |v| v.len())
+        }
+        atrium_xrpc::OutputDataOrBytes::Bytes(bytes) => bytes.len(),
+    };
+    if len > MAX_PROXIED_RESPONSE_BYTES {
+        return Err(atrium_xrpc::error::Error::XrpcResponse(upstream_error(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "upstream response exceeded size limit",
+        )));
+    }
+    Ok(output)
+}
+
+/// Max size of a proxied upstream response body. `send_xrpc` fully buffers
+/// the response, and the policy machine copies it into its own `buffers`, so
+/// an unbounded upstream body would let a hostile policy force unbounded
+/// memory use per request even though the final relay would refuse to send it
+/// out. We reject oversized responses here, before they reach the machine.
+const MAX_PROXIED_RESPONSE_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 
 /// Send `request` to `endpoint` (`did#service`), authenticating to the
 /// destination as the stewarded account.
@@ -143,6 +214,7 @@ pub async fn execute_remote(
     let result = proxied
         .send_xrpc::<Value, Value, Value, Value>(request)
         .await;
+    let result = enforce_response_size(result);
 
     // Re-login fallback: if the upstream rejected the token (both access and
     // refresh are dead — atrium already retried via refreshSession once), drop
@@ -161,15 +233,15 @@ pub async fn execute_remote(
                     .clone_with_proxy(target_did, &service)
                     .send_xrpc::<Value, Value, Value, Value>(request)
                     .await;
-                return match retried {
+                return match enforce_response_size(retried) {
                     Ok(ok) => Ok(ok),
-                    Err(atrium_xrpc::Error::XrpcResponse(xrpc_err)) => return Err(xrpc_err),
+                    Err(atrium_xrpc::Error::XrpcResponse(xrpc_err)) => Err(xrpc_err),
                     Err(e) => {
                         warn!(endpoint, "proxy retry send_xrpc failed: {e:?}");
-                        return Err(upstream_error(
+                        Err(upstream_error(
                             axum::http::StatusCode::BAD_GATEWAY,
                             format!("proxy retry failed: {e}"),
-                        ));
+                        ))
                     }
                 };
             }

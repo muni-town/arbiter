@@ -25,9 +25,15 @@ pub struct ArbiterCollection {
 struct ArbiterEntry {
     arbiter: Arbiter,
     pds_endpoint: String,
-    /// Last-applied repo `rev` per policy/service record key, for monotonic
-    /// reload.
-    revs: HashMap<String, String>,
+    /// The repo `rev` the arbiter was loaded at (its PDS head commit, or a
+    /// timestamp fallback). Any Jetstream event with `rev <= floor` refers to
+    /// state already reflected in the loaded records, so it is discarded.
+    ///
+    /// This is the only rev state we need: every accepted event triggers a full
+    /// reload that re-reads the PDS and replaces `rev_floor` with the then-current
+    /// head. A replayed or out-of-order event at or below that head is rejected by
+    /// the floor alone, so no per-record dedup map is necessary.
+    rev_floor: Option<String>,
 }
 
 /// The result of beginning a request: an owned request machine (the arbiter's
@@ -45,17 +51,57 @@ impl ArbiterCollection {
     }
 
     /// Onboard (or replace) an arbiter for the given DID with freshly loaded
-    /// policies. Resets rev tracking.
-    pub async fn onboard(&self, did: String, arbiter: Arbiter, pds_endpoint: String) {
+    /// policies.
+    ///
+    /// `rev_floor` is the repo `rev` the policies were loaded at (the PDS head
+    /// commit, captured before the records were read so the floor provably
+    /// dominates the loaded state). Jetstream events at or below this rev
+    /// describe state already reflected in the loaded records and are
+    /// discarded. `None` means no floor could be determined (accept everything,
+    /// risking only redundant reloads).
+    ///
+    /// The replacement is applied only if the incoming load is at least as
+    /// fresh as the currently-applied floor (string comparison of repo revs).
+    /// This closes a race where two reloads for the same DID run concurrently
+    /// and a slower load, having read an older PDS snapshot, finishes last and
+    /// would otherwise regress the active policy and its floor.
+    pub async fn onboard(
+        &self,
+        did: String,
+        arbiter: Arbiter,
+        pds_endpoint: String,
+        rev_floor: Option<String>,
+    ) {
         let mut map = self.inner.write().await;
-        map.insert(
-            did,
-            ArbiterEntry {
-                arbiter,
-                pds_endpoint,
-                revs: HashMap::new(),
-            },
-        );
+        match map.get_mut(&did) {
+            Some(existing) => {
+                // Only replace if the incoming floor is not older than the
+                // current one. A fresh load at the same head is still applied
+                // (both reflect the same PDS state).
+                let apply = match (&existing.rev_floor, &rev_floor) {
+                    (Some(cur), Some(new)) => new >= cur,
+                    // No current floor: apply anything. No new floor: never
+                    // regress a floored load.
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                };
+                if apply {
+                    existing.arbiter = arbiter;
+                    existing.pds_endpoint = pds_endpoint;
+                    existing.rev_floor = rev_floor;
+                }
+            }
+            None => {
+                map.insert(
+                    did,
+                    ArbiterEntry {
+                        arbiter,
+                        pds_endpoint,
+                        rev_floor,
+                    },
+                );
+            }
+        }
     }
 
     /// Stop serving an arbiter (e.g. its service record disappeared). Keeps
@@ -83,22 +129,19 @@ impl ArbiterCollection {
         })
     }
 
-    /// Whether the given `rev` is strictly newer than the last-applied rev for
-    /// `key` (string comparison; atproto repo revs are TID-based and
-    /// lexicographically ordered), or if no rev is stored yet.
-    pub async fn is_newer(&self, did: &str, key: &str, rev: &str) -> bool {
+    /// Whether the given repo `rev` refers to a commit this server has not yet
+    /// loaded. It is accepted iff it is strictly newer than the load-time
+    /// floor (revs at or below the floor are already reflected in the loaded
+    /// records).
+    ///
+    /// `rev`/`floor` comparison is string comparison: atproto repo revs are
+    /// TID-based and lexicographically ordered, so a later commit sorts
+    /// greater.
+    pub async fn is_newer(&self, did: &str, rev: &str) -> bool {
         let map = self.inner.read().await;
         match map.get(did) {
-            Some(entry) => entry.revs.get(key).is_none_or(|old| rev > old.as_str()),
+            Some(entry) => entry.rev_floor.as_deref().is_none_or(|floor| rev > floor),
             None => false,
-        }
-    }
-
-    /// Record the last-applied `rev` for a record key.
-    pub async fn set_rev(&self, did: &str, key: &str, rev: String) {
-        let mut map = self.inner.write().await;
-        if let Some(entry) = map.get_mut(did) {
-            entry.revs.insert(key.to_string(), rev);
         }
     }
 }

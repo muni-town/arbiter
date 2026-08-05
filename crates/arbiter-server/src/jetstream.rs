@@ -33,7 +33,7 @@ use atproto_jetstream::{
     CancellationToken, Consumer, ConsumerTaskConfig, EventHandler, JetstreamEvent,
 };
 
-use crate::policy::load_and_onboard;
+use crate::policy::{load_and_onboard, refresh_all_after_reconnect};
 use crate::{AppState, CONFIG};
 
 /// Collections this server watches on Jetstream.
@@ -75,6 +75,16 @@ pub async fn subscribe(state: Arc<AppState>) {
                 backoff = (backoff * 2).min(Duration::from_secs(30));
             }
         }
+
+        // The subscription was down; re-fetch current PDS state for every
+        // steward so any policy/service-record write missed while disconnected
+        // is picked up, closing the fail-open window (see
+        // `refresh_all_after_reconnect`). This is distinct from startup
+        // onboarding: it runs on every reconnect, not just boot.
+        let refresh_state = state.clone();
+        tokio::spawn(async move {
+            refresh_all_after_reconnect(refresh_state).await;
+        });
     }
 }
 
@@ -137,18 +147,16 @@ impl EventHandler for ReloadHandler {
     async fn handle_event(&self, event: Arc<JetstreamEvent>) -> anyhow::Result<()> {
         // Only repo commit/delete events carry record changes; identity and
         // account events are irrelevant to policy.
-        let (did, rev, collection, rkey) = match &*event {
+        let (did, rev, collection) = match &*event {
             JetstreamEvent::Commit { did, commit, .. } => (
                 did,
                 commit.rev.as_str(),
                 commit.collection.as_str(),
-                commit.rkey.as_str(),
             ),
             JetstreamEvent::Delete { did, commit, .. } => (
                 did,
                 commit.rev.as_str(),
                 commit.collection.as_str(),
-                commit.rkey.as_str(),
             ),
             _ => return Ok(()),
         };
@@ -177,29 +185,23 @@ impl EventHandler for ReloadHandler {
             return Ok(());
         }
 
-        // The record key this event targets, used for monotonic-rev gating. For a
-        // commit this is the record path; for a delete it's the collection/rkey too
-        // (so a delete of a watched record is rev-gated identically).
-        let path = format!("{collection}/{rkey}");
-
-        // Discard older/duplicate revs.
-        if !self.state.arbiters.is_newer(did, &path, rev).await {
+        // Discard events at or below the load-time rev floor: their state is
+        // already reflected in the loaded records (see `ArbiterCollection::is_newer`).
+        if !self.state.arbiters.is_newer(did, rev).await {
             return Ok(());
         }
 
         // Re-fetch the current PDS state and reapply the lifecycle + policies.
         // This never applies the event payload directly, so reordered/duplicate
-        // events cannot regress policy.
+        // events cannot regress policy. `load_and_onboard` sets the new rev
+        // floor from the PDS head it just read, so the next gating decision
+        // reflects the freshest state.
         // 
         // TODO: maybe we should try to surgically update instead of refreshing the
         // whole policy by re-loading all the records in the future, but we need to
         // analyze carefully for correctness before doing that.
         match load_and_onboard(&self.state, did).await {
             Ok(pds) => {
-                self.state
-                    .arbiters
-                    .set_rev(did, &path, rev.to_string())
-                    .await;
                 tracing::debug!(did, pds = %pds, "reloaded arbiter from jetstream event");
             }
             Err(e) => {

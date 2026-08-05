@@ -3,14 +3,15 @@
  *
  * Provides a single `arbiter` object with methods to:
  *  - Obtain a service auth token scoped to the arbiter-server DID.
- *  - Read / write PDS records (proxied through the arbiter).
+ *  - Read / write PDS records proxied through the arbiter's `town.muni.arbiter.proxy`
+ *    procedure (the only way to reach a stewarded account's PDS).
  *  - Read / write the root Rego policy record.
  *  - Discover whether a stewarded account has an arbiter service record.
  *  - Provision a new arbiter, or import an existing account via app password.
  */
 
 import { PUBLIC_ARBITER_URL, PUBLIC_ARBITER_DID } from '$env/static/public';
-import { xrpc } from '@atproto/lex';
+import { xrpc, type LexMap, isDidString, isNsidString } from '@atproto/lex';
 import { XrpcResponseError } from '@atproto/lex';
 import type { AtprotoDid } from '@atcute/lexicons/syntax';
 import * as town from '$lib/lexicons/town';
@@ -26,12 +27,39 @@ const POLICY_RKEY = 'self';
 const SERVICE_COLLECTION = 'town.muni.arbiter.service';
 const SERVICE_RKEY = 'self';
 
+/** The `did#service` fragment for a steward's PDS. */
+const AT_PROTO_PDS_FRAGMENT = 'atproto_pds';
+
 /** Fallback policy returned when no root policy record exists yet. */
-const DEFAULT_POLICY = '# Enter your Rego policy here\n\nallow = true\n';
+const DEFAULT_POLICY = '# Enter your Rego policy here\n\nresult := { "ok": true, "output": null }\n';
 
 /** Minimal DID document shape we care about (for PDS endpoint discovery). */
 interface MinimalDidDoc {
   service?: { id?: string; type?: string; serviceEndpoint?: string }[];
+}
+
+/** A single proxied XRPC operation to run against a stewarded account. */
+export interface ProxyOperation {
+  /** The inner XRPC method NSID (e.g. `com.atproto.repo.getRecord`). */
+  nsid: string;
+  /** HTTP method for the inner request. */
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  /** Optional query parameters for the inner request. */
+  parameters?: LexMap;
+  /** Optional JSON body for the inner request. */
+  body?: LexMap;
+}
+
+/** A proxied record value returned by the arbiter. */
+type RecordValue = Record<string, unknown>;
+
+/** Read the string `policy` field off an arbitrary record value, if present. */
+function policySource(value: unknown): string | undefined {
+  if (value && typeof value === 'object' && 'policy' in value) {
+    const candidate = value.policy;
+    if (typeof candidate === 'string') return candidate;
+  }
+  return undefined;
 }
 
 export const arbiter = {
@@ -44,48 +72,69 @@ export const arbiter = {
    */
   async getServiceAuth(lxm: string): Promise<string> {
     if (!auth.client) throw new Error('Not authenticated');
+    if (!isNsidString(lxm)) throw new Error(`Invalid NSID scope \`${lxm}\``);
 
     const resp = await auth.client.xrpc(com.atproto.server.getServiceAuth, {
       params: {
         aud: PUBLIC_ARBITER_DID as AtprotoDid,
         lxm,
-      } as any,
+      },
     });
     return (resp.body as { token: string }).token;
+  },
+
+  /**
+   * Run an XRPC operation against a stewarded account's PDS, proxied through
+   * the arbiter's `town.muni.arbiter.proxy` procedure. This is the only way to
+   * reach a stewarded account's PDS: the arbiter evaluates the operation
+   * against the installed policy, then proxies it to the steward's PDS
+   * (`did#atproto_pds`) authenticated as the stewarded account.
+   *
+   * Returns the body of the inner XRPC response (or throws if the operation or
+   * its proxy fails).
+   */
+  async proxy(did: string, op: ProxyOperation, target?: string): Promise<LexMap> {
+    if (!isDidString(did)) throw new Error(`Invalid arbiter DID \`${did}\``);
+    const token = await this.getServiceAuth('town.muni.arbiter.proxy');
+
+    const res = await xrpc(PUBLIC_ARBITER_URL, town.muni.arbiter.proxy, {
+      body: {
+        arbiterDid: did,
+        target: target ?? `${did}#${AT_PROTO_PDS_FRAGMENT}`,
+        method: op.method,
+        nsid: op.nsid,
+        parameters: op.parameters,
+        body: op.body,
+      },
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    return res.body ?? {};
   },
 
   // ─── Record operations (proxied through the arbiter) ────────────────
 
   /**
    * Fetch a record from the stewarded account's PDS, proxied through the
-   * arbiter. Returns the raw `com.atproto.repo.getRecord` response body
-   * (typically `{ uri, cid, value }`).
+   * arbiter. Returns the record `value` (the inner `com.atproto.repo.getRecord`
+   * response body is `{ uri, cid, value }`).
    */
   async getRecord(
     did: string,
     collection: string,
     rkey: string,
-  ): Promise<Record<string, unknown>> {
-    const token = await this.getServiceAuth('com.atproto.repo.getRecord');
-
-    const url = new URL(`${PUBLIC_ARBITER_URL}/xrpc/com.atproto.repo.getRecord`);
-    url.searchParams.set('repo', did);
-    url.searchParams.set('collection', collection);
-    url.searchParams.set('rkey', rkey);
-
-    const res = await fetch(url, {
-      headers: {
-        'arbiter-did': did,
-        'arbiter-proxy': `${did}#atproto_pds`,
-        Authorization: `Bearer ${token}`,
-      },
+  ): Promise<RecordValue> {
+    const body = await this.proxy(did, {
+      nsid: 'com.atproto.repo.getRecord',
+      method: 'GET',
+      parameters: { repo: did, collection, rkey },
     });
-    if (!res.ok) {
-      throw new Error(
-        `getRecord failed (${res.status}): ${await res.text()}`,
-      );
+    const value = body.value;
+    if (value == null || typeof value !== 'object') {
+      throw new Error(`getRecord returned no value for ${collection}/${rkey}`);
     }
-    return (await res.json()) as Record<string, unknown>;
+    return value as RecordValue;
   },
 
   /**
@@ -96,30 +145,22 @@ export const arbiter = {
   async putRecord(
     did: string,
     collection: string,
-    record: Record<string, unknown>,
+    record: LexMap,
     rkey?: string,
   ): Promise<{ uri: string; cid: string }> {
-    const token = await this.getServiceAuth('com.atproto.repo.putRecord');
-
-    const res = await xrpc(
-      PUBLIC_ARBITER_URL,
-      com.atproto.repo.putRecord,
-      {
-        body: {
-          repo: did as any,
-          collection: collection as any,
-          rkey: (rkey || undefined) as any,
-          record: record as any,
-          validate: true,
-        } as any,
-        headers: {
-          'arbiter-did': did,
-          'arbiter-proxy': `${did}#atproto_pds`,
-          Authorization: `Bearer ${token}`,
-        },
+    const body = await this.proxy(did, {
+      nsid: 'com.atproto.repo.putRecord',
+      method: 'POST',
+      body: {
+        repo: did,
+        collection,
+        rkey: rkey || undefined,
+        record,
+        validate: true,
       },
-    );
-    return res.body as { uri: string; cid: string };
+    });
+    const { uri, cid } = body;
+    return { uri: typeof uri === 'string' ? uri : '', cid: typeof cid === 'string' ? cid : '' };
   },
 
   // ─── Policy (root Rego record) ─────────────────────────────────────
@@ -127,22 +168,15 @@ export const arbiter = {
   /**
    * Read the root Rego policy for a stewarded account.
    *
-   * Fetches `town.muni.arbiter.policy.root/self` via getRecord and returns the
-   * `source` string. If the record does not exist (or any error occurs), a
-   * default placeholder policy is returned so the editor is still usable.
+   * Fetches `town.muni.arbiter.policy.root/self` via the arbiter proxy and
+   * returns the `policy` string. If the record does not exist (or any error
+   * occurs), a default placeholder policy is returned so the editor is still
+   * usable.
    */
   async getPolicy(did: string): Promise<string> {
     try {
       const record = await this.getRecord(did, POLICY_COLLECTION, POLICY_RKEY);
-      // getRecord returns `{ uri, cid, value }`; fall back to the body itself
-      // in case the proxy returns the record unwrapped.
-      const candidate: unknown =
-        record.value !== undefined ? record.value : record;
-      const source =
-        candidate && typeof candidate === 'object' && 'source' in candidate
-          ? candidate.source
-          : undefined;
-      return typeof source === 'string' ? source : DEFAULT_POLICY;
+      return policySource(record) ?? DEFAULT_POLICY;
     } catch {
       return DEFAULT_POLICY;
     }
@@ -150,15 +184,15 @@ export const arbiter = {
 
   /**
    * Write (replace) the root Rego policy for a stewarded account by writing
-   * the `town.muni.arbiter.policy.root/self` record via putRecord.
+   * the `town.muni.arbiter.policy.root/self` record via the arbiter proxy.
    */
-  async setPolicy(did: string, source: string): Promise<void> {
+  async setPolicy(did: string, policy: string): Promise<void> {
     await this.putRecord(
       did,
       POLICY_COLLECTION,
       {
         $type: 'town.muni.arbiter.policy.root',
-        source,
+        policy,
       },
       POLICY_RKEY,
     );
@@ -228,19 +262,36 @@ export const arbiter = {
    * Import an existing account as a stewarded arbiter using an app password.
    * The caller proves control of the account via the app password; the server
    * stores the credentials and brings the arbiter online.
+   *
+   * The server resolves the PDS endpoint itself from the account's DID doc;
+   * no PDS URL override is accepted.
    */
   async createAppPasswordArbiter(
     arbiterDid: string,
     appPassword: string,
-    pdsUrl?: string,
   ): Promise<void> {
-    const body: Record<string, unknown> = { arbiterDid, appPassword };
-    if (pdsUrl) body.pdsUrl = pdsUrl;
-
+    if (!isDidString(arbiterDid)) throw new Error(`Invalid arbiter DID \`${arbiterDid}\``);
     await xrpc(PUBLIC_ARBITER_URL, town.muni.arbiter.createAppPasswordArbiter, {
-      body: body as any,
+      body: { arbiterDid, appPassword },
       headers: {
         Authorization: `Bearer ${await this.getServiceAuth('town.muni.arbiter.createAppPasswordArbiter')}`,
+      },
+    });
+  },
+
+  /**
+   * Reset a stewarded arbiter's root policy (recovery admin only).
+   *
+   * Authenticated via a serviceAuth token scoped to
+   * `town.muni.arbiter.resetPolicy`. Only the account designated in the
+   * arbiter's `town.muni.arbiter.recovery/self` record may reset the policy.
+   */
+  async resetPolicy(did: string, policy: string): Promise<void> {
+    if (!isDidString(did)) throw new Error(`Invalid arbiter DID \`${did}\``);
+    await xrpc(PUBLIC_ARBITER_URL, town.muni.arbiter.resetPolicy, {
+      body: { arbiterDid: did, policy },
+      headers: {
+        Authorization: `Bearer ${await this.getServiceAuth('town.muni.arbiter.resetPolicy')}`,
       },
     });
   },

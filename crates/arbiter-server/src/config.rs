@@ -64,4 +64,23 @@ pub struct ServerConfig {
         default_value = ".muni.town"
     )]
     pub handle_suffix: String,
+
+    /// Max `createArbiter` calls allowed per caller per window. Set to 0 to
+    /// disallow account creation entirely. This is deliberately aggressive by
+    /// default (bulk arbiter creation is not allowed unless the admin raises
+    /// it explicitly).
+    #[arg(
+        long = "create-arbiter-rate-limit",
+        env = "CREATE_ARBITER_RATE_LIMIT",
+        default_value_t = 1
+    )]
+    pub create_arbiter_rate_limit: u64,
+
+    /// The rate-limit window for `createArbiter` (seconds).
+    #[arg(
+        long = "create-arbiter-rate-window-secs",
+        env = "CREATE_ARBITER_RATE_WINDOW_SECS",
+        default_value_t = 60
+    )]
+    pub create_arbiter_rate_window_secs: u64,
 }

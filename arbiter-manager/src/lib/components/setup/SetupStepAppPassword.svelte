@@ -27,7 +27,7 @@
       await setupClient.login(auth.client.did, setupState.appPassword);
 
       // Save the app password
-      setupState.step = 'email-code';
+      setupState.step = 'select-admin';
       setupState.error = undefined;
       setupState.loading = false;
     } catch (e) {

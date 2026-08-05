@@ -31,6 +31,35 @@ fn test_arbiter() -> Arbiter {
     Arbiter::new(Policies::new(root, HashMap::new()))
 }
 
+/// An arbiter whose root policy echoes a fixed `tag`, so tests can tell which
+/// policy instance is currently active.
+fn tagged_arbiter(tag: &str) -> Arbiter {
+    let src = format!(
+        r#"
+        package arbiter
+        result := {{ "ok": true, "output": {{ "tag": "{tag}" }} }}
+        "#
+    );
+    let root = PolicyVm::new(&src, Value::new_object(), "data.arbiter.result", &["xrpc", "policy"])
+        .expect("policy compiles");
+    Arbiter::new(Policies::new(root, HashMap::new()))
+}
+
+/// Run the arbiter's root policy for `did` and return the `tag` in the output,
+/// asserting the machine completes immediately.
+async fn active_tag(col: &ArbiterCollection, did: &str) -> String {
+    let mut drive = col
+        .begin_request(did, make_req(), RequestCtx::default())
+        .await
+        .expect("begin_request");
+    match drive.machine.start() {
+        ArbiterReqMachineStep::Completed(Ok(XrpcOutput::Data(json))) => {
+            json.get("tag").and_then(serde_json::Value::as_str).unwrap().to_string()
+        }
+        other => panic!("expected immediate Data completion, got {other:?}"),
+    }
+}
+
 fn make_req() -> XrpcRequest {
     XrpcRequest {
         method: http::Method::GET,
@@ -73,7 +102,7 @@ async fn fail_closed_unonboarded() {
 #[tokio::test]
 async fn onboard_then_request_succeeds() {
     let col = ArbiterCollection::new();
-    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string())
+    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string(), None)
         .await;
 
     assert!(is_serving(&col, DID_A).await);
@@ -101,7 +130,7 @@ async fn onboard_then_request_succeeds() {
 #[tokio::test]
 async fn offboard_then_fail_closed() {
     let col = ArbiterCollection::new();
-    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string())
+    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string(), None)
         .await;
     assert!(
         col.offboard(DID_A).await,
@@ -122,53 +151,123 @@ async fn offboard_unknown_returns_false() {
     assert!(!col.offboard("did:plc:unknown").await);
 }
 
-// ─── onboard resets rev tracking ─────────────────────────────────────────────
+// ─── stale onboard does not regress (concurrent reload race) ────────────────
 
 #[tokio::test]
-async fn onboard_resets_revs() {
+async fn stale_onboard_does_not_regress() {
+    // Two concurrent reloads for the same DID: a slower load that read an older
+    // PDS snapshot (lower floor) must NOT overwrite the newer active policy +
+    // floor when it finishes last.
     let col = ArbiterCollection::new();
-    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string())
-        .await;
-    col.set_rev(DID_A, "root", "zzz".to_string()).await;
-    assert!(
-        !col.is_newer(DID_A, "root", "aaa").await,
-        "rev should be tracked"
-    );
 
-    // Re-onboard resets revs.
-    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string())
-        .await;
+    // Fresh load at rev "ccc" with tag "new".
+    col.onboard(
+        DID_A.to_string(),
+        tagged_arbiter("new"),
+        PDS_A.to_string(),
+        Some("ccc".to_string()),
+    )
+    .await;
+    assert_eq!(active_tag(&col, DID_A).await, "new");
+
+    // Stale load at rev "aaa" (older snapshot) finishing afterwards.
+    col.onboard(
+        DID_A.to_string(),
+        tagged_arbiter("stale"),
+        PDS_A.to_string(),
+        Some("aaa".to_string()),
+    )
+    .await;
+
+    // The newer policy and floor must remain active.
+    assert_eq!(active_tag(&col, DID_A).await, "new", "stale load regressed policy");
     assert!(
-        col.is_newer(DID_A, "root", "aaa").await,
-        "rev tracking should be reset after re-onboard"
+        !col.is_newer(DID_A, "bbb").await,
+        "stale load lowered the floor"
     );
+    assert!(col.is_newer(DID_A, "ddd").await);
+}
+
+#[tokio::test]
+async fn equal_floor_onboard_replaces() {
+    // A load at the same floor (same PDS snapshot) is applied, not dropped.
+    let col = ArbiterCollection::new();
+    col.onboard(
+        DID_A.to_string(),
+        tagged_arbiter("v1"),
+        PDS_A.to_string(),
+        Some("bbb".to_string()),
+    )
+    .await;
+    col.onboard(
+        DID_A.to_string(),
+        tagged_arbiter("v2"),
+        PDS_A.to_string(),
+        Some("bbb".to_string()),
+    )
+    .await;
+    assert_eq!(active_tag(&col, DID_A).await, "v2");
 }
 
 // ─── monotonic rev gating ────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn rev_first_is_always_newer() {
+async fn rev_first_is_always_newer_without_floor() {
+    // With no floor (e.g. a fresh arbiter where we failed to read the PDS head),
+    // any rev is accepted — there is nothing to compare against.
     let col = ArbiterCollection::new();
-    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string())
+    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string(), None)
         .await;
     assert!(
-        col.is_newer(DID_A, "root", "aaa").await,
-        "first rev for a key should always be newer"
+        col.is_newer(DID_A, "aaa").await,
+        "without a floor, the first rev should be accepted"
+    );
+}
+
+#[tokio::test]
+async fn rev_at_or_below_floor_rejected() {
+    // The load-time floor (the PDS head we read when loading) must reject any
+    // event at or below it: that state is already reflected in the loaded
+    // records. This is the restart case that a per-key dedup map could not
+    // handle on its own, since it starts empty.
+    let col = ArbiterCollection::new();
+    col.onboard(
+        DID_A.to_string(),
+        test_arbiter(),
+        PDS_A.to_string(),
+        Some("ccc".to_string()),
+    )
+    .await;
+    assert!(
+        !col.is_newer(DID_A, "ccc").await,
+        "rev at the floor must be rejected (already loaded)"
+    );
+    assert!(
+        !col.is_newer(DID_A, "aaa").await,
+        "rev below the floor must be rejected"
+    );
+    assert!(
+        col.is_newer(DID_A, "ddd").await,
+        "rev above the floor must be accepted"
     );
 }
 
 #[tokio::test]
 async fn rev_newer_accepted() {
     let col = ArbiterCollection::new();
-    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string())
-        .await;
-    col.set_rev(DID_A, "root", "aaa".to_string()).await;
+    col.onboard(
+        DID_A.to_string(),
+        test_arbiter(),
+        PDS_A.to_string(),
+        Some("aaa".to_string()),
+    )
+    .await;
     assert!(
-        col.is_newer(DID_A, "root", "bbb").await,
+        col.is_newer(DID_A, "bbb").await,
         "lexicographically newer rev should be accepted"
     );
     assert!(
-        col.is_newer(DID_A, "root", "aaa1").await,
+        col.is_newer(DID_A, "aaa1").await,
         "longer rev with common prefix should be newer"
     );
 }
@@ -176,11 +275,15 @@ async fn rev_newer_accepted() {
 #[tokio::test]
 async fn rev_older_rejected() {
     let col = ArbiterCollection::new();
-    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string())
-        .await;
-    col.set_rev(DID_A, "root", "bbb".to_string()).await;
+    col.onboard(
+        DID_A.to_string(),
+        test_arbiter(),
+        PDS_A.to_string(),
+        Some("bbb".to_string()),
+    )
+    .await;
     assert!(
-        !col.is_newer(DID_A, "root", "aaa").await,
+        !col.is_newer(DID_A, "aaa").await,
         "older rev must be rejected (no regression)"
     );
 }
@@ -188,12 +291,16 @@ async fn rev_older_rejected() {
 #[tokio::test]
 async fn rev_duplicate_rejected() {
     let col = ArbiterCollection::new();
-    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string())
-        .await;
-    col.set_rev(DID_A, "root", "aaa".to_string()).await;
+    col.onboard(
+        DID_A.to_string(),
+        test_arbiter(),
+        PDS_A.to_string(),
+        Some("aaa".to_string()),
+    )
+    .await;
     assert!(
-        !col.is_newer(DID_A, "root", "aaa").await,
-        "duplicate rev must be rejected"
+        !col.is_newer(DID_A, "aaa").await,
+        "duplicate rev at the floor must be rejected"
     );
 }
 
@@ -201,67 +308,33 @@ async fn rev_duplicate_rejected() {
 async fn rev_unknown_did_rejected() {
     let col = ArbiterCollection::new();
     assert!(
-        !col.is_newer("did:plc:unknown", "root", "aaa").await,
+        !col.is_newer("did:plc:unknown", "aaa").await,
         "unknown DID should not accept revs"
     );
 }
 
 #[tokio::test]
-async fn rev_per_key_independent() {
+async fn rev_floor_reset_on_reonboard() {
+    // Re-onboarding replaces the floor; the new floor governs subsequent events.
     let col = ArbiterCollection::new();
-    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string())
-        .await;
+    col.onboard(
+        DID_A.to_string(),
+        test_arbiter(),
+        PDS_A.to_string(),
+        Some("ccc".to_string()),
+    )
+    .await;
+    assert!(!col.is_newer(DID_A, "ccc").await);
 
-    // Set rev for "root" key.
-    col.set_rev(DID_A, "root", "mmm".to_string()).await;
-    assert!(
-        !col.is_newer(DID_A, "root", "aaa").await,
-        "root rev is tracked"
-    );
-
-    // "sub" key should be independent — first rev always newer.
-    assert!(
-        col.is_newer(DID_A, "sub/moderation", "aaa").await,
-        "different key should not share rev tracking"
-    );
-
-    // Set "sub" rev and verify independence.
-    col.set_rev(DID_A, "sub/moderation", "bbb".to_string())
-        .await;
-    assert!(
-        col.is_newer(DID_A, "root", "zzz").await,
-        "root key should accept newer rev independent of sub key"
-    );
-    assert!(
-        col.is_newer(DID_A, "sub/moderation", "ccc").await,
-        "sub key should accept newer rev independent of root key"
-    );
-    assert!(
-        !col.is_newer(DID_A, "sub/moderation", "aaa").await,
-        "sub key should reject older rev"
-    );
-}
-
-#[tokio::test]
-async fn rev_set_persists() {
-    let col = ArbiterCollection::new();
-    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string())
-        .await;
-
-    col.set_rev(DID_A, "root", "ccc".to_string()).await;
-    // Verify the rev was stored by checking is_newer.
-    assert!(
-        !col.is_newer(DID_A, "root", "ccc").await,
-        "same rev is not newer"
-    );
-    assert!(
-        !col.is_newer(DID_A, "root", "bbb").await,
-        "older rev is not newer"
-    );
-    assert!(
-        col.is_newer(DID_A, "root", "ddd").await,
-        "newer rev is newer"
-    );
+    col.onboard(
+        DID_A.to_string(),
+        test_arbiter(),
+        PDS_A.to_string(),
+        Some("eee".to_string()),
+    )
+    .await;
+    assert!(!col.is_newer(DID_A, "ddd").await, "below new floor");
+    assert!(col.is_newer(DID_A, "fff").await, "above new floor");
 }
 
 // ─── multiple DIDs ──────────────────────────────────────────────────────────
@@ -272,9 +345,9 @@ async fn multiple_dids_independent() {
     let did_b = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
     let pds_b = "http://pds-b.example";
 
-    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string())
+    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string(), None)
         .await;
-    col.onboard(did_b.to_string(), test_arbiter(), pds_b.to_string())
+    col.onboard(did_b.to_string(), test_arbiter(), pds_b.to_string(), None)
         .await;
 
     assert!(is_serving(&col, DID_A).await);

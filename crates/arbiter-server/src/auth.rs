@@ -11,9 +11,10 @@
 //! against the caller's own DID-document keys.
 
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use atproto_identity::key::{KeyData, identify_key};
+use atproto_identity::model::VerificationMethod;
 use atproto_identity::traits::IdentityResolver;
 use atproto_oauth::encoding::FromBase64;
 use atproto_oauth::jwt::{Claims, verify};
@@ -26,15 +27,37 @@ use crate::AppState;
 use crate::CONFIG;
 use crate::error::AppError;
 
-/// Cache of PDS signing keys, keyed by PDS DID (the JWT `iss` claim).
+/// Maximum acceptable age of a serviceAuth token (seconds). serviceAuth tokens
+/// are short-lived (default 60s; at most a few minutes), so we reject anything
+/// older than this. This bounds how long a replayed token stays valid and how
+/// long a `jti` lingers in the replay cache.
+const MAX_TOKEN_AGE_SECS: u64 = 5 * 60;
+
+/// Maximum forward clock skew tolerated on `iat` (seconds), so a slightly
+/// fast verifier clock doesn't reject a freshly-minted token.
+const MAX_CLOCK_SKEW_SECS: u64 = 30;
+
+/// Cache of seen `jti` values for replay protection, keyed by `(PDS DID, jti)`.
+/// Entries live for [`MAX_TOKEN_AGE_SECS`] — as long as the token could
+/// legitimately be valid — so a replayed token within that window is rejected.
+static SEEN_JTIS: LazyLock<Cache<(String, String), ()>> = LazyLock::new(|| {
+    Cache::builder()
+        .max_capacity(100_000)
+        .time_to_live(Duration::from_secs(MAX_TOKEN_AGE_SECS))
+        .build()
+});
+
+/// Cache of PDS signing keys, keyed by `(PDS DID, kid)` (the JWT `iss` claim
+/// and the token header's `kid`).
 ///
 /// serviceAuth tokens are signed by the caller's PDS, so the verifying key is
 /// read from the PDS DID document (not the account's). Resolving a DID document
 /// on every request would be expensive and rate-limit-prone, so the extracted
-/// `KeyData` is memoized here. PDS signing keys are expected to rotate rarely;
-/// a long TTL (12h) keeps the cache effective while still eventually picking up
-/// a rotation.
-static PDS_SIGNING_KEYS: LazyLock<Cache<String, KeyData>> = LazyLock::new(|| {
+/// `KeyData` is memoized here. Keying by `kid` as well as the PDS DID means a
+/// key rotation (which changes the `kid`) naturally misses the stale cache
+/// entry and resolves the current key instead of serving the old one for the
+/// whole TTL. A short TTL still bounds how long a *deleted* key lingers.
+static PDS_SIGNING_KEYS: LazyLock<Cache<(String, String), KeyData>> = LazyLock::new(|| {
     Cache::builder()
         .max_capacity(256)
         .time_to_live(Duration::from_secs(12 * 60 * 60))
@@ -88,13 +111,25 @@ impl FromRequestParts<Arc<AppState>> for CallerDid {
             .as_deref()
             .ok_or_else(|| AppError::Unauthorized("serviceAuth missing `iss` claim".into()))?;
 
-        // 3. Resolve the PDS signing key (cached, keyed by PDS DID).
-        let key_data = match PDS_SIGNING_KEYS.get(pds_did).await {
+        // Decode the header (unverified) to read the `kid`, so we select the
+        // specific signing key the token claims to be signed with rather than
+        // blindly taking the first key in the PDS's DID document.
+        let header_segment = jwt
+            .split('.')
+            .next()
+            .ok_or_else(|| AppError::Unauthorized("malformed serviceAuth JWT".into()))?;
+        let unverified_header: atproto_oauth::jwt::Header = FromBase64::from_base64(header_segment)
+            .map_err(|e| AppError::Unauthorized(format!("unable to decode serviceAuth header: {e}")))?;
+        let kid = unverified_header.key_id;
+
+        // 3. Resolve the PDS signing key named by `kid` (cached by (PDS DID,
+        //    kid)). If `kid` is absent we fall back to the first key.
+        let key_data = match PDS_SIGNING_KEYS.get(&(pds_did.to_string(), kid.clone().unwrap_or_default())).await {
             Some(k) => k,
             None => {
-                let key = resolve_pds_signing_key(&*state.resolver, pds_did).await?;
+                let key = resolve_pds_signing_key(&*state.resolver, pds_did, kid.as_deref()).await?;
                 PDS_SIGNING_KEYS
-                    .insert(pds_did.to_string(), key.clone())
+                    .insert((pds_did.to_string(), kid.clone().unwrap_or_default()), key.clone())
                     .await;
                 key
             }
@@ -118,6 +153,38 @@ impl FromRequestParts<Arc<AppState>> for CallerDid {
             )));
         }
 
+        // 5b. Reject stale tokens and enforce replay protection.
+        //     - `iat` must be within a small clock-skew window (rejects
+        //       replayed or overly-aged tokens, and tokens whose lifetime is
+        //       absurdly long even if `exp` is far out).
+        //     - `jti` must be present and unique per (issuer, jti) within the
+        //       token's plausible lifetime.
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+            AppError::Unauthorized("system clock error".into())
+        })?.as_secs();
+        let iat = claims
+            .jose
+            .issued_at
+            .ok_or_else(|| AppError::Unauthorized("serviceAuth missing `iat` claim".into()))?;
+        if now.saturating_sub(iat) > MAX_TOKEN_AGE_SECS + MAX_CLOCK_SKEW_SECS {
+            return Err(AppError::Unauthorized(format!(
+                "serviceAuth token is too old (iat {iat}, now {now})"
+            )));
+        }
+        if iat > now + MAX_CLOCK_SKEW_SECS {
+            return Err(AppError::Unauthorized("serviceAuth token is from the future".into()));
+        }
+        let jti = claims
+            .jose
+            .json_web_token_id
+            .clone()
+            .ok_or_else(|| AppError::Unauthorized("serviceAuth missing `jti` claim".into()))?;
+        let jti_key = (pds_did.to_string(), jti);
+        if SEEN_JTIS.get(&jti_key).await.is_some() {
+            return Err(AppError::Unauthorized("serviceAuth token replay detected".into()));
+        }
+        SEEN_JTIS.insert(jti_key, ()).await;
+
         // 6. Extract `sub` (caller DID) and `lxm` (bound NSID).
         let did = claims
             .jose
@@ -134,21 +201,50 @@ impl FromRequestParts<Arc<AppState>> for CallerDid {
     }
 }
 
-/// Resolve a PDS DID document via `resolver` and extract its signing key from
-/// the first `Multikey` verification method.
+/// Resolve a PDS DID document via `resolver` and extract the `Multikey`
+/// signing key named by `kid` (the JWT header's key id, in `did:key:` form).
+///
+/// The `kid` lets us pick the specific signing key a token claims to be signed
+/// with, so a PDS exposing multiple keys is handled correctly. When `kid` is
+/// `None`, the first `Multikey` verification method is used as a fallback.
 pub async fn resolve_pds_signing_key(
     resolver: &dyn IdentityResolver,
     pds_did: &str,
+    kid: Option<&str>,
 ) -> Result<KeyData, AppError> {
     let doc = resolver.resolve(pds_did).await.map_err(|e| {
         AppError::Unauthorized(format!("unable to resolve PDS DID `{pds_did}`: {e}"))
     })?;
-    let multibase =
-        doc.did_keys().into_iter().next().ok_or_else(|| {
-            AppError::Unauthorized(format!("PDS `{pds_did}` exposes no signing key"))
-        })?;
-    // `did_keys()` returns the raw multibase value; `identify_key` expects a
-    // `did:key:`-prefixed (or bare multibase) string.
+
+    let multibase = match kid {
+        // The header `kid` is the public key's `did:key:` string; a DID doc
+        // `Multikey` stores the raw multibase (`z...`) under the same key.
+        Some(kid) if kid.starts_with("did:key:") => {
+            let want = kid.strip_prefix("did:key:").unwrap();
+            doc.verification_method.iter().find_map(|vm| match vm {
+                VerificationMethod::Multikey {
+                    public_key_multibase,
+                    ..
+                } if public_key_multibase == want => Some(public_key_multibase.as_str()),
+                _ => None,
+            })
+        }
+        Some(kid) => {
+            // Non-standard `kid`; still allow matching a bare-multibase kid.
+            doc.verification_method.iter().find_map(|vm| match vm {
+                VerificationMethod::Multikey {
+                    public_key_multibase,
+                    ..
+                } if public_key_multibase == kid => Some(public_key_multibase.as_str()),
+                _ => None,
+            })
+        }
+        None => None,
+    };
+    let multibase = multibase.or_else(|| doc.did_keys().into_iter().next()).ok_or_else(|| {
+        AppError::Unauthorized(format!("PDS `{pds_did}` exposes no signing key matching kid"))
+    })?;
+
     let full = if multibase.starts_with("did:key:") {
         multibase.to_string()
     } else {

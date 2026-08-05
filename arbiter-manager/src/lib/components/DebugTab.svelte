@@ -3,6 +3,7 @@
   import MonacoEditor from './MonacoEditor.svelte';
   import { TID } from '@atproto/common-web';
   import { arbiter } from '$lib/arbiter';
+  import type { LexMap } from '@atproto/lex';
 
   let { did }: { did: string } = $props();
 
@@ -22,7 +23,7 @@
     error = null;
 
     try {
-      let record: Record<string, unknown>;
+      let record: LexMap;
       try {
         record = JSON.parse(recordJson);
       } catch {

@@ -140,10 +140,11 @@ with the **Toasty** ORM.
 - **Single instance for now.** Arbiter state machines are in-memory,
   per-process. Turso is durable persistence for credentials, not a
   coordination layer. (Multi-instance is future work — see §10.)
-- **Encryption at rest is still required** for app passwords and DID keys.
-  Toasty is an ORM, not an encryption layer; encrypt credentials before
-  storing. This is an explicit open implementation item, not solved by
-  choosing Toasty.
+- **Encryption at rest is deferred.** Passwords are currently stored in
+  plaintext in the local Turso DB (see `storage.rs` for the explicit tradeoff).
+  This was intentionally dropped from the production bar for now; password
+  encryption (e.g. Turso whole-DB encryption or field-level AES-GCM) is a
+  follow-up, not a launch requirement.
 
 ## 6. Bootstrap (built-in XRPCs)
 

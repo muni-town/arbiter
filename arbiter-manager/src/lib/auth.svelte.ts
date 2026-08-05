@@ -19,6 +19,8 @@ const atprotoOauthScope = [
   'rpc:app.bsky.actor.getProfile?aud=*',
   'rpc:town.muni.arbiter.createArbiter?aud=*',
   'rpc:town.muni.arbiter.createAppPasswordArbiter?aud=*',
+  'rpc:town.muni.arbiter.proxy?aud=*',
+  'rpc:town.muni.arbiter.resetPolicy?aud=*',
 ].join(' ');
 
 export class Auth {

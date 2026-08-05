@@ -67,10 +67,8 @@
       <div class="space-y-1">
         <h3 class="font-semibold text-base-900 dark:text-base-50">Sign In To Your Account Here</h3>
         <p class="text-sm text-base-600 dark:text-base-400">
-          Sign in with your account using AT Protocol OAuth. This will let us register the arbiter
-          server with your DID PLC. <br /><br /><strong>Note:</strong> This does not work for
-          <code>did:web</code> accounts. If you don't know what that means, then you don't have one and
-          won't have to worry about it.
+          Sign in with your account using AT Protocol OAuth. This proves you control the account and
+          lets the app write the arbiter's initial policy to it.
         </p>
       </div>
     </div>
@@ -86,7 +84,8 @@
       <div class="space-y-1">
         <h3 class="font-semibold text-base-900 dark:text-base-50">Enter App Password</h3>
         <p class="text-sm text-base-600 dark:text-base-400">
-          Type in the App Password you created.
+          Type in the App Password you created. It lets the arbiter server execute requests on your
+          account's PDS after validating them against your policy.
         </p>
       </div>
     </div>
@@ -98,24 +97,6 @@
         class="w-8 h-8 rounded-full bg-accent-100 dark:bg-accent-900 text-accent-600 dark:text-accent-300 flex items-center justify-center text-sm font-bold shrink-0"
       >
         4
-      </div>
-      <div class="space-y-1">
-        <h3 class="font-semibold text-base-900 dark:text-base-50">Verify via Email</h3>
-        <p class="text-sm text-base-600 dark:text-base-400">
-          Your PDS will send a confirmation code to your email. This is required to authorize
-          changes to your DID document, registering the arbiter service with your account. Enter the
-          code to proceed.
-        </p>
-      </div>
-    </div>
-
-    <div
-      class="flex gap-4 p-4 rounded-lg bg-base-50 dark:bg-base-900 border border-base-200 dark:border-base-800"
-    >
-      <div
-        class="w-8 h-8 rounded-full bg-accent-100 dark:bg-accent-900 text-accent-600 dark:text-accent-300 flex items-center justify-center text-sm font-bold shrink-0"
-      >
-        5
       </div>
       <div class="space-y-1">
         <h3 class="font-semibold text-base-900 dark:text-base-50">Select an Admin</h3>

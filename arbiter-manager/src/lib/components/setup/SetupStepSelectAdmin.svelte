@@ -1,21 +1,16 @@
 <script lang="ts">
   import { Button } from '@foxui/core';
-  import { setupState } from '$lib/setupState.svelte';
+  import { setupState, setupClient } from '$lib/setupState.svelte';
   import { AtprotoHandlePopup, type Profile } from '@foxui/all';
-  import { PUBLIC_ARBITER_URL, PUBLIC_ARBITER_DID } from '$env/static/public';
-  import type { AtprotoDid } from '@atcute/lexicons/syntax';
-  import { auth } from '$lib/auth.svelte';
-  import * as town from '$lib/lexicons/town';
-  import * as com from '$lib/lexicons/com';
   import { isAtprotoDid } from '@atproto/oauth-client-browser';
-  import { xrpc } from '@atproto/lex';
   import { defaultPolicyWithOwner } from '$lib/default-policy';
   import { arbiter } from '$lib/arbiter';
+  import { auth } from '$lib/auth.svelte';
 
   let selectedAdmin: Profile | undefined = $state(undefined);
 
   function goBack() {
-    setupState.step = 'email-code';
+    setupState.step = 'app-password';
   }
 
   async function finishSetup() {
@@ -28,35 +23,22 @@
     setupState.error = undefined;
 
     try {
-      if (!auth.client) throw new Error('Not logged in');
-      if (!selectedAdmin.did) throw new Error('You must select an admin.');
       if (!isAtprotoDid(auth.did)) throw new Error('Not logged in with valid DID');
       if (!setupState.appPassword) throw new Error('Must provide AppPassword');
-      let token = (
-        await auth.client.xrpc(com.atproto.server.getServiceAuth, {
-          params: {
-            aud: PUBLIC_ARBITER_DID as AtprotoDid,
-            lxm: 'town.muni.arbiter.createAppPasswordArbiter',
-          },
-        })
-      ).body.token;
+      if (!selectedAdmin.did) throw new Error('You must select an admin.');
 
-      // Import the existing account as a stewarded arbiter.
-      await xrpc(PUBLIC_ARBITER_URL, town.muni.arbiter.createAppPasswordArbiter, {
-        body: {
-          arbiterDid: auth.did,
-          appPassword: setupState.appPassword,
-        },
-        headers: {
-          'arbiter-did': auth.did,
-          'arbiter-proxy': `${auth.did}#atproto_pds`,
-          authorization: `Bearer ${token}`,
-        },
-      });
+      // Write the initial root policy directly to the account's PDS (via the
+      // app-password session established earlier) BEFORE importing it as a
+      // stewarded arbiter. The server fails to onboard an arbiter whose root
+      // policy record is missing, so the policy must exist first.
+      if (!setupClient.agent) {
+        await setupClient.login(auth.did, setupState.appPassword);
+      }
+      await setupClient.writeRootPolicy(defaultPolicyWithOwner(selectedAdmin.did));
 
-      // Write the initial root policy as a PDS record (proxied through the
-      // arbiter), substituting the selected admin as the owner.
-      await arbiter.setPolicy(auth.did, defaultPolicyWithOwner(selectedAdmin.did));
+      // Import the existing account as a stewarded arbiter. The server reads
+      // the root policy record we just wrote and brings the arbiter online.
+      await arbiter.createAppPasswordArbiter(auth.did, setupState.appPassword);
 
       setupState.step = 'complete';
       setupState.error = undefined;

@@ -59,7 +59,7 @@
         disabled={setupState.loading}
       />
       <p class="text-xs text-base-500">
-        This is the account whose DID document will be updated with the arbiter service.
+        This is the account that will become the stewarded arbiter account.
       </p>
     </div>
 
