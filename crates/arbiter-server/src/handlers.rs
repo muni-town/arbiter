@@ -1,13 +1,13 @@
 //! XRPC routing.
 //!
-//! All requests come through one axum catch-all `/xrpc/{nsid}`. The handler
+//! Requests come through one axum catch-all `/xrpc/{nsid}`. The handler
 //! enforces `lxm == nsid` (the `CallerDid` extractor can't see the path),
 //! dispatches the built-in provisioning NSIDs (`createArbiter` /
-//! `createAppPasswordArbiter`) internally, and otherwise drives the arbiter's
-//! Rego policy machine — proxying any `RemoteXrpcRequest` it emits to the
-//! policy-supplied endpoint authenticated as the stewarded account.
+//! `createAppPasswordArbiter`) internally, and routes everything else to the
+//! `town.muni.arbiter.proxy` endpoint — which drives the arbiter's Rego policy
+//! machine and proxies any `RemoteXrpcRequest` it emits to the policy-supplied
+//! endpoint authenticated as the stewarded account.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arbiter_core::arbiter::{ArbiterReqMachineStep, RequestCtx};
@@ -23,8 +23,8 @@ use atrium_xrpc::InputDataOrBytes;
 use atrium_xrpc_client::reqwest::ReqwestClient;
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::extract::{Path, State};
+use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use rand::RngCore;
 use serde_json::{Value, json};
@@ -43,6 +43,8 @@ use crate::resolver::IdentityResolverExt;
 const NSID_CREATE_ARBITER: &str = "town.muni.arbiter.createArbiter";
 /// Built-in NSID: import an existing account (via app password) as a steward.
 const NSID_CREATE_APP_PASSWORD_ARBITER: &str = "town.muni.arbiter.createAppPasswordArbiter";
+/// Built-in NSID: proxy an arbitrary XRPC request through an arbiter's policy.
+const NSID_PROXY: &str = "town.muni.arbiter.proxy";
 
 /// A typed agent over an authenticated `CredentialSession` against a PDS.
 type SessionAgent = Agent<CredentialSession<MemorySessionStore, ReqwestClient>>;
@@ -58,9 +60,6 @@ async fn xrpc_handler(
     State(state): State<Arc<AppState>>,
     CallerDid { did: caller, lxm }: CallerDid,
     Path(nsid): Path<String>,
-    method: Method,
-    headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Result<Response, AppError> {
     // The extractor can't see the path; enforce the serviceAuth binding here.
@@ -70,49 +69,63 @@ async fn xrpc_handler(
         )));
     }
 
-    // Built-in provisioning NSIDs never use the proxy header.
+    // Built-in NSIDs are dispatched explicitly; anything else is rejected.
     match nsid.as_str() {
-        NSID_CREATE_ARBITER => return create_arbiter(&state, &caller).await,
+        NSID_CREATE_ARBITER => create_arbiter(&state, &caller).await,
         NSID_CREATE_APP_PASSWORD_ARBITER => {
-            return create_app_password_arbiter(&state, &caller, &body).await;
+            create_app_password_arbiter(&state, &caller, &body).await
         }
-        _ => {}
+        NSID_PROXY => proxy_request(&state, &caller, &body).await,
+        other => Err(AppError::BadRequest(format!("unknown nsid `{other}`"))),
     }
+}
 
-    // ---- steady-state proxy ------------------------------------------------
-    let arbiter_did = header_str(&headers, "arbiter-did")?
-        .ok_or_else(|| AppError::MissingHeader("arbiter-did"))?;
-    let arbiter_proxy = header_str(&headers, "arbiter-proxy")?
-        .ok_or_else(|| AppError::MissingHeader("arbiter-proxy"))?;
+/// A proxied XRPC request: the outer `town.muni.arbiter.proxy` procedure's
+/// body names the arbiter to act on behalf of, the destination `did#service`,
+/// and the inner XRPC request to evaluate.
+#[derive(serde::Deserialize)]
+struct ProxyBody {
+    #[serde(rename = "arbiterDid")]
+    arbiter_did: String,
+    /// Destination `did#service` for the proxied request.
+    target: String,
+    /// HTTP method for the inner request.
+    method: String,
+    /// Inner XRPC request NSID.
+    nsid: String,
+    /// Optional query parameters for the inner request.
+    #[serde(default)]
+    parameters: Option<Value>,
+    /// Optional JSON body for the inner request.
+    #[serde(default)]
+    body: Option<Value>,
+}
 
+/// Handle a `town.muni.arbiter.proxy` request: drive the named arbiter's Rego
+/// policy over the inner request, executing any proxied XRPC call it emits.
+async fn proxy_request(state: &AppState, caller: &str, body: &Bytes) -> Result<Response, AppError> {
+    let proxy: ProxyBody = serde_json::from_slice(body)
+        .map_err(|e| AppError::BadRequest(format!("invalid proxy body: {e}")))?;
+    let arbiter_did = proxy.arbiter_did;
     let pds_endpoint = state.resolver.resolve_pds_endpoint(&arbiter_did).await?;
 
-    // Build the XRPC request the arbiter policy will evaluate. Query params are
-    // surfaced to the policy for GET; the body is parsed as JSON for non-GET.
-    let parameters = if method == Method::GET {
-        Some(serde_json::to_value(&query).unwrap_or(Value::Null))
-    } else {
-        None
-    };
-    let input = if method == Method::GET {
-        None
-    } else {
-        let body_json = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-        Some(InputDataOrBytes::Data(body_json))
-    };
+    let method: Method = proxy
+        .method
+        .parse()
+        .map_err(|_| AppError::BadRequest(format!("invalid method `{}`", proxy.method)))?;
     let req = XrpcRequest {
         method,
-        nsid: nsid.clone(),
-        parameters,
-        input,
+        nsid: proxy.nsid,
+        parameters: proxy.parameters,
+        input: proxy.body.map(InputDataOrBytes::Data),
         encoding: Some("application/json".to_string()),
     };
 
     let ctx = RequestCtx {
         arbiter_did: arbiter_did.clone(),
         pds_endpoint: pds_endpoint.clone(),
-        caller_did: caller,
-        xrpc_endpoint: arbiter_proxy,
+        caller_did: caller.to_string(),
+        xrpc_endpoint: proxy.target,
     };
 
     let drive = state.arbiters.begin_request(&arbiter_did, req, ctx).await?;
@@ -160,20 +173,6 @@ fn xrpc_result_to_response(result: XrpcResult) -> Response {
                 "error": xrpc_err.error,
             });
             (xrpc_err.status, Json(body)).into_response()
-        }
-    }
-}
-
-/// Read a header value as a trimmed string, returning `None` when absent.
-/// Rejects header values that aren't valid UTF-8.
-fn header_str(headers: &HeaderMap, name: &'static str) -> Result<Option<String>, AppError> {
-    match headers.get(name) {
-        None => Ok(None),
-        Some(value) => {
-            let s = value
-                .to_str()
-                .map_err(|e| AppError::InvalidHeader(name, format!("{e}")))?;
-            Ok(Some(s.trim().to_string()))
         }
     }
 }

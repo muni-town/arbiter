@@ -10,10 +10,8 @@ pub enum AppError {
     ArbiterNotFound(String),
     #[error("arbiter not ready (policies not loaded): {0}")]
     ArbiterNotReady(String),
-    #[error("missing required header: {0}")]
-    MissingHeader(&'static str),
-    #[error("invalid header {0}: {1}")]
-    InvalidHeader(&'static str, String),
+    #[error("bad request: {0}")]
+    BadRequest(String),
     #[error("no #atproto_pds service for {0}")]
     MissingPdsEndpoint(String),
     #[error("unauthorized: {0}")]
@@ -27,9 +25,7 @@ impl IntoResponse for AppError {
         let status = match &self {
             AppError::ArbiterNotFound(_) => StatusCode::NOT_FOUND,
             AppError::ArbiterNotReady(_) => StatusCode::SERVICE_UNAVAILABLE,
-            AppError::MissingHeader(_)
-            | AppError::InvalidHeader(_, _)
-            | AppError::MissingPdsEndpoint(_) => StatusCode::BAD_REQUEST,
+            AppError::BadRequest(_) | AppError::MissingPdsEndpoint(_) => StatusCode::BAD_REQUEST,
             AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             AppError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };

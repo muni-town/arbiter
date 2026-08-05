@@ -433,35 +433,36 @@ async fn auth_setup() -> AuthEnv {
     }
 }
 
-/// Send `GET /xrpc/com.example.foo` to the running server, optionally with a
-/// Bearer JWT and the `arbiter-did`/`arbiter-proxy` headers.
+/// Send a proxied request to `POST /xrpc/town.muni.arbiter.proxy`, optionally
+/// with a Bearer JWT. The body names the arbiter DID, target, and inner
+/// request (nsid = `com.example.foo`).
 async fn xrpc_get(
     env: &AuthEnv,
     jwt: Option<String>,
     arbiter_did: Option<&str>,
 ) -> reqwest::Response {
-    let url = format!("http://{}/xrpc/com.example.foo", env.addr);
+    let url = format!("http://{}/xrpc/town.muni.arbiter.proxy", env.addr);
     let client = reqwest::Client::new();
-    let mut req = client.get(&url);
+    let mut req = client.post(&url);
     if let Some(j) = jwt {
         req = req.bearer_auth(j);
     }
+    let mut body = json!({ "method": "GET", "nsid": "com.example.foo" });
     if let Some(d) = arbiter_did {
-        req = req
-            .header("arbiter-did", d)
-            .header("arbiter-proxy", format!("{d}#atproto_pds"));
+        body["arbiterDid"] = Value::String(d.to_string());
+        body["target"] = Value::String(format!("{d}#atproto_pds"));
     }
-    req.send().await.expect("request sent")
+    req.json(&body).send().await.expect("request sent")
 }
 
-/// A valid serviceAuth JWT bound to `com.example.foo` for the given env.
+/// A valid serviceAuth JWT bound to the proxy NSID for the given env.
 fn valid_jwt(env: &AuthEnv) -> String {
     mint_service_auth(
         &env.pds_priv,
         &env.pds_did,
         SERVER_DID,
         &env.caller_did,
-        "com.example.foo",
+        "town.muni.arbiter.proxy",
         now_secs() + 60,
     )
 }
@@ -554,7 +555,7 @@ async fn auth_invalid_signature() {
         &env.pds_did,
         SERVER_DID,
         &env.caller_did,
-        "com.example.foo",
+        "town.muni.arbiter.proxy",
         now_secs() + 60,
     );
     let resp = xrpc_get(&env, Some(jwt), Some(env.steward_did.as_str())).await;
@@ -573,7 +574,7 @@ async fn auth_expired_token() {
         &env.pds_did,
         SERVER_DID,
         &env.caller_did,
-        "com.example.foo",
+        "town.muni.arbiter.proxy",
         now_secs().saturating_sub(10),
     );
     let resp = xrpc_get(&env, Some(jwt), Some(env.steward_did.as_str())).await;
@@ -587,13 +588,14 @@ async fn auth_expired_token() {
 #[tokio::test]
 async fn auth_wrong_lxm() {
     let env = auth_setup().await;
-    // Valid signature/aud/exp, but the bound lxm differs from the request path.
+    // Valid signature/aud/exp, but the bound lxm differs from the requested
+    // (proxy) NSID.
     let jwt = mint_service_auth(
         &env.pds_priv,
         &env.pds_did,
         SERVER_DID,
         &env.caller_did,
-        "com.example.bar",
+        "town.muni.arbiter.somethingElse",
         now_secs() + 60,
     );
     let resp = xrpc_get(&env, Some(jwt), Some(env.steward_did.as_str())).await;
@@ -613,7 +615,7 @@ async fn auth_wrong_aud() {
         &env.pds_did,
         "did:web:other.example",
         &env.caller_did,
-        "com.example.foo",
+        "town.muni.arbiter.proxy",
         now_secs() + 60,
     );
     let resp = xrpc_get(&env, Some(jwt), Some(env.steward_did.as_str())).await;
@@ -639,12 +641,12 @@ async fn auth_missing_header() {
 #[tokio::test]
 async fn auth_missing_arbiter_did() {
     let env = auth_setup().await;
-    // Valid JWT, but no arbiter-did header → MissingHeader → 400.
+    // Valid JWT, but the proxy body omits `arbiterDid` → 400.
     let resp = xrpc_get(&env, Some(valid_jwt(&env)), None).await;
     assert_eq!(
         resp.status(),
         StatusCode::BAD_REQUEST,
-        "missing arbiter-did must be a 400"
+        "missing arbiterDid must be a 400"
     );
 }
 

@@ -1,0 +1,57 @@
+{
+  "lexicon": 1,
+  "id": "town.muni.arbiter.proxy",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Proxied XRPC request through an arbiter's policy.\n\nThe caller authenticates via serviceAuth (aud = arbiter-server DID,\nlxm = town.muni.arbiter.proxy). The body specifies the arbiter DID to act\non behalf of, the target DID#service to reach, and the inner XRPC\nrequest (method, nsid, parameters, body) to evaluate. The server drives\nthe arbiter's Rego policy and proxies the inner request to the target\nauthenticated as the stewarded account.\n\nThe `nsid` here is the *inner* request NSID, distinct from this\nprocedure's own NSID.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "arbiterDid": {
+              "type": "string",
+              "format": "did",
+              "description": "The stewarded account's DID to act on behalf of."
+            },
+            "target": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "The destination DID#service for the proxied request (e.g. did:plc:xyz#atproto_pds)."
+            },
+            "method": {
+              "type": "string",
+              "description": "HTTP method for the inner XRPC request (GET, POST, etc)."
+            },
+            "nsid": {
+              "type": "string",
+              "description": "The inner XRPC request NSID."
+            },
+            "parameters": {
+              "type": "object",
+              "description": "Optional query parameters for the inner request."
+            },
+            "body": {
+              "type": "object",
+              "description": "Optional JSON body for the inner request."
+            }
+          },
+          "required": ["arbiterDid", "target", "method", "nsid"]
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object"
+        }
+      },
+      "errors": [
+        {
+          "name": "ErrPermissionDenied",
+          "description": "The requesting user is not allowed to proxy through this arbiter."
+        }
+      ]
+    }
+  }
+}

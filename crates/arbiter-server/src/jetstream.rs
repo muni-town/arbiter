@@ -190,6 +190,10 @@ impl EventHandler for ReloadHandler {
         // Re-fetch the current PDS state and reapply the lifecycle + policies.
         // This never applies the event payload directly, so reordered/duplicate
         // events cannot regress policy.
+        // 
+        // TODO: maybe we should try to surgically update instead of refreshing the
+        // whole policy by re-loading all the records in the future, but we need to
+        // analyze carefully for correctness before doing that.
         match load_and_onboard(&self.state, did).await {
             Ok(pds) => {
                 self.state
