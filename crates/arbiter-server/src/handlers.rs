@@ -386,13 +386,17 @@ fn random_secret(len: usize) -> String {
     encoded.chars().take(len).collect()
 }
 
-/// A random-ish valid handle using the configured suffix
-/// (`arbiter-<pid>-<nanos><suffix>`).
+/// A random valid handle using the configured suffix (`<base32><suffix>`).
+///
+/// The local label is a cryptographically random value (CSPRNG) base32-encoded
+/// (RFC 4648, no padding). Base32 uses only `[A-Z2-7]`, a strict subset of the
+/// characters permitted in a handle label, and is more compact than hex for
+/// the same entropy (13 chars vs 16 for 8 bytes). The trailing suffix supplies
+/// the TLD, which must start with a letter.
 fn random_handle() -> Result<Handle, &'static str> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    Handle::new(format!("arbiter-{pid:x}-{nanos:x}{}", CONFIG.handle_suffix))
+    use data_encoding::BASE32_NOPAD;
+    let mut bytes = [0u8; 8];
+    rand::rng().fill_bytes(&mut bytes);
+    let encoded = BASE32_NOPAD.encode(&bytes);
+    Handle::new(format!("{encoded}{}", CONFIG.handle_suffix))
 }
