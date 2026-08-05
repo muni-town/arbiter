@@ -45,6 +45,8 @@ const NSID_CREATE_ARBITER: &str = "town.muni.arbiter.createArbiter";
 const NSID_CREATE_APP_PASSWORD_ARBITER: &str = "town.muni.arbiter.createAppPasswordArbiter";
 /// Built-in NSID: proxy an arbitrary XRPC request through an arbiter's policy.
 const NSID_PROXY: &str = "town.muni.arbiter.proxy";
+/// Built-in NSID: reset a stewarded arbiter's root policy (recovery admin only).
+const NSID_RESET_POLICY: &str = "town.muni.arbiter.resetPolicy";
 
 /// A typed agent over an authenticated `CredentialSession` against a PDS.
 type SessionAgent = Agent<CredentialSession<MemorySessionStore, ReqwestClient>>;
@@ -76,6 +78,7 @@ async fn xrpc_handler(
             create_app_password_arbiter(&state, &caller, &body).await
         }
         NSID_PROXY => proxy_request(&state, &caller, &body).await,
+        NSID_RESET_POLICY => reset_policy(&state, &caller, &body).await,
         other => Err(AppError::BadRequest(format!("unknown nsid `{other}`"))),
     }
 }
@@ -160,6 +163,63 @@ async fn proxy_request(state: &AppState, caller: &str, body: &Bytes) -> Result<R
     };
 
     Ok(xrpc_result_to_response(result))
+}
+
+/// The `town.muni.arbiter.resetPolicy` request body.
+#[derive(serde::Deserialize)]
+struct ResetPolicyBody {
+    #[serde(rename = "arbiterDid")]
+    arbiter_did: String,
+    /// Replacement Rego source for the root policy.
+    policy: String,
+}
+
+/// Handle `town.muni.arbiter.resetPolicy`: authorize the caller as the
+/// designated recovery admin, write the replacement root policy record to the
+/// steward's PDS, and re-onboard the arbiter so the new policy takes effect.
+async fn reset_policy(state: &AppState, caller: &str, body: &Bytes) -> Result<Response, AppError> {
+    let body: ResetPolicyBody = serde_json::from_slice(body)
+        .map_err(|e| AppError::BadRequest(format!("invalid resetPolicy body: {e}")))?;
+
+    // Only the designated recovery admin may reset the policy.
+    let admin = policy::recovery_admin(state, &body.arbiter_did)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::Forbidden("no recovery admin is set".to_string()))?;
+    if caller != admin {
+        return Err(AppError::Forbidden(format!(
+            "caller `{caller}` is not the designated recovery admin `{admin}`"
+        )));
+    }
+
+    // Validate the replacement policy before writing it.
+    policy::compile_root(&body.policy).map_err(|e| {
+        AppError::BadRequest(format!("replacement policy failed to compile: {e:#}"))
+    })?;
+
+    // Resolve the steward's PDS + credentials, then overwrite the root policy
+    // record (upsert via putRecord).
+    let pds_endpoint = state.resolver.resolve_pds_endpoint(&body.arbiter_did).await?;
+    let creds = state
+        .store
+        .get(&body.arbiter_did)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| {
+            AppError::Other(anyhow::anyhow!(
+                "no stored credentials for arbiter {}",
+                body.arbiter_did
+            ))
+        })?;
+    let writer = login_session(&body.arbiter_did, &creds.password, &pds_endpoint).await?;
+    put_root_policy(&writer, &body.arbiter_did, &body.policy).await?;
+
+    // Re-onboard so the new policy is active.
+    policy::load_and_onboard(state, &body.arbiter_did)
+        .await
+        .map_err(AppError::from)?;
+
+    Ok(ok_response())
 }
 
 /// Map a final `XrpcResult` to an axum `Response`.
@@ -360,6 +420,46 @@ async fn write_record(
         .create_record(input)
         .await
         .map_err(|e| AppError::Other(anyhow::anyhow!("createRecord {collection}/{rkey}: {e}")))?;
+    Ok(())
+}
+
+/// Overwrite the `town.muni.arbiter.policy.root/self` record with `policy`
+/// (the Rego source), authenticated as the steward.
+async fn put_root_policy(
+    agent: &SessionAgent,
+    repo: &str,
+    policy: &str,
+) -> Result<(), AppError> {
+    let record = serde_json::json!({
+        "$type": policy::ROOT_COLLECTION,
+        "policy": policy,
+    })
+    .try_into_unknown()
+    .map_err(|e| AppError::Other(anyhow::anyhow!("build root policy record: {e}")))?;
+    let input = atrium_api::com::atproto::repo::put_record::InputData {
+        collection: policy::ROOT_COLLECTION
+            .parse::<Nsid>()
+            .map_err(|e| AppError::Other(anyhow::anyhow!("invalid nsid: {e}")))?,
+        record,
+        repo: repo
+            .parse::<AtIdentifier>()
+            .map_err(|e| AppError::Other(anyhow::anyhow!("invalid repo `{repo}`: {e}")))?,
+        rkey: policy::ROOT_RKEY
+            .parse::<RecordKey>()
+            .map_err(|e| AppError::Other(anyhow::anyhow!("invalid rkey: {e}")))?,
+        swap_commit: None,
+        swap_record: None,
+        validate: None,
+    }
+    .into();
+    agent
+        .api
+        .com
+        .atproto
+        .repo
+        .put_record(input)
+        .await
+        .map_err(|e| AppError::Other(anyhow::anyhow!("putRecord root policy: {e}")))?;
     Ok(())
 }
 

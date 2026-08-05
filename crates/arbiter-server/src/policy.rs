@@ -35,8 +35,11 @@ use regorus::Value;
 const SERVICE_COLLECTION: &str = "town.muni.arbiter.service";
 const SERVICE_RKEY: &str = "self";
 /// Root policy record collection + rkey (`town.muni.arbiter.policy.root/self`).
-const ROOT_COLLECTION: &str = "town.muni.arbiter.policy.root";
-const ROOT_RKEY: &str = "self";
+pub const ROOT_COLLECTION: &str = "town.muni.arbiter.policy.root";
+pub const ROOT_RKEY: &str = "self";
+/// Recovery-admin designation record (`town.muni.arbiter.recovery/self`).
+pub const RECOVERY_COLLECTION: &str = "town.muni.arbiter.recovery";
+pub const RECOVERY_RKEY: &str = "self";
 /// Sub-policy record collection (`town.muni.arbiter.policy.sub/<name>`).
 const SUB_COLLECTION: &str = "town.muni.arbiter.policy.sub";
 
@@ -99,15 +102,7 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
 
     // Unauthenticated client for public record reads. A bounded timeout keeps a
     // hung PDS from stalling onboarding.
-    let client = ReqwestClientBuilder::new(&pds_endpoint)
-        .client(
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .context("building HTTP client")?,
-        )
-        .build();
-    let api = AtpServiceClient::new(client);
+    let api = pds_read_client(&pds_endpoint)?;
 
     let repo = parse_at_identifier(did)?;
 
@@ -161,7 +156,7 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
         })?;
     let root_src = rego_source(&root_rec)
         .with_context(|| format!("extracting root policy source for {did}"))?;
-    let root = PolicyVm::new(&root_src, Value::new_object(), ENTRYPOINT, HOST_FNS)
+    let root = compile_root(&root_src)
         .with_context(|| format!("compiling root policy for {did}"))?;
 
     // --- sub-policies ------------------------------------------------------
@@ -198,6 +193,45 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
 fn parse_at_identifier(repo: &str) -> Result<AtIdentifier> {
     repo.parse::<AtIdentifier>()
         .map_err(|e| anyhow!("invalid repo identifier `{repo}`: {e}"))
+}
+
+/// Build an unauthenticated atrium client for public PDS record reads. A bounded
+/// timeout keeps a hung PDS from stalling the caller.
+fn pds_read_client(pds_endpoint: &str) -> Result<AtpServiceClient<atrium_xrpc_client::reqwest::ReqwestClient>> {
+    let client = ReqwestClientBuilder::new(pds_endpoint)
+        .client(
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .context("building HTTP client")?,
+        )
+        .build();
+    Ok(AtpServiceClient::new(client))
+}
+
+/// Fetch the designated recovery admin DID from `town.muni.arbiter.recovery/self`
+/// on `did`'s PDS, if the record exists and carries a `did` field.
+///
+/// Returns `Ok(None)` when no recovery admin has been designated.
+pub async fn recovery_admin(state: &AppState, did: &str) -> Result<Option<String>> {
+    let pds_endpoint = state
+        .resolver
+        .resolve_pds_endpoint(did)
+        .await
+        .map_err(|e| anyhow::anyhow!("resolving PDS endpoint for {did}: {e:#}"))?;
+    let api = pds_read_client(&pds_endpoint)?;
+    let repo = parse_at_identifier(did)?;
+    let rec = fetch_record(&api, &repo, RECOVERY_COLLECTION, RECOVERY_RKEY)
+        .await
+        .with_context(|| format!("fetching {RECOVERY_COLLECTION}/{RECOVERY_RKEY}"))?;
+    Ok(rec.and_then(|r| r.field("did")))
+}
+
+/// Compile a root policy from Rego `source`, returning a freshly compiled
+/// [`PolicyVm`] (a fresh execution context). Used both by onboarding and by
+/// `resetPolicy` to validate + install a replacement root policy.
+pub fn compile_root(source: &str) -> Result<PolicyVm> {
+    PolicyVm::new(source, Value::new_object(), ENTRYPOINT, HOST_FNS)
 }
 
 /// Fetch a single record via `com.atproto.repo.getRecord`.

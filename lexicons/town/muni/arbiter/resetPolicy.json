@@ -1,0 +1,48 @@
+{
+  "lexicon": 1,
+  "id": "town.muni.arbiter.resetPolicy",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Reset a stewarded arbiter's root policy.\n\nThe caller authenticates via serviceAuth (aud = arbiter-server DID,\nlxm = town.muni.arbiter.resetPolicy). Only the account designated in the\narbiter's `town.muni.arbiter.recovery/self` record (the recovery admin)\nmay reset the policy. The replacement Rego source is written to\n`town.muni.arbiter.policy.root/self` and the arbiter is re-onboarded.\n\nIf no recovery admin is set, this endpoint is unavailable (forbidden).",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "arbiterDid": {
+              "type": "string",
+              "format": "did",
+              "description": "The stewarded account whose root policy to reset."
+            },
+            "policy": {
+              "type": "string",
+              "description": "The replacement Rego source text for the root policy."
+            }
+          },
+          "required": ["arbiterDid", "policy"]
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "ok": { "type": "boolean" }
+          },
+          "required": ["ok"]
+        }
+      },
+      "errors": [
+        {
+          "name": "ErrPermissionDenied",
+          "description": "The caller is not the designated recovery admin, or no recovery admin is set."
+        },
+        {
+          "name": "ErrInvalidPolicy",
+          "description": "The replacement policy failed to compile."
+        }
+      ]
+    }
+  }
+}

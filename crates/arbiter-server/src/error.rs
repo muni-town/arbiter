@@ -16,6 +16,8 @@ pub enum AppError {
     MissingPdsEndpoint(String),
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -27,6 +29,7 @@ impl IntoResponse for AppError {
             AppError::ArbiterNotReady(_) => StatusCode::SERVICE_UNAVAILABLE,
             AppError::BadRequest(_) | AppError::MissingPdsEndpoint(_) => StatusCode::BAD_REQUEST,
             AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            AppError::Forbidden(_) => StatusCode::FORBIDDEN,
             AppError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = json!({

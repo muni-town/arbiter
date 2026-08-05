@@ -227,7 +227,14 @@ async fn list_records_handler(
 }
 
 async fn create_session_handler() -> Response {
-    Json(json!({ "accessJwt": "fake-jwt", "did": "mock-pds" })).into_response()
+    // `did`/`handle` must be syntactically valid for atrium's session parsing.
+    Json(json!({
+        "accessJwt": "fake-jwt",
+        "did": "did:plc:mockpds",
+        "handle": "mock.pds.example",
+        "refreshJwt": "fake-refresh",
+    }))
+    .into_response()
 }
 
 async fn create_account_handler() -> Response {
@@ -238,6 +245,36 @@ async fn create_account_handler() -> Response {
         "refreshJwt": "fake-refresh",
     }))
     .into_response()
+}
+
+/// Handle `com.atproto.repo.putRecord`: upsert the record into the shared map.
+async fn put_record_handler(
+    State(st): State<PdsState>,
+    Json(body): Json<Value>,
+) -> Response {
+    let repo = body.get("repo").and_then(|v| v.as_str()).unwrap_or_default();
+    let collection = body
+        .get("collection")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let rkey = body.get("rkey").and_then(|v| v.as_str()).unwrap_or_default();
+    let record = body.get("record").cloned();
+    match record {
+        Some(v) => {
+            let mut map = st.records.lock().await;
+            map.insert(
+                (repo.to_string(), collection.to_string(), rkey.to_string()),
+                v,
+            );
+            let uri = format!("at://{repo}/{collection}/{rkey}");
+            (
+                StatusCode::OK,
+                Json(json!({ "uri": uri, "cid": "bafkreibme22gw2h7y2h7tg2fhqotaqjucnbc24deqo72b6mkl2egezxhvy" })),
+            )
+                .into_response()
+        }
+        None => (StatusCode::BAD_REQUEST, Json(json!({ "error": "InvalidRequest" }))).into_response(),
+    }
 }
 
 /// Start a mock PDS on a random port backed by the shared record map. The
@@ -260,6 +297,10 @@ async fn start_mock_pds(records: RecordMap) -> SocketAddr {
         .route(
             "/xrpc/com.atproto.server.createAccount",
             axum::routing::post(create_account_handler),
+        )
+        .route(
+            "/xrpc/com.atproto.repo.putRecord",
+            axum::routing::post(put_record_handler),
         )
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -787,5 +828,154 @@ async fn auto_delete_service_repointed() {
     assert!(
         creds.is_none(),
         "credentials must be purged when the service record is repointed at another server"
+    );
+}
+
+// ─── 6. resetPolicy (recovery admin) ────────────────────────────────────────
+
+/// Stand up a server where `recovery` designates `admin_did` as the steward's
+/// recovery admin, and return the router address + a signing PDS keypair for
+/// minting caller JWTs.
+async fn reset_setup() -> (SocketAddr, KeyData, String, String, String, RecordMap) {
+    let steward_did = unique_did("steward");
+    let admin_did = unique_did("admin");
+    let records = Arc::new(Mutex::new(HashMap::new()));
+
+    populate_standard_records(&records, &steward_did, ECHO_POLICY).await;
+    {
+        let mut m = records.lock().await;
+        m.insert(
+            (
+                steward_did.clone(),
+                "town.muni.arbiter.recovery".to_string(),
+                "self".to_string(),
+            ),
+            json!({ "did": admin_did }),
+        );
+    }
+
+    let pds_addr = start_mock_pds(records.clone()).await;
+    let pds_url = format!("http://{pds_addr}");
+
+    // A PDS DID carrying a signing key, so caller JWTs verify.
+    let (pds_priv, pds_pub) = pds_keypair();
+    let multibase = pds_pub
+        .to_string()
+        .strip_prefix("did:key:")
+        .expect("pub key is did:key: prefixed")
+        .to_string();
+    let pds_did = unique_did("pds");
+
+    let mut docs = HashMap::new();
+    docs.insert(
+        pds_did.clone(),
+        did_doc(&pds_did, &pds_url, Some(&multibase)),
+    );
+    docs.insert(steward_did.clone(), did_doc(&steward_did, &pds_url, None));
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(MockResolver { docs });
+    let state = make_state(resolver);
+    state
+        .store
+        .store(
+            steward_did.clone(),
+            PdsCredentials {
+                password: "steward-pw".to_string(),
+            },
+        )
+        .await
+        .expect("store creds");
+    policy::load_and_onboard(&state, &steward_did)
+        .await
+        .expect("onboard");
+
+    let app = handlers::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind router");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (addr, pds_priv, pds_did, steward_did, admin_did, records)
+}
+
+/// Mint a caller JWT bound to `resetPolicy` with the given `sub`.
+fn reset_jwt(pds_priv: &KeyData, pds_did: &str, sub: &str) -> String {
+    mint_service_auth(
+        pds_priv,
+        pds_did,
+        SERVER_DID,
+        sub,
+        "town.muni.arbiter.resetPolicy",
+        now_secs() + 60,
+    )
+}
+
+#[tokio::test]
+async fn reset_policy_as_recovery_admin() {
+    let (addr, pds_priv, pds_did, steward_did, admin_did, records) = reset_setup().await;
+    let jwt = reset_jwt(&pds_priv, &pds_did, &admin_did);
+
+    let url = format!("http://{addr}/xrpc/town.muni.arbiter.resetPolicy");
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "arbiterDid": steward_did,
+            "policy": "package arbiter\nresult := { \"ok\": true, \"output\": { \"got\": \"reset\" } }",
+        }))
+        .send()
+        .await
+        .expect("send resetPolicy");
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "recovery admin must be able to reset the policy"
+    );
+
+    // The root policy record must have been overwritten in the PDS.
+    let root = records
+        .lock()
+        .await
+        .get(&(
+            steward_did.clone(),
+            ROOT_COLLECTION.to_string(),
+            ROOT_RKEY.to_string(),
+        ))
+        .cloned()
+        .expect("root policy record present after reset");
+    assert_eq!(
+        root.get("policy").and_then(|v| v.as_str()),
+        Some("package arbiter\nresult := { \"ok\": true, \"output\": { \"got\": \"reset\" } }"),
+        "root policy must be the reset source"
+    );
+}
+
+#[tokio::test]
+async fn reset_policy_forbidden_for_non_admin() {
+    let (addr, pds_priv, pds_did, steward_did, _admin_did, _records) = reset_setup().await;
+    let intruder_did = unique_did("intruder");
+    let jwt = reset_jwt(&pds_priv, &pds_did, &intruder_did);
+
+    let url = format!("http://{addr}/xrpc/town.muni.arbiter.resetPolicy");
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "arbiterDid": steward_did,
+            "policy": "package arbiter\nresult := { \"ok\": true }",
+        }))
+        .send()
+        .await
+        .expect("send resetPolicy");
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "non-admin caller must be forbidden"
     );
 }
