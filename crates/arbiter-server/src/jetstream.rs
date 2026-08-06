@@ -1,12 +1,19 @@
 //! Jetstream subscription for policy/service-record hot reload + auto-delete.
 //!
-//! Subscribes to ATProto Jetstream using the `atproto-jetstream` consumer
-//! library (typed events, WebSocket + parsing handled by the library). The
-//! subscription is *not* DID-filtered server-side — it watches every repo — and
-//! each event is accepted or dropped by whether the server currently stewards
-//! the affected account. This way an arbiter created *after* the subscription
-//! is live still receives policy hot-reload and auto-delete without waiting for
-//! a reconnect. Only the record collections this server cares about are watched:
+//! Subscribes to ATProto Jetstream over a **WebSocket driven by `reqwest`**
+//! (via `reqwest-websocket`), parsing each message with `atproto-jetstream`'s
+//! `JetstreamEvent` type. Using reqwest for the transport means the connection
+//! honors the `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` environment variables and
+//! any custom TLS roots configured on the reqwest client — unlike
+//! `atproto-jetstream`'s bundled `tokio-websockets` client, which opens a bare
+//! `TcpStream` and cannot go through a proxy or use a custom certificate.
+//!
+//! The subscription is *not* DID-filtered server-side — it watches every repo —
+//! and each event is accepted or dropped by whether the server currently
+//! stewards the affected account. This way an arbiter created *after* the
+//! subscription is live still receives policy hot-reload and auto-delete
+//! without waiting for a reconnect. Only the record collections this server
+//! cares about are watched:
 //!
 //! - `town.muni.arbiter.service` (the `self` service record) — arbiter
 //!   lifecycle (absent or repointed -> offboard).
@@ -21,17 +28,18 @@
 //! reads the latest PDS state (never the event payload), a reordered or
 //! duplicate event can never regress policy.
 //!
-//! The library does **not** reconnect automatically — `subscribe` keeps the
-//! outer reconnect-with-backoff loop and drives the consumer on each attempt.
+//! `subscribe` owns reconnection (with bounded backoff) — a single connect is
+//! driven by [`run_subscription`].
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
-use atproto_jetstream::{
-    CancellationToken, Consumer, ConsumerTaskConfig, EventHandler, JetstreamEvent,
-};
+use atproto_jetstream::EventHandler;
+use atproto_jetstream::JetstreamEvent;
+use futures_util::{SinkExt, StreamExt};
+use reqwest_websocket::{Message, RequestBuilderExt};
 
 use crate::policy::{load_and_onboard, refresh_all_after_reconnect};
 use crate::{AppState, CONFIG};
@@ -53,9 +61,8 @@ const WATCHED_COLLECTIONS: &[&str] = &[
 /// current set of stewarded accounts, so accounts created while the stream is
 /// live are picked up immediately.
 ///
-/// Runs forever, reconnecting with bounded backoff on disconnect or error. The
-/// underlying `atproto-jetstream` consumer does not reconnect itself; this loop
-/// owns reconnection.
+/// Runs forever, reconnecting with bounded backoff on disconnect or error.
+/// Each connect is driven by [`run_subscription`]; this loop owns reconnection.
 pub async fn subscribe(state: Arc<AppState>) {
     let mut backoff = Duration::from_secs(2);
     loop {
@@ -90,73 +97,136 @@ pub async fn subscribe(state: Arc<AppState>) {
 
 /// Connect once and pump events until the stream closes or errors.
 ///
-/// The consumer is deliberately not DID-filtered: it subscribes to every repo,
-/// and `ReloadHandler` accepts only events for accounts the server currently
-/// stewards. An account created after this subscription is live therefore still
-/// gets hot-reload/auto-delete without a reconnect.
+/// The subscription is deliberately not DID-filtered: it subscribes to every
+/// repo, and [`ReloadHandler`] accepts only events for accounts the server
+/// currently stewards. An account created after this subscription is live
+/// therefore still gets hot-reload/auto-delete without a reconnect.
 ///
-/// A watchdog cancels the consumer if no message arrives within
-/// [`JETSTREAM_STALL_TIMEOUT`]. The underlying consumer loop has no read
-/// timeout of its own and only exits on WS close or cancellation, so a
-/// half-open connection would otherwise stall the subscription indefinitely,
-/// silently disabling hot-reload/auto-delete. Cancelling forces a reconnect,
-/// which re-runs [`crate::policy::refresh_all_after_reconnect`] to re-fetch
-/// current PDS state.
+/// The transport is a WebSocket driven by `reqwest` (via `reqwest-websocket`),
+/// so it honors `HTTP(S)_PROXY` and any custom TLS roots on the reqwest client.
+/// Each text frame is parsed into an [`atproto_jetstream::JetstreamEvent`] and
+/// dispatched to [`ReloadHandler`].
+///
+/// A watchdog cancels the connection if no message arrives within
+/// [`JETSTREAM_STALL_TIMEOUT`]. reqwest-websocket has no read timeout of its
+/// own, so a half-open connection would otherwise stall the subscription
+/// indefinitely, silently disabling hot-reload/auto-delete. Cancelling forces
+/// a reconnect, which re-runs [`crate::policy::refresh_all_after_reconnect`] to
+/// re-fetch current PDS state.
 async fn run_subscription(state: &Arc<AppState>) -> anyhow::Result<()> {
-    let config = ConsumerTaskConfig {
-        user_agent: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
-        // TODO(compression): consider enabling Zstandard compression to save on
-        // bandwidth. Requires vendoring the Jetstream zstd dictionary file and
-        // wiring a config path to it (the library hard-reads
-        // `zstd_dictionary_location` at connect time, so a missing/mismatched
-        // dictionary fails the whole subscription). Deferred for simplicity.
-        compression: false,
-        zstd_dictionary_location: String::new(),
-        jetstream_hostname: CONFIG.jetstream_host.clone(),
-        collections: WATCHED_COLLECTIONS.iter().map(|s| s.to_string()).collect(),
-        // Subscribe to all DIDs; each event is filtered per-event by whether the
-        // server stewards the affected account (see `ReloadHandler`).
-        dids: Vec::new(),
-        max_message_size_bytes: None,
-        cursor: None,
-        require_hello: false,
-    };
+    // Build a reqwest client with the system-native trust roots. reqwest reads
+    // HTTP_PROXY/HTTPS_PROXY/ALL_PROXY from the environment by default, so the
+    // WebSocket (like the rest of the server's reqwest traffic) goes through a
+    // configured proxy and trusts a custom system CA.
+    //
+    // Force HTTP/1.1: reqwest-websocket only supports HTTP/1.1 WebSocket
+    // upgrades and fails ("websocket upgrade failed") if the connection
+    // negotiates HTTP/2.
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
+        .build()
+        .context("building jetstream reqwest client")?;
 
-    let consumer = Consumer::new(config);
-    let handler = Arc::new(ReloadHandler {
-        state: Arc::clone(state),
-    });
-    consumer
-        .register_handler(handler)
+    let url = jetstream_subscribe_url();
+    let mut ws = client
+        .get(url)
+        .upgrade()
+        .send()
         .await
-        .context("registering jetstream handler")?;
+        .map_err(|e| anyhow!("jetstream websocket upgrade failed: {e}"))?
+        .into_websocket()
+        .await
+        .map_err(|e| anyhow!("jetstream websocket handshake failed: {e}"))?;
 
-    let cancel = CancellationToken::new();
-    // Clone for the consumer task; the original is held for the watchdog.
-    let consumer_cancel = cancel.clone();
-    let handle = tokio::spawn(async move { consumer.run_background(consumer_cancel).await });
+    tracing::info!(host = %CONFIG.jetstream_host, "jetstream websocket connected");
 
-    // Watchdog: if the consumer makes no progress for `JETSTREAM_STALL_TIMEOUT`,
-    // cancel it to force a reconnect. A false positive is safe — the reconnect
-    // path re-fetches current PDS state for every steward.
-    let watchdog = tokio::spawn(async move {
-        tokio::time::sleep(JETSTREAM_STALL_TIMEOUT).await;
-        tracing::warn!("jetstream subscription stalled; cancelling to force reconnect");
-        cancel.cancel();
-    });
+    // Send the Jetstream "options_update" message so the server applies our
+    // wanted collections (mirrors what atproto-jetstream sends on connect).
+    ws.send(jetstream_update_message()).await
+        .map_err(|e| anyhow!("jetstream update message send failed: {e}"))?;
 
-    let outcome = match handle.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e),
-        Err(e) => Err(anyhow!("jetstream consumer task panicked: {e}")),
+    let handler = ReloadHandler {
+        state: Arc::clone(state),
     };
-    watchdog.abort();
-    outcome
+
+    // Pump frames. The WebSocket is a `Stream<Item = Result<Message, Error>>`.
+    // Each `next()` is wrapped in `JETSTREAM_STALL_TIMEOUT` so a half-open
+    // connection (which yields no frame) cannot stall the subscription
+    // indefinitely; the timeout breaks the loop and forces a reconnect.
+    loop {
+        let next = tokio::time::timeout(JETSTREAM_STALL_TIMEOUT, ws.next()).await;
+        match next {
+            Err(_) => {
+                tracing::warn!("jetstream connection stalled; reconnecting");
+                break;
+            }
+            Ok(None) => {
+                tracing::warn!("jetstream connection closed");
+                break;
+            }
+            Ok(Some(Err(e))) => {
+                return Err(anyhow!("jetstream recv error: {e}"));
+            }
+            Ok(Some(Ok(Message::Text(text)))) => {
+                match serde_json::from_str::<JetstreamEvent>(&text) {
+                    Ok(event) => {
+                        if let Err(e) = handler.handle_event(Arc::new(event)).await {
+                            tracing::error!(error = %format!("{e:#}"), "jetstream handler error");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "skipping unparseable jetstream frame");
+                    }
+                }
+            }
+            Ok(Some(Ok(Message::Binary(_)))) => {
+                // Compression is disabled; Jetstream sends text frames only.
+                tracing::debug!("ignoring unexpected binary jetstream frame");
+            }
+            Ok(Some(Ok(_))) => {
+                // Ping/Pong/Close frames: ignore.
+            }
+        }
+    }
+    Ok(())
 }
 
-/// Maximum time the Jetstream consumer may go without receiving any message
-/// before it is cancelled and reconnected. Guards against a half-open
-/// connection stalling hot-reload/auto-delete indefinitely.
+/// The WebSocket subscribe URL for the configured Jetstream host.
+fn jetstream_subscribe_url() -> reqwest::Url {
+    let collections = WATCHED_COLLECTIONS
+        .iter()
+        .map(|c| format!("wantedCollections={c}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    reqwest::Url::parse(&format!(
+        "wss://{}/subscribe?compress=false&requireHello=false&{collections}",
+        CONFIG.jetstream_host
+    ))
+    .expect("valid jetstream subscribe URL")
+}
+
+/// The JSON `options_update` message Jetstream expects once connected.
+fn jetstream_update_message() -> Message {
+    let wanted = WATCHED_COLLECTIONS
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    Message::Text(
+        serde_json::json!({
+            "type": "options_update",
+            "payload": {
+                "wantedCollections": wanted,
+                "wantedDids": [],
+                "maxMessageSizeBytes": 56_000,
+            },
+        })
+        .to_string(),
+    )
+}
+
+/// Maximum time the Jetstream subscription may go without receiving any message
+/// before it is reconnected. Guards against a half-open connection stalling
+/// hot-reload/auto-delete indefinitely.
 const JETSTREAM_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Handler that reloads arbiters on watched policy/service-record events.

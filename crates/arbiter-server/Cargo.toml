@@ -41,5 +41,10 @@ base64 = "0.22"
 # base32 encoding for steward handle local labels (handlers.rs).
 data-encoding = "2"
 # --- Jetstream subscription (policy/service-record hot reload) ---
-# Typed ATProto Jetstream consumer (WebSocket + parsing handled by the library).
+# Typed ATProto Jetstream event parsing (we drive our own WebSocket transport).
 atproto-jetstream = "0.14.5"
+# WebSocket transport via reqwest (honors HTTP(S)_PROXY env vars + custom TLS
+# roots, unlike atproto-jetstream's bundled tokio-websockets client).
+reqwest-websocket = "0.4"
+# Stream/Sink combinators for the reqwest-websocket WebSocket.
+futures-util = "0.3"

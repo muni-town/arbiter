@@ -33,12 +33,16 @@
       // policy record is missing, so the policy must exist first.
       if (!setupClient.agent) {
         await setupClient.login(auth.did, setupState.appPassword);
+        console.log(`Logged in as ${auth.did}`);
       }
+      console.log('Preparing to write root policy');
       await setupClient.writeRootPolicy(defaultPolicyWithOwner(selectedAdmin.did));
+      console.log('Wrote root policy');
 
       // Import the existing account as a stewarded arbiter. The server reads
       // the root policy record we just wrote and brings the arbiter online.
       await arbiter.createAppPasswordArbiter(auth.did, setupState.appPassword);
+      console.log('Created app password arbiter');
 
       setupState.step = 'complete';
       setupState.error = undefined;

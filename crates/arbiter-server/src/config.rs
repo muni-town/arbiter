@@ -26,7 +26,7 @@ pub struct ServerConfig {
     #[arg(
         long = "jetstream-host",
         env = "JETSTREAM_HOST",
-        default_value = "jetstream.atproto.tools"
+        default_value = "jetstream1.us-east.bsky.network"
     )]
     pub jetstream_host: String,
 
