@@ -94,6 +94,14 @@ pub async fn subscribe(state: Arc<AppState>) {
 /// and `ReloadHandler` accepts only events for accounts the server currently
 /// stewards. An account created after this subscription is live therefore still
 /// gets hot-reload/auto-delete without a reconnect.
+///
+/// A watchdog cancels the consumer if no message arrives within
+/// [`JETSTREAM_STALL_TIMEOUT`]. The underlying consumer loop has no read
+/// timeout of its own and only exits on WS close or cancellation, so a
+/// half-open connection would otherwise stall the subscription indefinitely,
+/// silently disabling hot-reload/auto-delete. Cancelling forces a reconnect,
+/// which re-runs [`crate::policy::refresh_all_after_reconnect`] to re-fetch
+/// current PDS state.
 async fn run_subscription(state: &Arc<AppState>) -> anyhow::Result<()> {
     let config = ConsumerTaskConfig {
         user_agent: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
@@ -124,15 +132,32 @@ async fn run_subscription(state: &Arc<AppState>) -> anyhow::Result<()> {
         .context("registering jetstream handler")?;
 
     let cancel = CancellationToken::new();
-    let handle = tokio::spawn(async move { consumer.run_background(cancel).await });
-    // The consumer runs until the stream closes (returns Ok) or errors. Wait for
-    // the task to finish, then return to the reconnect loop (any Err -> backoff).
-    match handle.await {
+    // Clone for the consumer task; the original is held for the watchdog.
+    let consumer_cancel = cancel.clone();
+    let handle = tokio::spawn(async move { consumer.run_background(consumer_cancel).await });
+
+    // Watchdog: if the consumer makes no progress for `JETSTREAM_STALL_TIMEOUT`,
+    // cancel it to force a reconnect. A false positive is safe — the reconnect
+    // path re-fetches current PDS state for every steward.
+    let watchdog = tokio::spawn(async move {
+        tokio::time::sleep(JETSTREAM_STALL_TIMEOUT).await;
+        tracing::warn!("jetstream subscription stalled; cancelling to force reconnect");
+        cancel.cancel();
+    });
+
+    let outcome = match handle.await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e),
         Err(e) => Err(anyhow!("jetstream consumer task panicked: {e}")),
-    }
+    };
+    watchdog.abort();
+    outcome
 }
+
+/// Maximum time the Jetstream consumer may go without receiving any message
+/// before it is cancelled and reconnected. Guards against a half-open
+/// connection stalling hot-reload/auto-delete indefinitely.
+const JETSTREAM_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Handler that reloads arbiters on watched policy/service-record events.
 ///

@@ -19,15 +19,29 @@ use tokio::sync::OnceCell;
 use crate::credstore::{CredentialStore, PdsCredentials};
 
 /// Schema for the credentials table. `password` is stored in plaintext (see module docs).
-/// Only the password is persisted; the PDS endpoint is resolved from the DID doc.
+/// The PDS endpoint is resolved from the DID doc. `recovery_admin` is the caller
+/// that provisioned the account (used to repair a half-provisioned account).
+/// `provisioned` distinguishes a partially-provisioned account (bootstrap
+/// records not yet written) from a fully-provisioned one (whose service record
+/// disappearing later is a deliberate auto-delete, not to be repaired).
 const SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS arbiter_credentials (\n\
-    did       TEXT PRIMARY KEY NOT NULL,\n\
-    password  TEXT NOT NULL\n\
+    did              TEXT PRIMARY KEY NOT NULL,\n\
+    password         TEXT NOT NULL,\n\
+    recovery_admin   TEXT NOT NULL,\n\
+    provisioned      INTEGER NOT NULL DEFAULT 0\n\
 );";
 
 /// Upsert a credential row, keyed by DID.
-const UPSERT_SQL: &str = "INSERT INTO arbiter_credentials (did, password) VALUES (?, ?)\n\
-     ON CONFLICT(did) DO UPDATE SET password = excluded.password";
+const UPSERT_SQL: &str = "INSERT INTO arbiter_credentials (did, password, recovery_admin, provisioned)\n\
+     VALUES (?, ?, ?, ?)\n\
+     ON CONFLICT(did) DO UPDATE SET\n\
+       password = excluded.password,\n\
+       recovery_admin = excluded.recovery_admin,\n\
+       provisioned = excluded.provisioned";
+
+/// Mark an account as fully provisioned (bootstrap records written).
+const MARK_PROVISIONED_SQL: &str =
+    "UPDATE arbiter_credentials SET provisioned = 1 WHERE did = ?";
 
 /// Durable credential store backed by a local Turso database file.
 ///
@@ -82,9 +96,17 @@ impl TursoCredentialStore {
 impl CredentialStore for TursoCredentialStore {
     async fn store(&self, did: String, creds: PdsCredentials) -> Result<()> {
         let conn = self.conn().await?;
-        conn.execute(UPSERT_SQL, turso::params![did, creds.password])
-            .await
-            .context("failed to store credentials")?;
+        conn.execute(
+            UPSERT_SQL,
+            turso::params![
+                did,
+                creds.password,
+                creds.recovery_admin,
+                creds.provisioned as i64
+            ],
+        )
+        .await
+        .context("failed to store credentials")?;
         Ok(())
     }
 
@@ -92,7 +114,7 @@ impl CredentialStore for TursoCredentialStore {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
-                "SELECT password FROM arbiter_credentials WHERE did = ?",
+                "SELECT password, recovery_admin, provisioned FROM arbiter_credentials WHERE did = ?",
                 turso::params![did],
             )
             .await
@@ -100,10 +122,24 @@ impl CredentialStore for TursoCredentialStore {
         match rows.next().await? {
             Some(row) => {
                 let password: String = row.get(0)?;
-                Ok(Some(PdsCredentials { password }))
+                let recovery_admin: String = row.get(1)?;
+                let provisioned: i64 = row.get(2)?;
+                Ok(Some(PdsCredentials {
+                    password,
+                    recovery_admin,
+                    provisioned: provisioned != 0,
+                }))
             }
             None => Ok(None),
         }
+    }
+
+    async fn mark_provisioned(&self, did: &str) -> Result<()> {
+        let conn = self.conn().await?;
+        conn.execute(MARK_PROVISIONED_SQL, turso::params![did])
+            .await
+            .context("failed to mark provisioned")?;
+        Ok(())
     }
 
     async fn remove(&self, did: &str) -> Result<()> {
@@ -120,14 +156,26 @@ impl CredentialStore for TursoCredentialStore {
     async fn list(&self) -> Result<Vec<(String, PdsCredentials)>> {
         let conn = self.conn().await?;
         let mut rows = conn
-            .query("SELECT did, password FROM arbiter_credentials", ())
+            .query(
+                "SELECT did, password, recovery_admin, provisioned FROM arbiter_credentials",
+                (),
+            )
             .await
             .context("failed to list credentials")?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             let did: String = row.get(0)?;
             let password: String = row.get(1)?;
-            out.push((did, PdsCredentials { password }));
+            let recovery_admin: String = row.get(2)?;
+            let provisioned: i64 = row.get(3)?;
+            out.push((
+                did,
+                PdsCredentials {
+                    password,
+                    recovery_admin,
+                    provisioned: provisioned != 0,
+                },
+            ));
         }
         Ok(out)
     }

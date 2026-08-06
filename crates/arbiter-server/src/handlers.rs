@@ -21,7 +21,7 @@ use atrium_api::com::atproto::server::create_account;
 use atrium_api::types::TryIntoUnknown;
 use atrium_api::types::string::{AtIdentifier, Handle, Nsid, RecordKey};
 use atrium_xrpc::InputDataOrBytes;
-use atrium_xrpc_client::reqwest::ReqwestClient;
+use atrium_xrpc_client::reqwest::{ReqwestClient, ReqwestClientBuilder};
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -129,9 +129,36 @@ struct ProxyBody {
 /// compromised policy can cause per request.
 const MAX_REMOTE_XRPC_CALLS: usize = 12;
 
+/// Semaphore bounding concurrently-executing `proxy` requests (see
+/// [`ServerConfig::max_concurrent_proxies`]). Initialized lazily on first
+/// proxy request.
+static PROXY_SEMAPHORE: LazyLock<Option<Arc<tokio::sync::Semaphore>>> = LazyLock::new(|| {
+    if CONFIG.max_concurrent_proxies > 0 {
+        Some(Arc::new(tokio::sync::Semaphore::new(CONFIG.max_concurrent_proxies)))
+    } else {
+        None
+    }
+});
+
 /// Handle a `town.muni.arbiter.proxy` request: drive the named arbiter's Rego
 /// policy over the inner request, executing any proxied XRPC call it emits.
+///
+/// Each request can buffer up to (remote-call limit × response cap) bytes, so
+/// concurrency is bounded by a semaphore (configurable via
+/// `MAX_CONCURRENT_PROXIES`) to cap the worst-case memory footprint.
 async fn proxy_request(state: &AppState, caller: &str, body: &Bytes) -> Result<Response, AppError> {
+    // Acquire a concurrency slot. This bounds total in-flight proxy memory
+    // independent of policy; requests beyond the cap wait.
+    let _permit = match PROXY_SEMAPHORE.as_ref() {
+        Some(semaphore) => Some(
+            Arc::clone(semaphore)
+                .acquire_owned()
+                .await
+                .map_err(|_| AppError::Other(anyhow::anyhow!("proxy semaphore closed")))?,
+        ),
+        None => None,
+    };
+
     let proxy: ProxyBody = serde_json::from_slice(body)
         .map_err(|e| AppError::BadRequest(format!("invalid proxy body: {e}")))?;
     let arbiter_did = proxy.arbiter_did;
@@ -372,7 +399,7 @@ async fn create_arbiter(state: &AppState, caller: &str) -> Result<Response, AppE
         random_handle().map_err(|e| AppError::Other(anyhow::anyhow!("invalid handle: {e}")))?;
 
     let provisioning = Agent::new(CredentialSession::new(
-        ReqwestClient::new(&pds_url),
+        time_bound_reqwest(&pds_url),
         MemorySessionStore::default(),
     ));
     let account = provisioning
@@ -400,15 +427,30 @@ async fn create_arbiter(state: &AppState, caller: &str) -> Result<Response, AppE
     let new_did = account.data.did.as_str().to_string();
 
     // Persist credentials first: even if the record writes below fail, the
-    // account is not orphaned — startup onboarding will find it and retry.
+    // account is not orphaned — startup onboarding will find it (via
+    // `provisioned = false`) and repair the missing bootstrap records.
     state
         .store
-        .store(new_did.clone(), PdsCredentials { password: password.clone() })
+        .store(
+            new_did.clone(),
+            PdsCredentials {
+                password: password.clone(),
+                recovery_admin: caller.to_string(),
+                provisioned: false,
+            },
+        )
         .await
         .map_err(AppError::from)?;
 
     let writer = login_session(&new_did, &password, &pds_url).await?;
     write_service_and_recovery(&writer, &new_did, caller).await?;
+
+    // Bootstrap records written; the account is now fully provisioned.
+    state
+        .store
+        .mark_provisioned(&new_did)
+        .await
+        .map_err(AppError::from)?;
 
     Ok(ok_response())
 }
@@ -451,14 +493,16 @@ async fn create_app_password_arbiter(
     // authorizes stewardship takeover.
     let writer = login_session(&arbiter_did, &app_password, &pds_endpoint).await?;
 
-    // Persist credentials first so startup onboarding can finish the job if a
-    // record write below fails.
+    // Persist credentials first so startup onboarding can repair the bootstrap
+    // records if a write below fails (`provisioned = false`).
     state
         .store
         .store(
             arbiter_did.clone(),
             PdsCredentials {
                 password: app_password,
+                recovery_admin: caller.to_string(),
+                provisioned: false,
             },
         )
         .await
@@ -466,19 +510,45 @@ async fn create_app_password_arbiter(
 
     write_service_and_recovery(&writer, &arbiter_did, caller).await?;
 
+    // Bootstrap records written; the account is now fully provisioned.
+    state
+        .store
+        .mark_provisioned(&arbiter_did)
+        .await
+        .map_err(AppError::from)?;
+
     Ok(ok_response())
 }
 
 /// Log in as `did`/`password` against `pds_url` and wrap the session in an
 /// `Agent` for typed record writes.
 async fn login_session(did: &str, password: &str, pds_url: &str) -> Result<SessionAgent, AppError> {
-    let session =
-        CredentialSession::new(ReqwestClient::new(pds_url), MemorySessionStore::default());
+    let session = CredentialSession::new(
+        time_bound_reqwest(pds_url),
+        MemorySessionStore::default(),
+    );
     session
         .login(did, password)
         .await
         .map_err(|e| AppError::Other(anyhow::anyhow!("login {did}: {e}")))?;
     Ok(Agent::new(session))
+}
+
+/// Total timeout for provisioning / policy-write HTTP requests (createAccount,
+/// createSession, putRecord). A hung PDS must not pin these tasks indefinitely.
+const PROVISIONING_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Build a reqwest client with a total timeout for the provisioning / write
+/// paths (mirrors the proxy and PDS-read clients).
+fn time_bound_reqwest(base_uri: &str) -> ReqwestClient {
+    ReqwestClientBuilder::new(base_uri)
+        .client(
+            reqwest::Client::builder()
+                .timeout(PROVISIONING_HTTP_TIMEOUT)
+                .build()
+                .expect("building reqwest client"),
+        )
+        .build()
 }
 
 /// Number of attempts for each bootstrap record write during provisioning.
@@ -508,6 +578,32 @@ async fn write_service_and_recovery(
     )
     .await?;
     write_record_retry(agent, repo, "town.muni.arbiter.recovery", "self", caller).await?;
+    Ok(())
+}
+
+/// Repair a partially-provisioned account: rewrite the bootstrap
+/// `service/self` + `recovery/self` records (using the persisted recovery
+/// admin) and mark it provisioned.
+///
+/// Called by onboarding when it finds an account marked `provisioned = false`
+/// whose bootstrap records are missing, so a failed `createArbiter` /
+/// `createAppPasswordArbiter` write is retried at startup / on reconnect rather
+/// than leaving an unrecoverable half-provisioned account. Returns `Ok(())` on
+/// success (and marks the account provisioned); errors propagate so the caller
+/// can retry later.
+pub async fn repair_provisioning(
+    state: &AppState,
+    did: &str,
+    creds: &PdsCredentials,
+    pds_endpoint: &str,
+) -> Result<(), AppError> {
+    let writer = login_session(did, &creds.password, pds_endpoint).await?;
+    write_service_and_recovery(&writer, did, &creds.recovery_admin).await?;
+    state
+        .store
+        .mark_provisioned(did)
+        .await
+        .map_err(AppError::from)?;
     Ok(())
 }
 

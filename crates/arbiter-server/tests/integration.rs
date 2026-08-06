@@ -53,6 +53,16 @@ const SERVER_DID: &str = "did:web:localhost:8203";
 const ECHO_POLICY: &str =
     "package arbiter\nresult := { \"ok\": true, \"output\": { \"got\": input.nsid } }";
 
+/// Build credentials for a test steward, defaulting to a fully-provisioned
+/// account (so auto-delete lifecycle tests behave as expected).
+fn test_creds(password: &str) -> PdsCredentials {
+    PdsCredentials {
+        password: password.to_string(),
+        recovery_admin: "did:plc:testadmin".to_string(),
+        provisioned: true,
+    }
+}
+
 // ─── small shared helpers ───────────────────────────────────────────────────
 
 /// Monotonic counter yielding unique DID strings per test run, so the
@@ -684,9 +694,7 @@ async fn fail_closed_when_pds_unreachable() {
         .store
         .store(
             did.clone(),
-            PdsCredentials {
-                password: "irrelevant".to_string(),
-            },
+            test_creds("irrelevant"),
         )
         .await
         .expect("store creds");
@@ -1092,9 +1100,7 @@ async fn auto_delete_service_absent() {
         .store
         .store(
             env.steward_did.clone(),
-            PdsCredentials {
-                password: "kept".to_string(),
-            },
+            test_creds("kept"),
         )
         .await
         .expect("store creds");
@@ -1137,9 +1143,7 @@ async fn auto_delete_service_repointed() {
         .store
         .store(
             env.steward_did.clone(),
-            PdsCredentials {
-                password: "purge-me".to_string(),
-            },
+            test_creds("purge-me"),
         )
         .await
         .expect("store creds");
@@ -1175,6 +1179,93 @@ async fn auto_delete_service_repointed() {
         creds.is_none(),
         "credentials must be purged when the service record is repointed at another server"
     );
+}#[tokio::test]
+async fn unprovisioned_account_is_repaired_not_offboarded() {
+    // A partially-provisioned account (bootstrap records never fully written,
+    // `provisioned = false`) must be repaired by onboarding — its missing
+    // service/recovery records rewritten — rather than offboarded as a
+    // deliberate auto-delete.
+    let steward_did = unique_did("steward");
+    let records = Arc::new(Mutex::new(HashMap::new()));
+    // Root policy present, but NO service record: mimics a createArbiter that
+    // wrote credentials but failed before the bootstrap records landed.
+    {
+        let mut m = records.lock().await;
+        m.insert(
+            (
+                steward_did.clone(),
+                ROOT_COLLECTION.to_string(),
+                ROOT_RKEY.to_string(),
+            ),
+            json!({ "policy": ECHO_POLICY }),
+        );
+    }
+    let pds_addr = start_mock_pds(records.clone()).await;
+    let pds_url = format!("http://{pds_addr}");
+
+    let mut docs = HashMap::new();
+    docs.insert(steward_did.clone(), did_doc(&steward_did, &pds_url, None));
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(MockResolver { docs });
+    let state = make_state(resolver);
+
+    // Store credentials marked UN-provisioned with the original recovery admin.
+    state
+        .store
+        .store(
+            steward_did.clone(),
+            PdsCredentials {
+                password: "unprovisioned-pw".to_string(),
+                recovery_admin: "did:plc:creator".to_string(),
+                provisioned: false,
+            },
+        )
+        .await
+        .expect("store creds");
+
+    // Onboarding should repair the bootstrap records and bring the arbiter up.
+    let pds = policy::load_and_onboard(&state, &steward_did)
+        .await
+        .expect("onboard repairs unprovisioned account");
+    assert!(
+        is_serving(&state, &steward_did).await,
+        "repaired account must be serving"
+    );
+    assert_eq!(pds, pds_url);
+
+    // The service + recovery records must now exist in the PDS.
+    let svc = records
+        .lock()
+        .await
+        .get(&(steward_did.clone(), SERVICE_COLLECTION.to_string(), SERVICE_RKEY.to_string()))
+        .cloned();
+    assert_eq!(
+        svc.and_then(|v| v.get("did").and_then(|d| d.as_str()).map(String::from)),
+        Some(SERVER_DID.to_string()),
+        "service record must be repaired to point at this server"
+    );
+    let recovery = records
+        .lock()
+        .await
+        .get(&(
+            steward_did.clone(),
+            "town.muni.arbiter.recovery".to_string(),
+            "self".to_string(),
+        ))
+        .cloned();
+    assert_eq!(
+        recovery.and_then(|v| v.get("did").and_then(|d| d.as_str()).map(String::from)),
+        Some("did:plc:creator".to_string()),
+        "recovery record must be repaired with the persisted recovery admin"
+    );
+
+    // The account must now be marked provisioned.
+    let creds = state
+        .store
+        .get(&steward_did)
+        .await
+        .expect("store get")
+        .expect("creds present");
+    assert!(creds.provisioned, "account must be marked provisioned after repair");
 }
 
 // ─── 6. resetPolicy (recovery admin) ────────────────────────────────────────
@@ -1224,9 +1315,7 @@ async fn reset_setup() -> (SocketAddr, KeyData, String, String, String, RecordMa
         .store
         .store(
             steward_did.clone(),
-            PdsCredentials {
-                password: "steward-pw".to_string(),
-            },
+            test_creds("steward-pw"),
         )
         .await
         .expect("store creds");

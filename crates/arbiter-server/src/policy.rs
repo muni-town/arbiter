@@ -181,10 +181,28 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
         .with_context(|| format!("fetching {SERVICE_COLLECTION}/{SERVICE_RKEY}"))?;
     match service {
         None => {
-            // Record absent: stop serving but keep credentials (may re-onboard).
-            tracing::info!(did, "service record absent; offboarding arbiter");
-            state.arbiters.offboard(did).await;
-            return Ok(pds_endpoint);
+            // Service record absent. If the account is only partially
+            // provisioned (its bootstrap records were never fully written),
+            // repair it rather than offboard it — otherwise a failed
+            // createArbiter leaves an unrecoverable account. A fully
+            // provisioned account whose service record disappears is a
+            // deliberate offboard (auto-delete) and is NOT repaired.
+            let creds = state.store.get(did).await.context("reading credentials")?;
+            match creds {
+                Some(creds) if !creds.provisioned => {
+                    tracing::info!(did, "un-provisioned account missing service record; repairing bootstrap");
+                    crate::handlers::repair_provisioning(state, did, &creds, &pds_endpoint)
+                        .await?;
+                    // Fall through: the records are (re)written; re-run the
+                    // service-record fetch so we don't treat it as absent below.
+                }
+                _ => {
+                    // Record absent: stop serving but keep credentials (may re-onboard).
+                    tracing::info!(did, "service record absent; offboarding arbiter");
+                    state.arbiters.offboard(did).await;
+                    return Ok(pds_endpoint);
+                }
+            }
         }
         Some(rec) => {
             let svc_did = rec.field("did");

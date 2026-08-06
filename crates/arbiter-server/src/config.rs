@@ -83,4 +83,15 @@ pub struct ServerConfig {
         default_value_t = 60
     )]
     pub create_arbiter_rate_window_secs: u64,
+
+    /// Max concurrently-executing `town.muni.arbiter.proxy` requests. Each such
+    /// request can buffer up to (remote-call limit × response cap) bytes in
+    /// memory, so this caps the worst-case memory footprint independent of
+    /// policy. Set to 0 for unlimited.
+    #[arg(
+        long = "max-concurrent-proxies",
+        env = "MAX_CONCURRENT_PROXIES",
+        default_value_t = 32
+    )]
+    pub max_concurrent_proxies: usize,
 }
