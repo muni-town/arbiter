@@ -47,7 +47,8 @@ const ROOT_COLLECTION: &str = "town.muni.arbiter.policy.root";
 const ROOT_RKEY: &str = "self";
 
 /// Default `CONFIG.server_did` (no env vars set in tests → clap defaults).
-const SERVER_DID: &str = "did:web:localhost:8203";
+/// Port is percent-encoded per the did:web spec.
+const SERVER_DID: &str = "did:web:localhost%3A8203";
 
 /// Root policy that echoes `input.nsid` back in `output.got`.
 const ECHO_POLICY: &str =
@@ -493,12 +494,13 @@ fn pds_keypair() -> (KeyData, KeyData) {
     (priv_key, pub_key)
 }
 
-/// Mint a serviceAuth-style JWT signed by `priv_key`.
+/// Mint a serviceAuth-style JWT signed by `priv_key` (the caller account's
+/// key). Canonical ATProto serviceAuth tokens carry `iss` = caller DID and no
+/// `sub` claim.
 fn mint_service_auth(
     priv_key: &KeyData,
     iss: &str,
     aud: &str,
-    sub: &str,
     lxm: &str,
     exp_secs: u64,
 ) -> String {
@@ -510,7 +512,6 @@ fn mint_service_auth(
         jose: JoseClaims {
             issuer: Some(iss.to_string()),
             audience: Some(aud.to_string()),
-            subject: Some(sub.to_string()),
             expiration: Some(exp_secs),
             issued_at: Some(now_secs()),
             json_web_token_id: Some(jti),
@@ -530,7 +531,6 @@ fn mint_service_auth_with_iat(
     priv_key: &KeyData,
     iss: &str,
     aud: &str,
-    sub: &str,
     lxm: &str,
     iat_secs: u64,
     exp_secs: u64,
@@ -541,7 +541,6 @@ fn mint_service_auth_with_iat(
         jose: JoseClaims {
             issuer: Some(iss.to_string()),
             audience: Some(aud.to_string()),
-            subject: Some(sub.to_string()),
             expiration: Some(exp_secs),
             issued_at: Some(iat_secs),
             json_web_token_id: jti.map(|s| s.to_string()),
@@ -560,25 +559,26 @@ fn mint_service_auth_with_iat(
 
 struct AuthEnv {
     addr: SocketAddr,
-    pds_priv: KeyData,
-    pds_did: String,
-    steward_did: String,
+    /// The caller account's signing keypair (serviceAuth tokens are signed by
+    /// the caller, with `iss` = the caller DID).
+    caller_priv: KeyData,
     caller_did: String,
+    steward_did: String,
 }
 
-/// Stand up a full on-boarded server with a PDS holding a signing key, start
-/// the axum router on a random port, and return everything the auth tests need.
+/// Stand up a full on-boarded server with a caller account holding a signing
+/// key, start the axum router on a random port, and return everything the
+/// auth tests need.
 async fn auth_setup() -> AuthEnv {
-    let (pds_priv, pds_pub) = pds_keypair();
+    let (caller_priv, caller_pub) = pds_keypair();
     // `KeyData::Display` emits `did:key:z...`; the verification method stores
     // the raw multibase (the part after `did:key:`).
-    let pub_did_key = pds_pub.to_string();
+    let pub_did_key = caller_pub.to_string();
     let multibase = pub_did_key
         .strip_prefix("did:key:")
         .expect("pub key is did:key: prefixed")
         .to_string();
 
-    let pds_did = unique_did("pds");
     let steward_did = unique_did("steward");
     let caller_did = unique_did("caller");
 
@@ -588,9 +588,11 @@ async fn auth_setup() -> AuthEnv {
     let pds_url = format!("http://{pds_addr}");
 
     let mut docs = HashMap::new();
+    // The caller account's DID doc exposes its signing key (serviceAuth tokens
+    // are signed by the caller account, verified against its own DID doc).
     docs.insert(
-        pds_did.clone(),
-        did_doc(&pds_did, &pds_url, Some(&multibase)),
+        caller_did.clone(),
+        did_doc(&caller_did, &pds_url, Some(&multibase)),
     );
     docs.insert(steward_did.clone(), did_doc(&steward_did, &pds_url, None));
     let resolver: Arc<dyn IdentityResolver> = Arc::new(MockResolver { docs });
@@ -611,10 +613,9 @@ async fn auth_setup() -> AuthEnv {
 
     AuthEnv {
         addr,
-        pds_priv,
-        pds_did,
-        steward_did,
+        caller_priv,
         caller_did,
+        steward_did,
     }
 }
 
@@ -643,10 +644,9 @@ async fn xrpc_get(
 /// A valid serviceAuth JWT bound to the proxy NSID for the given env.
 fn valid_jwt(env: &AuthEnv) -> String {
     mint_service_auth(
-        &env.pds_priv,
-        &env.pds_did,
-        SERVER_DID,
+        &env.caller_priv,
         &env.caller_did,
+        SERVER_DID,
         "town.muni.arbiter.proxy",
         now_secs() + 60,
     )
@@ -730,14 +730,13 @@ async fn auth_valid_token() {
 #[tokio::test]
 async fn auth_invalid_signature() {
     let env = auth_setup().await;
-    // Mint with a completely different key pair: the PDS DID doc still exposes
-    // the original public key, so verification must fail.
+    // Mint with a completely different key pair: the caller DID doc still
+    // exposes the original public key, so verification must fail.
     let (other_priv, _) = pds_keypair();
     let jwt = mint_service_auth(
         &other_priv,
-        &env.pds_did,
-        SERVER_DID,
         &env.caller_did,
+        SERVER_DID,
         "town.muni.arbiter.proxy",
         now_secs() + 60,
     );
@@ -753,10 +752,9 @@ async fn auth_invalid_signature() {
 async fn auth_expired_token() {
     let env = auth_setup().await;
     let jwt = mint_service_auth(
-        &env.pds_priv,
-        &env.pds_did,
-        SERVER_DID,
+        &env.caller_priv,
         &env.caller_did,
+        SERVER_DID,
         "town.muni.arbiter.proxy",
         now_secs().saturating_sub(10),
     );
@@ -774,10 +772,9 @@ async fn auth_wrong_lxm() {
     // Valid signature/aud/exp, but the bound lxm differs from the requested
     // (proxy) NSID.
     let jwt = mint_service_auth(
-        &env.pds_priv,
-        &env.pds_did,
-        SERVER_DID,
+        &env.caller_priv,
         &env.caller_did,
+        SERVER_DID,
         "town.muni.arbiter.somethingElse",
         now_secs() + 60,
     );
@@ -794,10 +791,9 @@ async fn auth_wrong_lxm() {
 async fn auth_wrong_aud() {
     let env = auth_setup().await;
     let jwt = mint_service_auth(
-        &env.pds_priv,
-        &env.pds_did,
-        "did:web:other.example",
+        &env.caller_priv,
         &env.caller_did,
+        "did:web:other.example",
         "town.muni.arbiter.proxy",
         now_secs() + 60,
     );
@@ -838,10 +834,9 @@ async fn auth_replay_rejected() {
     // A token replayed with the same `jti` must be rejected the second time.
     let env = auth_setup().await;
     let jwt = mint_service_auth_with_iat(
-        &env.pds_priv,
-        &env.pds_did,
-        SERVER_DID,
+        &env.caller_priv,
         &env.caller_did,
+        SERVER_DID,
         "town.muni.arbiter.proxy",
         now_secs(),
         now_secs() + 60,
@@ -862,10 +857,9 @@ async fn auth_missing_jti_rejected() {
     // A validly-signed token without a `jti` must be rejected.
     let env = auth_setup().await;
     let jwt = mint_service_auth_with_iat(
-        &env.pds_priv,
-        &env.pds_did,
-        SERVER_DID,
+        &env.caller_priv,
         &env.caller_did,
+        SERVER_DID,
         "town.muni.arbiter.proxy",
         now_secs(),
         now_secs() + 60,
@@ -885,10 +879,9 @@ async fn auth_stale_iat_rejected() {
     // future.
     let env = auth_setup().await;
     let jwt = mint_service_auth_with_iat(
-        &env.pds_priv,
-        &env.pds_did,
-        SERVER_DID,
+        &env.caller_priv,
         &env.caller_did,
+        SERVER_DID,
         "town.muni.arbiter.proxy",
         now_secs().saturating_sub(10 * 60), // 10 minutes ago
         now_secs() + 3600,
@@ -904,8 +897,7 @@ async fn auth_stale_iat_rejected() {
 
 /// Stand up a server whose PDS DID doc exposes the given signing keys (in
 /// order). The steward is onboarded and the router is listening.
-async fn auth_setup_with_keys(pds_privs: &[&KeyData]) -> (SocketAddr, String, String, String) {
-    let pds_did = unique_did("pds");
+async fn auth_setup_with_keys(caller_privs: &[&KeyData]) -> (SocketAddr, String, String, String) {
     let steward_did = unique_did("steward");
     let caller_did = unique_did("caller");
 
@@ -916,7 +908,7 @@ async fn auth_setup_with_keys(pds_privs: &[&KeyData]) -> (SocketAddr, String, St
 
     // `KeyData::Display` emits `did:key:z...`; the DID doc stores the raw
     // multibase (the part after `did:key:`).
-    let multibases: Vec<String> = pds_privs
+    let multibases: Vec<String> = caller_privs
         .iter()
         .map(|p| {
             to_public(p)
@@ -930,9 +922,12 @@ async fn auth_setup_with_keys(pds_privs: &[&KeyData]) -> (SocketAddr, String, St
     let mb_refs: Vec<&str> = multibases.iter().map(|s| s.as_str()).collect();
 
     let mut docs = HashMap::new();
+    // The caller account's DID doc exposes its signing keys (serviceAuth
+    // tokens are signed by the caller account, verified against its own DID
+    // document).
     docs.insert(
-        pds_did.clone(),
-        did_doc_multi(&pds_did, &pds_url, &mb_refs),
+        caller_did.clone(),
+        did_doc_multi(&caller_did, &pds_url, &mb_refs),
     );
     docs.insert(steward_did.clone(), did_doc(&steward_did, &pds_url, None));
     let resolver: Arc<dyn IdentityResolver> = Arc::new(MockResolver { docs });
@@ -951,7 +946,7 @@ async fn auth_setup_with_keys(pds_privs: &[&KeyData]) -> (SocketAddr, String, St
         let _ = axum::serve(listener, app).await;
     });
 
-    (addr, pds_did, steward_did, caller_did)
+    (addr, caller_did.clone(), steward_did, caller_did)
 }
 
 #[tokio::test]
@@ -961,15 +956,14 @@ async fn auth_selects_key_by_kid_when_multiple() {
     // blindly taking the first key.
     let (k1_priv, _) = pds_keypair();
     let (k2_priv, _) = pds_keypair();
-    let (addr, pds_did, steward_did, caller_did) =
+    let (addr, caller_did, steward_did, _) =
         auth_setup_with_keys(&[&k1_priv, &k2_priv]).await;
 
     // Mint with the second key; its header `kid` is that key's did:key:.
     let jwt = mint_service_auth(
         &k2_priv,
-        &pds_did,
-        SERVER_DID,
         &caller_did,
+        SERVER_DID,
         "town.muni.arbiter.proxy",
         now_secs() + 60,
     );
@@ -1000,15 +994,14 @@ async fn auth_key_rotation_not_served_stale() {
     // for the whole TTL.
     let (old_priv, _) = pds_keypair();
     let (new_priv, _) = pds_keypair();
-    let (addr, pds_did, steward_did, caller_did) =
+    let (addr, caller_did, steward_did, _) =
         auth_setup_with_keys(&[&old_priv, &new_priv]).await;
 
     let mint = |key: &KeyData| {
         mint_service_auth(
             key,
-            &pds_did,
-            SERVER_DID,
             &caller_did,
+            SERVER_DID,
             "town.muni.arbiter.proxy",
             now_secs() + 60,
         )
@@ -1294,19 +1287,19 @@ async fn reset_setup() -> (SocketAddr, KeyData, String, String, String, RecordMa
     let pds_addr = start_mock_pds(records.clone()).await;
     let pds_url = format!("http://{pds_addr}");
 
-    // A PDS DID carrying a signing key, so caller JWTs verify.
-    let (pds_priv, pds_pub) = pds_keypair();
-    let multibase = pds_pub
+    // The admin account carries a signing key, so its serviceAuth JWTs verify
+    // against its own DID doc.
+    let (admin_priv, admin_pub) = pds_keypair();
+    let multibase = admin_pub
         .to_string()
         .strip_prefix("did:key:")
         .expect("pub key is did:key: prefixed")
         .to_string();
-    let pds_did = unique_did("pds");
 
     let mut docs = HashMap::new();
     docs.insert(
-        pds_did.clone(),
-        did_doc(&pds_did, &pds_url, Some(&multibase)),
+        admin_did.clone(),
+        did_doc(&admin_did, &pds_url, Some(&multibase)),
     );
     docs.insert(steward_did.clone(), did_doc(&steward_did, &pds_url, None));
     let resolver: Arc<dyn IdentityResolver> = Arc::new(MockResolver { docs });
@@ -1332,16 +1325,15 @@ async fn reset_setup() -> (SocketAddr, KeyData, String, String, String, RecordMa
         let _ = axum::serve(listener, app).await;
     });
 
-    (addr, pds_priv, pds_did, steward_did, admin_did, records)
+    (addr, admin_priv, admin_did.clone(), steward_did, admin_did, records)
 }
 
-/// Mint a caller JWT bound to `resetPolicy` with the given `sub`.
-fn reset_jwt(pds_priv: &KeyData, pds_did: &str, sub: &str) -> String {
+/// Mint a caller JWT bound to `resetPolicy` for the given admin (issuer).
+fn reset_jwt(admin_priv: &KeyData, admin_did: &str) -> String {
     mint_service_auth(
-        pds_priv,
-        pds_did,
+        admin_priv,
+        admin_did,
         SERVER_DID,
-        sub,
         "town.muni.arbiter.resetPolicy",
         now_secs() + 60,
     )
@@ -1349,8 +1341,8 @@ fn reset_jwt(pds_priv: &KeyData, pds_did: &str, sub: &str) -> String {
 
 #[tokio::test]
 async fn reset_policy_as_recovery_admin() {
-    let (addr, pds_priv, pds_did, steward_did, admin_did, records) = reset_setup().await;
-    let jwt = reset_jwt(&pds_priv, &pds_did, &admin_did);
+    let (addr, admin_priv, admin_did, steward_did, _admin_did, records) = reset_setup().await;
+    let jwt = reset_jwt(&admin_priv, &admin_did);
 
     let url = format!("http://{addr}/xrpc/town.muni.arbiter.resetPolicy");
     let client = reqwest::Client::new();
@@ -1391,9 +1383,75 @@ async fn reset_policy_as_recovery_admin() {
 
 #[tokio::test]
 async fn reset_policy_forbidden_for_non_admin() {
-    let (addr, pds_priv, pds_did, steward_did, _admin_did, _records) = reset_setup().await;
+    // Stand up a server where `admin_did` is the recovery admin, but mint a
+    // token for a DIFFERENT caller (intruder) who holds their own verifiable
+    // key. The recovery-admin check must reject them with FORBIDDEN.
+    let steward_did = unique_did("steward");
+    let admin_did = unique_did("admin");
     let intruder_did = unique_did("intruder");
-    let jwt = reset_jwt(&pds_priv, &pds_did, &intruder_did);
+    let records = Arc::new(Mutex::new(HashMap::new()));
+
+    populate_standard_records(&records, &steward_did, ECHO_POLICY).await;
+    {
+        let mut m = records.lock().await;
+        m.insert(
+            (
+                steward_did.clone(),
+                "town.muni.arbiter.recovery".to_string(),
+                "self".to_string(),
+            ),
+            json!({ "did": admin_did }),
+        );
+    }
+
+    let pds_addr = start_mock_pds(records.clone()).await;
+    let pds_url = format!("http://{pds_addr}");
+
+    // The intruder holds a signing key so their serviceAuth token verifies.
+    let (intruder_priv, intruder_pub) = pds_keypair();
+    let intruder_multibase = intruder_pub
+        .to_string()
+        .strip_prefix("did:key:")
+        .expect("pub key is did:key: prefixed")
+        .to_string();
+
+    let mut docs = HashMap::new();
+    docs.insert(
+        intruder_did.clone(),
+        did_doc(&intruder_did, &pds_url, Some(&intruder_multibase)),
+    );
+    docs.insert(steward_did.clone(), did_doc(&steward_did, &pds_url, None));
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(MockResolver { docs });
+    let state = make_state(resolver);
+    state
+        .store
+        .store(
+            steward_did.clone(),
+            test_creds("steward-pw"),
+        )
+        .await
+        .expect("store creds");
+    policy::load_and_onboard(&state, &steward_did)
+        .await
+        .expect("onboard");
+
+    let app = handlers::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind router");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    // Mint a valid token for the intruder (signed by their key, iss = intruder).
+    let jwt = mint_service_auth(
+        &intruder_priv,
+        &intruder_did,
+        SERVER_DID,
+        "town.muni.arbiter.resetPolicy",
+        now_secs() + 60,
+    );
 
     let url = format!("http://{addr}/xrpc/town.muni.arbiter.resetPolicy");
     let client = reqwest::Client::new();

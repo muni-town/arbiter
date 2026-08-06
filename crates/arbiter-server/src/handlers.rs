@@ -27,6 +27,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::extract::DefaultBodyLimit;
 use axum::http::{Method, StatusCode};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
 use rand::RngCore;
 use serde_json::{Value, json};
@@ -75,7 +76,16 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         // caller's behalf (no cookie-based ambient credentials). A hostile site
         // can only trigger requests *without* a token, which are rejected as
         // unauthorized.
-        .layer(CorsLayer::permissive())
+        //
+        // `Authorization` must be explicitly listed (not just `*`): browsers do
+        // not treat `*` as covering the non-simple Authorization header, so the
+        // preflight would pass but the response would be unreadable cross-origin.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers([AUTHORIZATION, CONTENT_TYPE]),
+        )
 }
 
 async fn xrpc_handler(

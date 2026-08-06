@@ -11,11 +11,13 @@ pub struct ServerConfig {
     pub listen: String,
 
     /// This arbiter server's own DID (the `aud` serviceAuth tokens must match).
+    /// Note: for a `did:web` with a non-default port the port is percent-encoded
+    /// in the DID (`did:web:localhost%3A8203`), per the did:web spec.
     #[arg(
         short,
         long = "server-did",
         env = "DID",
-        default_value = "did:web:localhost:8203"
+        default_value = "did:web:localhost%3A8203"
     )]
     pub server_did: String,
 
