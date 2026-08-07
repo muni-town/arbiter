@@ -141,7 +141,11 @@ impl ArbiterCollection {
         let map = self.inner.read().await;
         match map.get(did) {
             Some(entry) => entry.rev_floor.as_deref().is_none_or(|floor| rev > floor),
-            None => false,
+            // Not currently onboarded (offboarded or never loaded): there is no
+            // floor to regress, so accept the event. This is what lets a
+            // re-import (service record rewritten after an offboard) re-onboard
+            // the arbiter via jetstream.
+            None => true,
         }
     }
 }

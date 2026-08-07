@@ -1129,6 +1129,63 @@ async fn auto_delete_service_absent() {
 }
 
 #[tokio::test]
+async fn reimport_after_offboard_reonboards() {
+    // Regression: after an offboard (service record absent), restoring the
+    // service record and re-running onboarding must bring the arbiter back
+    // online. The jetstream handler gates events with `is_newer`, which must
+    // accept events for a DID that is currently offboarded (no floor to
+    // regress) — otherwise a re-import never re-onboards.
+    let env = policy_setup(ECHO_POLICY).await;
+
+    env.state
+        .store
+        .store(
+            env.steward_did.clone(),
+            test_creds("kept"),
+        )
+        .await
+        .expect("store creds");
+    assert!(is_serving(&env.state, &env.steward_did).await);
+
+    // Remove the service record → offboard.
+    {
+        let mut m = env.records.lock().await;
+        m.remove(&(
+            env.steward_did.clone(),
+            SERVICE_COLLECTION.into(),
+            SERVICE_RKEY.into(),
+        ));
+    }
+    policy::load_and_onboard(&env.state, &env.steward_did)
+        .await
+        .expect("reload after service removal");
+    assert!(
+        !is_serving(&env.state, &env.steward_did).await,
+        "absent service record must offboard the arbiter"
+    );
+
+    // Restore the service record (as a re-import would) and re-onboard.
+    {
+        let mut m = env.records.lock().await;
+        m.insert(
+            (
+                env.steward_did.clone(),
+                SERVICE_COLLECTION.into(),
+                SERVICE_RKEY.into(),
+            ),
+            json!({ "did": SERVER_DID }),
+        );
+    }
+    policy::load_and_onboard(&env.state, &env.steward_did)
+        .await
+        .expect("reload after service restore");
+    assert!(
+        is_serving(&env.state, &env.steward_did).await,
+        "restored service record must re-onboard the arbiter"
+    );
+}
+
+#[tokio::test]
 async fn auto_delete_service_repointed() {
     let env = policy_setup(ECHO_POLICY).await;
 

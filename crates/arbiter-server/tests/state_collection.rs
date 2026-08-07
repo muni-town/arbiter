@@ -305,11 +305,16 @@ async fn rev_duplicate_rejected() {
 }
 
 #[tokio::test]
-async fn rev_unknown_did_rejected() {
+async fn rev_offboarded_did_accepted() {
+    // A DID not currently in the collection (offboarded, or never loaded) has
+    // no floor to regress, so any event is accepted. Filtering of genuinely
+    // unknown (non-stewarded) DIDs happens upstream in the jetstream handler's
+    // `stewarded` gate, not here — this is what lets a re-import (service
+    // record rewritten after an offboard) re-onboard via jetstream.
     let col = ArbiterCollection::new();
     assert!(
-        !col.is_newer("did:plc:unknown", "aaa").await,
-        "unknown DID should not accept revs"
+        col.is_newer("did:plc:unknown", "aaa").await,
+        "offboarded/never-loaded DID should accept revs"
     );
 }
 
