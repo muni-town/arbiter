@@ -34,6 +34,7 @@ result := xrpc({
 	"nsid": input.nsid,
 	"parameters": input.parameters,
 	"body": input.body,
+	"encoding": input.encoding,
 }) if allow
 
 # The stewarded account itself is always allowed.
