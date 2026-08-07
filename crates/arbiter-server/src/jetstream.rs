@@ -124,6 +124,10 @@ async fn run_subscription(state: &Arc<AppState>) -> anyhow::Result<()> {
     // negotiates HTTP/2.
     let client = reqwest::Client::builder()
         .use_rustls_tls()
+        // Force HTTP/1.1: reqwest-websocket only supports HTTP/1.1 WebSocket
+        // upgrades and fails ("websocket upgrade failed") if the connection
+        // negotiates HTTP/2.
+        .http1_only()
         .build()
         .context("building jetstream reqwest client")?;
 
