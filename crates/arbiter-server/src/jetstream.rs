@@ -301,7 +301,7 @@ impl EventHandler for ReloadHandler {
         // analyze carefully for correctness before doing that.
         match load_and_onboard(&self.state, did).await {
             Ok(pds) => {
-                tracing::debug!(did, pds = %pds, "reloaded arbiter from jetstream event");
+                tracing::info!(did, pds = %pds, "reloaded arbiter from jetstream event");
             }
             Err(e) => {
                 // Fail closed: stop serving until the next reload succeeds.
