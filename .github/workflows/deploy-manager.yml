@@ -1,0 +1,80 @@
+name: Deploy Arbiter Manager
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "arbiter-manager/**"
+      - "crates/arbiter-core-wasm/**"
+      - "crates/arbiter-core/**"
+      - "policies/**"
+      - "lexicons/**"
+      - ".github/workflows/deploy-manager.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  BASE_PATH: /${{ github.event.repository.name }}/arbiter-manager
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: arbiter-manager
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: pnpm/action-setup@v4
+
+      - name: Install wasm-pack
+        run: |
+          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build WASM crate
+        working-directory: crates/arbiter-core-wasm
+        run: wasm-pack build --target web
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - run: |
+          echo "PUBLIC_ARBITER_DID=did:web:arbiter.muni.town" >> .env
+          echo "PUBLIC_ARBITER_URL=https://arbiter.muni.town" >> .env
+
+      - name: Build
+        run: pnpm build
+
+      - name: Stage for Pages
+        run: |
+          mkdir -p _site
+          mv dist _site/arbiter-manager
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: arbiter-manager/_site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
