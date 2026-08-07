@@ -152,6 +152,13 @@ impl PolicyVm {
         vm.load_program(program);
         vm.set_data(data.clone())?;
         vm.set_execution_mode(regorus::rvm::vm::ExecutionMode::Suspendable);
+        // The execution timer is backed by `std::time::Instant`, which is not
+        // implemented on `wasm32-unknown-unknown` and panics when the timer is
+        // configured. Disable it there so policy validation (and evaluation)
+        // works in the browser; the wall-clock budget is a safety net against
+        // runaway loops, not a correctness requirement.
+        #[cfg(target_arch = "wasm32")]
+        let time_limit = None;
         vm.set_execution_timer_config(time_limit.map(execution_timer_config));
 
         Ok(Self {

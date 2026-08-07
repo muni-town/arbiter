@@ -29,6 +29,12 @@
 // use serde_wasm_bindgen::Serializer;
 use wasm_bindgen::prelude::*;
 
+/// Install a panic hook that logs the panic message to the console.
+#[wasm_bindgen(start)]
+pub fn start() {
+    console_error_panic_hook::set_once();
+}
+
 // // ---------------------------------------------------------------------------
 // // Serialization helpers
 // // ---------------------------------------------------------------------------

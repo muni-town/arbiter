@@ -31,7 +31,8 @@ const SERVICE_RKEY = 'self';
 const AT_PROTO_PDS_FRAGMENT = 'atproto_pds';
 
 /** Fallback policy returned when no root policy record exists yet. */
-const DEFAULT_POLICY = '# Enter your Rego policy here\n\nresult := { "ok": true, "output": null }\n';
+const DEFAULT_POLICY =
+  '# Enter your Rego policy here\n\npackage arbiter\n\nresult := { "ok": true, "output": null }\n';
 
 /** Minimal DID document shape we care about (for PDS endpoint discovery). */
 interface MinimalDidDoc {
