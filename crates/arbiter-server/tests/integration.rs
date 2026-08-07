@@ -1273,9 +1273,15 @@ async fn unprovisioned_account_is_repaired_not_offboarded() {
         .expect("store creds");
 
     // Onboarding should repair the bootstrap records and bring the arbiter up.
-    let pds = policy::load_and_onboard(&state, &steward_did)
+    let pds = match policy::load_and_onboard(&state, &steward_did)
         .await
-        .expect("onboard repairs unprovisioned account");
+        .expect("onboard repairs unprovisioned account")
+    {
+        policy::OnboardOutcome::Onboarded { pds_endpoint } => pds_endpoint,
+        policy::OnboardOutcome::Offboarded { .. } => {
+            panic!("repaired account must be onboarded, not offboarded")
+        }
+    };
     assert!(
         is_serving(&state, &steward_did).await,
         "repaired account must be serving"

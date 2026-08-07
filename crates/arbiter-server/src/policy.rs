@@ -55,6 +55,18 @@ const ENTRYPOINT: &str = "data.arbiter.result";
 /// retries.
 const STARTUP_MAX_RETRIES: u32 = 5;
 
+/// Outcome of a [`load_and_onboard`] pass: whether the arbiter was brought
+/// online or offboarded. `load_and_onboard` returns `Ok` for both — the
+/// lifecycle was applied successfully either way — so callers must branch on
+/// this to log accurately (an offboard is not an onboard).
+pub enum OnboardOutcome {
+    /// Policies loaded and the arbiter is serving.
+    Onboarded { pds_endpoint: String },
+    /// Lifecycle applied but the arbiter is not serving (service record absent,
+    /// malformed, or repointed at another server).
+    Offboarded { pds_endpoint: String },
+}
+
 /// On startup, load + onboard every arbiter the server holds credentials for.
 ///
 /// Per-arbiter fail-closed is already enforced by `ArbiterCollection::begin_request`
@@ -76,8 +88,16 @@ pub async fn startup_onboard(state: Arc<AppState>) -> Result<()> {
         let mut delay = Duration::from_secs(1);
         loop {
             match load_and_onboard(&state, &did).await {
-                Ok(pds_endpoint) => {
+                Ok(OnboardOutcome::Onboarded { pds_endpoint }) => {
                     tracing::info!(did = %did, pds = %pds_endpoint, "onboarded arbiter");
+                    break;
+                }
+                Ok(OnboardOutcome::Offboarded { pds_endpoint }) => {
+                    tracing::info!(
+                        did = %did,
+                        pds = %pds_endpoint,
+                        "arbiter offboarded at startup (service record absent or repointed)"
+                    );
                     break;
                 }
                 Err(e) if attempt >= STARTUP_MAX_RETRIES => {
@@ -127,8 +147,16 @@ pub async fn refresh_all_after_reconnect(state: Arc<AppState>) {
         let mut delay = Duration::from_secs(1);
         loop {
             match load_and_onboard(&state, &did).await {
-                Ok(pds) => {
-                    tracing::info!(did = %did, pds = %pds, "refreshed arbiter after reconnect");
+                Ok(OnboardOutcome::Onboarded { pds_endpoint }) => {
+                    tracing::info!(did = %did, pds = %pds_endpoint, "refreshed arbiter after reconnect");
+                    break;
+                }
+                Ok(OnboardOutcome::Offboarded { pds_endpoint }) => {
+                    tracing::info!(
+                        did = %did,
+                        pds = %pds_endpoint,
+                        "arbiter offboarded after reconnect (service record absent or repointed)"
+                    );
                     break;
                 }
                 Err(e) if attempt >= STARTUP_MAX_RETRIES => {
@@ -156,13 +184,15 @@ pub async fn refresh_all_after_reconnect(state: Arc<AppState>) {
 }
 
 /// Fetch the latest root + sub-policy records and the service record for `did`
-/// from its PDS, build `Policies`, and onboard (or update) the arbiter. Returns
-/// the resolved PDS endpoint.
+/// from its PDS, build `Policies`, and onboard (or update) the arbiter.
 ///
 /// Also applies the lifecycle: if `town.muni.arbiter.service/self` is absent
 /// -> `state.arbiters.offboard(did)`; if its `did` field != `CONFIG.server_did`
 /// -> `offboard` + `state.store.remove(did)`.
-pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
+///
+/// Returns [`OnboardOutcome`] so callers can tell an onboard from an offboard
+/// (both are `Ok` — the lifecycle applied successfully).
+pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<OnboardOutcome> {
     let pds_endpoint = state
         .resolver
         .resolve_pds_endpoint(did)
@@ -200,7 +230,7 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
                     // Record absent: stop serving but keep credentials (may re-onboard).
                     tracing::info!(did, "service record absent; offboarding arbiter");
                     state.arbiters.offboard(did).await;
-                    return Ok(pds_endpoint);
+                    return Ok(OnboardOutcome::Offboarded { pds_endpoint });
                 }
             }
         }
@@ -211,7 +241,7 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
                     // Malformed service record: treat as absent (keep credentials).
                     tracing::warn!(did, "service record missing 'did' field; offboarding");
                     state.arbiters.offboard(did).await;
-                    return Ok(pds_endpoint);
+                    return Ok(OnboardOutcome::Offboarded { pds_endpoint });
                 }
                 Some(d) if d != CONFIG.server_did => {
                     // Repointed at another server: stop serving + purge credentials.
@@ -225,7 +255,7 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
                     if let Err(e) = state.store.remove(did).await {
                         tracing::warn!(did, error = %format!("{e:#}"), "failed to purge credentials");
                     }
-                    return Ok(pds_endpoint);
+                    return Ok(OnboardOutcome::Offboarded { pds_endpoint });
                 }
                 _ => {
                     // Points at this server: continue loading policies.
@@ -298,7 +328,7 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<String> {
         .arbiters
         .onboard(did.to_string(), arbiter, pds_endpoint.clone(), rev_floor)
         .await;
-    Ok(pds_endpoint)
+    Ok(OnboardOutcome::Onboarded { pds_endpoint })
 }
 
 /// Parse a repo identifier (handle or DID) for the atrium typed client.

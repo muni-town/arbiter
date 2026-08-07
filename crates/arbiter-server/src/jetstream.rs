@@ -41,7 +41,7 @@ use atproto_jetstream::JetstreamEvent;
 use futures_util::{SinkExt, StreamExt};
 use reqwest_websocket::{Message, RequestBuilderExt};
 
-use crate::policy::{load_and_onboard, refresh_all_after_reconnect};
+use crate::policy::{OnboardOutcome, load_and_onboard, refresh_all_after_reconnect};
 use crate::{AppState, CONFIG};
 
 /// Collections this server watches on Jetstream.
@@ -300,8 +300,15 @@ impl EventHandler for ReloadHandler {
         // whole policy by re-loading all the records in the future, but we need to
         // analyze carefully for correctness before doing that.
         match load_and_onboard(&self.state, did).await {
-            Ok(pds) => {
-                tracing::info!(did, pds = %pds, "reloaded arbiter from jetstream event");
+            Ok(OnboardOutcome::Onboarded { pds_endpoint }) => {
+                tracing::info!(did, pds = %pds_endpoint, "reloaded arbiter from jetstream event");
+            }
+            Ok(OnboardOutcome::Offboarded { pds_endpoint }) => {
+                tracing::info!(
+                    did,
+                    pds = %pds_endpoint,
+                    "offboarded arbiter from jetstream event (service record absent or repointed)"
+                );
             }
             Err(e) => {
                 // Fail closed: stop serving until the next reload succeeds.
