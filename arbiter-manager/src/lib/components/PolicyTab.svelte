@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Button, Box } from '@foxui/core';
   import PolicyEditor from './PolicyEditor.svelte';
+  import ResetPolicySheet from './ResetPolicySheet.svelte';
   import { arbiter } from '$lib/arbiter';
   import { ensureWasm, checkPolicy } from '$lib/wasm';
 
@@ -14,6 +15,8 @@
   let saving = $state(false);
   let saveError = $state<string | null>(null);
   let saveSuccess = $state(false);
+
+  let showReset = $state(false);
 
   let validationError = $state<string | null>(null);
   let wasmReady = $state(false);
@@ -75,7 +78,17 @@
       saving = false;
     }
   }
-</script>
+
+  /**
+   * Open the reset-policy dialog: choose the owner account, then confirm to
+   * reset the policy via the `resetPolicy` recovery endpoint. This bypasses the
+   * policy itself, so it works even when the current policy denies normal
+   * updates — the recovery path out of a broken policy.
+   */
+  function openResetDialog() {
+    saveError = null;
+    showReset = true;
+  }</script>
 
 <div class="flex-1 overflow-auto h-full">
   <div class="p-4 space-y-4 h-full flex flex-col">
@@ -101,6 +114,9 @@
           {#if validationError}
             <span class="text-xs text-red-500">Policy has errors</span>
           {/if}
+          <Button size="sm" variant="secondary" onclick={openResetDialog}>
+            Reset Policy
+          </Button>
           <Button size="sm" onclick={savePolicy} disabled={saving}>
             {saving ? 'Saving…' : 'Save Policy'}
           </Button>
@@ -127,3 +143,7 @@
     {/if}
   </div>
 </div>
+
+{#if arbiterDid}
+  <ResetPolicySheet bind:open={showReset} {arbiterDid} onReset={loadPolicy} />
+{/if}

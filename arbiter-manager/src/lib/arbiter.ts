@@ -62,6 +62,22 @@ function policySource(value: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Resolve the `did#atproto_pds` service endpoint for an account from its DID
+ * document. Throws if no such service exists.
+ */
+async function resolvePdsEndpoint(did: string): Promise<string> {
+  const doc = (await didResolver.resolve(did as AtprotoDid)) as MinimalDidDoc;
+  const pdsService = (doc.service ?? []).find((s) => {
+    const id = typeof s.id === 'string' ? s.id.replace(/^#/, '') : '';
+    return id === 'atproto_pds' && typeof s.serviceEndpoint === 'string';
+  });
+  if (!pdsService || typeof pdsService.serviceEndpoint !== 'string') {
+    throw new Error(`no #atproto_pds service in DID doc for ${did}`);
+  }
+  return pdsService.serviceEndpoint;
+}
+
 export const arbiter = {
   /**
    * Obtain a service auth token scoped to the arbiter-server DID.
@@ -138,6 +154,37 @@ export const arbiter = {
   },
 
   /**
+   * Fetch a public record directly from the steward's PDS (no auth, no
+   * proxying). Resolves the `#atproto_pds` endpoint from the DID doc and
+   * issues `com.atproto.repo.getRecord`. Returns the record `value`.
+   */
+  async getPublicRecord(
+    did: string,
+    collection: string,
+    rkey: string,
+  ): Promise<RecordValue> {
+    const pds = await resolvePdsEndpoint(did);
+    const url = new URL(`${pds}/xrpc/com.atproto.repo.getRecord`);
+    url.searchParams.set('repo', did);
+    url.searchParams.set('collection', collection);
+    url.searchParams.set('rkey', rkey);
+
+    const res = await fetch(url);
+    if (!res.ok) {
+      throw new Error(`getRecord ${collection}/${rkey} failed: ${res.status}`);
+    }
+    const body: unknown = await res.json();
+    if (!body || typeof body !== 'object' || !('value' in body)) {
+      throw new Error(`getRecord ${collection}/${rkey} returned no value`);
+    }
+    const value = body.value;
+    if (value == null || typeof value !== 'object') {
+      throw new Error(`getRecord ${collection}/${rkey} returned no value`);
+    }
+    return value as RecordValue;
+  },
+
+  /**
    * Write (create/replace) a record on the stewarded account's PDS via
    * putRecord, proxied through the arbiter so the record ends up in the
    * stewarded account's repo.
@@ -156,7 +203,11 @@ export const arbiter = {
         collection,
         rkey: rkey || undefined,
         record,
-        validate: true,
+        // The PDS does not have the custom `town.muni.arbiter.*` lexicons
+        // registered, so validating would reject them (`Unknown lexicon
+        // type`). The arbiter validates Rego itself on reset; write without
+        // server-side lexicon validation.
+        validate: false,
       },
     });
     const { uri, cid } = body;
@@ -168,15 +219,17 @@ export const arbiter = {
   /**
    * Read the root Rego policy for a stewarded account.
    *
-   * Fetches `town.muni.arbiter.policy.root/self` via the arbiter proxy and
-   * returns the `policy` string. If the record does not exist (or any error
-   * occurs), a default placeholder policy is returned so the editor is still
-   * usable.
+   * The policy record lives in the steward's public repo, so it is read
+   * directly from the steward's PDS (`com.atproto.repo.getRecord`) with no
+   * auth — proxying it through the arbiter would require the policy to allow
+   * its own `getRecord`, which it must not. Returns the `policy` string; if
+   * the record does not exist (or cannot be read), a default placeholder is
+   * returned so the editor is still usable.
    */
   async getPolicy(did: string): Promise<string> {
     try {
-      const record = await this.getRecord(did, POLICY_COLLECTION, POLICY_RKEY);
-      return policySource(record) ?? DEFAULT_POLICY;
+      const value = await this.getPublicRecord(did, POLICY_COLLECTION, POLICY_RKEY);
+      return policySource(value) ?? DEFAULT_POLICY;
     } catch {
       return DEFAULT_POLICY;
     }
@@ -211,33 +264,8 @@ export const arbiter = {
    */
   async hasArbiterService(did: string): Promise<boolean> {
     try {
-      const doc = (await didResolver.resolve(did as AtprotoDid)) as MinimalDidDoc;
-      const pdsService = (doc.service ?? []).find((s) => {
-        const id = typeof s.id === 'string' ? s.id.replace(/^#/, '') : '';
-        return id === 'atproto_pds' && typeof s.serviceEndpoint === 'string';
-      });
-      if (!pdsService || typeof pdsService.serviceEndpoint !== 'string') {
-        return false;
-      }
-      const url = new URL(`${pdsService.serviceEndpoint}/xrpc/com.atproto.repo.getRecord`);
-      url.searchParams.set('repo', did);
-      url.searchParams.set('collection', SERVICE_COLLECTION);
-      url.searchParams.set('rkey', SERVICE_RKEY);
-
-      const res = await fetch(url);
-      if (!res.ok) return false;
-      const body: unknown = await res.json();
-      if (
-        !body ||
-        typeof body !== 'object' ||
-        !('value' in body) ||
-        body.value === null ||
-        typeof body.value !== 'object' ||
-        !('did' in body.value)
-      ) {
-        return false;
-      }
-      return body.value.did === PUBLIC_ARBITER_DID;
+      const value = await this.getPublicRecord(did, SERVICE_COLLECTION, SERVICE_RKEY);
+      return value.did === PUBLIC_ARBITER_DID;
     } catch {
       return false;
     }

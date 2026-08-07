@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Box } from '@foxui/core';
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
 
   let {
     value = $bindable(),
@@ -80,6 +80,10 @@
 
   onMount(async () => {
     const monaco = await import('monaco-editor');
+    // The DOM may have been detached/reattached while Monaco loaded (e.g. HMR);
+    // bail out if our container is no longer attached, or `create` will walk
+    // `parentNode` on a null/detached node.
+    if (!containerEl?.isConnected) return;
 
     // ── Worker setup ─────────────────────────────────────────────────────
     const EditorWorker = (await import(
@@ -88,6 +92,7 @@
     const JsonWorker = (await import(
       'monaco-editor/esm/vs/language/json/json.worker?worker'
     )).default;
+    if (!containerEl?.isConnected) return;
 
     (self as unknown as Record<string, unknown>).MonacoEnvironment = {
       getWorker(_: unknown, label: string) {
@@ -165,16 +170,26 @@
 
     // Sync changes back
     editor.onDidChangeModelContent(() => {
-      value = editor.getValue();
-      onChange?.(value);
+      const text = editor.getValue();
+      value = text;
+      onChange?.(text);
     });
   });
 
   // Sync external value changes into the editor (if it's been created)
   $effect(() => {
-    if (editor && editor.getValue() !== value) {
-      editor.setValue(value);
+    if (!editor || typeof value !== 'string') return;
+    const current = value;
+    if (editor.getValue() !== current) {
+      editor.setValue(current);
     }
+  });
+
+  // Dispose the editor on unmount (incl. HMR re-mount) so Monaco doesn't leak
+  // instances attached to detached DOM nodes.
+  onDestroy(() => {
+    editor?.dispose();
+    editor = null;
   });
 </script>
 

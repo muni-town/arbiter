@@ -17,5 +17,8 @@ export const defaultPolicy = defaultPolicySource as string;
  * given DID, returning the final policy string ready to send to the arbiter.
  */
 export function defaultPolicyWithOwner(ownerDid: string): string {
-  return defaultPolicy.replace('${owner}', ownerDid);
+  // The template contains `${owner}` in both the doc comment and the actual
+  // `allow` rule, so replace every occurrence — a single `.replace` would only
+  // fix the comment and leave the rule's placeholder intact.
+  return defaultPolicy.replaceAll('${owner}', ownerDid);
 }

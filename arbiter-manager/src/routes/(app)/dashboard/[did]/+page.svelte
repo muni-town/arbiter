@@ -6,7 +6,7 @@
 
   $effect(() => {
     if (did) {
-      goto(`/dashboard/${encodeURIComponent(did)}/spaces`, { replaceState: true });
+      goto(`/dashboard/${encodeURIComponent(did)}/policy`, { replaceState: true });
     }
   });
 </script>

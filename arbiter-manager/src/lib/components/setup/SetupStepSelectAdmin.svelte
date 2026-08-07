@@ -3,14 +3,31 @@
   import { setupState, setupClient } from '$lib/setupState.svelte';
   import { AtprotoHandlePopup, type Profile } from '@foxui/all';
   import { isAtprotoDid } from '@atproto/oauth-client-browser';
+  import { isActorIdentifier } from '@atcute/lexicons/syntax';
   import { defaultPolicyWithOwner } from '$lib/default-policy';
   import { arbiter } from '$lib/arbiter';
   import { auth } from '$lib/auth.svelte';
+  import { actorResolver } from '$lib/resolver';
 
   let selectedAdmin: Profile | undefined = $state(undefined);
 
   function goBack() {
     setupState.step = 'app-password';
+  }
+
+  /**
+   * The foxui `AtprotoHandlePopup` fires `onselected` with a hardcoded
+   * `did: ''` when the user just types a handle and presses Enter without
+   * picking a dropdown result, so `selectedAdmin.did` may be empty. Resolve
+   * the handle to its DID in that case.
+   */
+  async function ownerDid(): Promise<string> {
+    if (!selectedAdmin) throw new Error('Please resolve an admin DID first');
+    if (selectedAdmin.did) return selectedAdmin.did;
+    if (!selectedAdmin.handle) throw new Error('You must select an admin.');
+    if (!isActorIdentifier(selectedAdmin.handle)) throw new Error('Invalid admin handle');
+    const resolved = await actorResolver.resolve(selectedAdmin.handle);
+    return resolved.did;
   }
 
   async function finishSetup() {
@@ -25,7 +42,9 @@
     try {
       if (!isAtprotoDid(auth.did)) throw new Error('Not logged in with valid DID');
       if (!setupState.appPassword) throw new Error('Must provide AppPassword');
-      if (!selectedAdmin.did) throw new Error('You must select an admin.');
+
+      // Resolve the owner DID (see `ownerDid`).
+      const did = await ownerDid();
 
       // Write the initial root policy directly to the account's PDS (via the
       // app-password session established earlier) BEFORE importing it as a
@@ -36,7 +55,7 @@
         console.log(`Logged in as ${auth.did}`);
       }
       console.log('Preparing to write root policy');
-      await setupClient.writeRootPolicy(defaultPolicyWithOwner(selectedAdmin.did));
+      await setupClient.writeRootPolicy(defaultPolicyWithOwner(did));
       console.log('Wrote root policy');
 
       // Import the existing account as a stewarded arbiter. The server reads
