@@ -1,15 +1,6 @@
 name: Deploy Arbiter Manager
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "arbiter-manager/**"
-      - "crates/arbiter-core-wasm/**"
-      - "crates/arbiter-core/**"
-      - "policies/**"
-      - "lexicons/**"
-      - ".github/workflows/deploy-manager.yml"
   workflow_dispatch:
 
 permissions:

@@ -1,0 +1,87 @@
+# Build args for the arbiter the manager talks to.
+#   PUBLIC_ARBITER_DID : the `did:web:...` of the arbiter server (e.g. did:web:arbiter.muni.town)
+#   PUBLIC_ARBITER_URL : base URL of the arbiter server's XRPC endpoint (e.g. https://arbiter.muni.town)
+#   PUBLIC_BASE_URL    : public origin where this manager is served (e.g. https://arbiter.muni.town),
+#                        used to generate the production OAuth client metadata at build time.
+# These are baked into the static bundle / metadata at build time (see `_app/env.js`,
+# `oauth-client-metadata.json`), so they must be passed when building the image.
+ARG PUBLIC_ARBITER_DID=did:web:localhost%3A8203
+ARG PUBLIC_ARBITER_URL=http://localhost:8203
+ARG PUBLIC_BASE_URL=http://localhost
+
+# ---------------------------------------------------------------------------
+# Stage 1: Rust — build the arbiter-core WASM bundle (wasm-pack).
+# Same base image as the arbiter-server image (clux/muslrust).
+# ---------------------------------------------------------------------------
+FROM clux/muslrust:stable AS rust
+
+# wasm-pack is not preinstalled in the muslrust image; install it.
+RUN cargo install wasm-pack --locked
+
+COPY . /project
+WORKDIR /project/crates/arbiter-core-wasm
+
+# wasm32-unknown-unknown is a rustup target; muslrust ships rustup.
+RUN rustup target add wasm32-unknown-unknown \
+    && wasm-pack build --target web --out-dir pkg
+
+# ---------------------------------------------------------------------------
+# Stage 2: Node — build the SvelteKit static site.
+# The manager resolves `arbiter-core-wasm` from `../crates/arbiter-core-wasm/pkg`
+# (the file: dependency) and imports policies from `../policies`, so those are
+# mounted in the build context alongside `arbiter-manager/`.
+# ---------------------------------------------------------------------------
+FROM node:22-alpine AS build
+
+ARG PUBLIC_ARBITER_DID
+ARG PUBLIC_ARBITER_URL
+ARG PUBLIC_BASE_URL
+
+ENV PUBLIC_ARBITER_DID=$PUBLIC_ARBITER_DID \
+    PUBLIC_ARBITER_URL=$PUBLIC_ARBITER_URL
+
+# pnpm is bundled with corepack on the node image. Pin the version the repo
+# declares in its root package.json (pnpm@10.32.1) for reproducible builds.
+RUN corepack enable && corepack prepare pnpm@10.32.1 --activate
+
+# Copy the freshly built WASM pkg (the manager's `file:` dependency).
+COPY --from=rust /project/crates/arbiter-core-wasm/pkg /project/crates/arbiter-core-wasm/pkg
+# The manager app; its `lexicons/` entry is a symlink to the repo-root `lexicons/`,
+# which the `postinstall` script reads to regenerate TS schema types.
+COPY arbiter-manager /project/arbiter-manager
+COPY policies /project/policies
+COPY lexicons /project/lexicons
+
+WORKDIR /project/arbiter-manager
+
+# Generate production OAuth client metadata for the public base URL, replacing
+# the committed loopback/dev version. The scope list must match `atprotoOauthScope`
+# in src/lib/auth.svelte.ts.
+RUN cat > static/oauth-client-metadata.json <<EOF
+{
+  "client_id": "$PUBLIC_BASE_URL/oauth-client-metadata.json",
+  "scope": "atproto identity:* rpc:com.atproto.repo.putRecord?aud=* rpc:com.atproto.repo.getRecord?aud=* rpc:app.bsky.actor.getProfile?aud=* rpc:town.muni.arbiter.createArbiter?aud=* rpc:town.muni.arbiter.createAppPasswordArbiter?aud=* rpc:town.muni.arbiter.proxy?aud=* rpc:town.muni.arbiter.resetPolicy?aud=*",
+  "redirect_uris": ["$PUBLIC_BASE_URL/oauth/callback"],
+  "response_types": ["code"],
+  "grant_types": ["authorization_code", "refresh_token"],
+  "token_endpoint_auth_method": "none",
+  "application_type": "native",
+  "dpop_bound_access_tokens": true
+}
+EOF
+
+RUN pnpm install --frozen-lockfile \
+    && pnpm build
+
+# ---------------------------------------------------------------------------
+# Stage 3: Caddy — serve the static build. SPA fallback to index.html.
+# ---------------------------------------------------------------------------
+FROM joseluisq/static-web-server:3.0.0-beta.1-alpine AS production
+
+ENV SERVER_ROOT=/public
+ENV SERVER_PORT=80
+ENV SERVER_FALLBACK_PAGE=/public/index.html
+
+COPY --from=build /project/arbiter-manager/build /public
+
+EXPOSE 80

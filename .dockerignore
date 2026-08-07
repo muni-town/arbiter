@@ -1,2 +1,13 @@
 target
 Dockerfile
+Dockerfile.arbiter-manager
+node_modules
+**/node_modules
+**/.svelte-kit
+**/build
+**/dist
+.git
+.jj
+data
+.gitignore
+leaf.gitignore
