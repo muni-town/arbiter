@@ -8,6 +8,7 @@ import {
 import * as app from '$lib/lexicons/app';
 import { Client } from '@atproto/lex';
 import { goto } from '$app/navigation';
+import { base } from '$app/paths';
 import { resetSetupState } from './setupState.svelte';
 
 const SESSION_DID_KEY = 'session-did';
@@ -122,11 +123,12 @@ async function makeOauthClient(): Promise<BrowserOAuthClient> {
       )}&scope=${encodeURIComponent(atprotoOauthScope)}`,
     };
   } else {
-    // In prod, we fetch the `/oauth-client-metadata.json` which is expected to be deployed alongside the
-    // static build.
-    // native client metadata is not reuqired to be on the same domin as client_id,
-    // so it can always use the deployed metadata
-    const resp = await fetch(`/oauth-client-metadata.json`, {
+    // In prod, we fetch the `oauth-client-metadata.json` which is expected to
+    // be deployed alongside the static build, resolved relative to the app's
+    // base path (e.g. `/leaf-0.4/arbiter-manager/` on GitHub Pages). Native
+    // client metadata is not required to be on the same domain as client_id,
+    // so it can always use the deployed metadata.
+    const resp = await fetch(`${base}/oauth-client-metadata.json`, {
       headers: [['accept', 'application/json']],
     });
     clientMetadata = await resp.json();

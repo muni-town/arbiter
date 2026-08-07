@@ -13,6 +13,25 @@ use crate::{
     xrpc::{XrpcEndpoint, XrpcError, XrpcOutput, XrpcRequest, XrpcResult},
 };
 
+/// Async host functions registered on every arbiter policy VM (mirrors
+/// `arbiter-server::policy::HOST_FNS`).
+pub const HOST_FNS: &[&str] = &["xrpc", "policy"];
+/// Rego entrypoint evaluated to produce a request's result (mirrors
+/// `arbiter-server::policy::ENTRYPOINT`).
+pub const ENTRYPOINT: &str = "data.arbiter.result";
+
+/// Compile a Rego policy with the arbiter's host functions and entrypoint,
+/// validating it before it is installed.
+///
+/// This runs the full [`PolicyVm`] compile path (including the async host
+/// functions) so that malformed policies — bad Rego syntax, missing
+/// entrypoint, or calls to the `xrpc`/`policy` builtins with the wrong
+/// arity — are caught here rather than at evaluation time.
+pub fn validate_policy(policy: &str) -> Result<()> {
+    PolicyVm::new(policy, Value::new_object(), ENTRYPOINT, HOST_FNS)
+        .map(|_| ())
+}
+
 /// The marker key used inside Rego values to refer to a binary payload stored
 /// out-of-band in the machine's `buffers` list.
 ///

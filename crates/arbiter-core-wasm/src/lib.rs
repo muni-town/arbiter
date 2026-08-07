@@ -25,13 +25,9 @@
 //! processes them: sends responses back, or routes `xrpc_remote` requests
 //! to the target machine.
 
-// use arbiter_core::{
-//     ArbiterState, Event, IoAction, SpaceId, StateMachine,
-//     policy_core::XrpcMethod,
-// };
 // use serde::Serialize;
 // use serde_wasm_bindgen::Serializer;
-// use wasm_bindgen::prelude::*;
+use wasm_bindgen::prelude::*;
 
 // // ---------------------------------------------------------------------------
 // // Serialization helpers
@@ -415,12 +411,11 @@
 // // Standalone helpers
 // // ---------------------------------------------------------------------------
 
-// /// Validate a Rego policy string. Throws a JavaScript exception on error.
-// #[wasm_bindgen]
-// pub fn validate_policy(policy: &str) -> Result<(), JsValue> {
-//     arbiter_core::policy_core::validate_policy(policy)
-//         .map_err(|e| JsValue::from_str(&e.to_string()))
-// }
+/// Validate a Rego policy string. Throws a JavaScript exception on error.
+#[wasm_bindgen]
+pub fn validate_policy(policy: &str) -> Result<(), JsValue> {
+    arbiter_core::arbiter::validate_policy(policy).map_err(|e| JsValue::from_str(&format!("{e:#}")))
+}
 
 // // ---------------------------------------------------------------------------
 

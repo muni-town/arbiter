@@ -1,13 +1,6 @@
 name: Deploy Arbiter Simulator
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "arbiter-simulator/**"
-      - "crates/**"
-      - "lexicons/**"
-      - ".github/workflows/deploy.yml"
   workflow_dispatch:
 
 permissions:

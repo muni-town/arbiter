@@ -55,13 +55,29 @@ jobs:
           echo "PUBLIC_ARBITER_DID=did:web:arbiter.muni.town" >> .env
           echo "PUBLIC_ARBITER_URL=https://arbiter.muni.town" >> .env
 
+      - name: Generate production OAuth client metadata
+        run: |
+          BASE_URL="https://${{ github.event.repository.owner.login }}.github.io/${{ github.event.repository.name }}/arbiter-manager"
+          cat > static/oauth-client-metadata.json <<EOF
+          {
+            "client_id": "$BASE_URL/oauth-client-metadata.json",
+            "scope": "atproto identity:* rpc:com.atproto.repo.putRecord?aud=* rpc:com.atproto.repo.getRecord?aud=* rpc:app.bsky.actor.getProfile?aud=* rpc:town.muni.arbiter.createArbiter?aud=* rpc:town.muni.arbiter.createAppPasswordArbiter?aud=* rpc:town.muni.arbiter.proxy?aud=* rpc:town.muni.arbiter.resetPolicy?aud=*",
+            "redirect_uris": ["$BASE_URL/oauth/callback"],
+            "response_types": ["code"],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "token_endpoint_auth_method": "none",
+            "application_type": "native",
+            "dpop_bound_access_tokens": true
+          }
+          EOF
+
       - name: Build
         run: pnpm build
 
       - name: Stage for Pages
         run: |
           mkdir -p _site
-          mv dist _site/arbiter-manager
+          mv build _site/arbiter-manager
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
