@@ -6,18 +6,29 @@
   import { goto } from '$app/navigation';
   import { auth } from '$lib/auth.svelte';
 
-  let oauthDid = $state('');
   let adminDid = $state('');
 
   onMount(() => {
     if (auth.did && auth.profile?.handle) {
       managedCommunities.add(auth.did, auth.profile?.handle);
     }
+    // In the create flow the new account's DID is known; add it to the
+    // managed list so it appears on the dashboard.
+    if (setupState.createDid) {
+      managedCommunities.add(setupState.createDid, 'New arbiter account');
+    }
   });
 
   function goToDashboard() {
+    // In the create flow the new account's DID is known; in the import flow the
+    // stewarded account is the signed-in account (`auth.did`).
+    const target = setupState.createDid || auth.did;
+    if (!target) {
+      setupState.error = 'No account DID to open';
+      return;
+    }
     resetSetupState();
-    goto(`/dashboard/${encodeURIComponent(oauthDid)}`);
+    goto(`/dashboard/${encodeURIComponent(target)}`);
   }
 
   function startOver() {

@@ -12,7 +12,7 @@
     await auth.init();
 
     if (setupState.step == 'oauth' && auth.profile) {
-      setupState.step = 'app-password';
+      setupState.step = 'choose';
     } else if (!auth.session && setupState.step != 'intro') {
       resetSetupState();
     }

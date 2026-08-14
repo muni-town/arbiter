@@ -13,13 +13,20 @@ import { PdsSetupClient } from './pds-setup-client';
 export const STORAGE_KEY = 'arbiter-manager-setup-state';
 
 const setupStepTy = type(
-  '"intro" | "oauth" | "app-password" | "select-admin" | "complete"',
+  '"intro" | "oauth" | "choose" | "app-password" | "select-admin" | "complete" | "create"',
 );
 export type SetupStep = typeof setupStepTy.infer;
 
+const setupModeTy = type('"create" | "import"');
+export type SetupMode = typeof setupModeTy.infer;
+
 const setupStateTy = type({
   step: setupStepTy.default('intro'),
+  /** Which path the user chose: create a new account or import an existing one. */
+  mode: setupModeTy.optional(),
   appPassword: type.string.optional(),
+  /** The DID of a newly created (not imported) arbiter account, if any. */
+  createDid: type.string.optional(),
   error: type.string.optional(),
   loading: type.boolean.default(false),
 });
@@ -37,7 +44,9 @@ export const setupClient = new PdsSetupClient();
 
 export const resetSetupState = () => {
   setupState.step = initState.step;
+  setupState.mode = undefined;
   setupState.appPassword = undefined;
+  setupState.createDid = undefined;
   setupState.error = undefined;
   setupState.loading = false;
 };

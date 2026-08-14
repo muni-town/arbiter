@@ -178,6 +178,27 @@ fn make_state(resolver: Arc<dyn IdentityResolver>) -> Arc<AppState> {
                 .expect("fresh credential store"),
         ),
         resolver,
+        default_pds: String::new(),
+        invite_code: None,
+    })
+}
+
+/// Like [`make_state`], but with the provisioning config (default PDS URL +
+/// invite code) set, so `createArbiter` can be exercised against a mock PDS.
+fn make_state_with_provisioning(
+    resolver: Arc<dyn IdentityResolver>,
+    default_pds: String,
+    invite_code: Option<String>,
+) -> Arc<AppState> {
+    Arc::new(AppState {
+        arbiters: ArbiterCollection::new(),
+        store: Box::new(
+            TursoCredentialStore::new(fresh_creds_db().to_string_lossy().into_owned())
+                .expect("fresh credential store"),
+        ),
+        resolver,
+        default_pds,
+        invite_code,
     })
 }
 
@@ -211,6 +232,12 @@ struct PdsState {
     /// Current repo head commit CID per repo DID, used to enforce `swapCommit`
     /// on `putRecord` (the mock's compare-and-swap check).
     heads: Arc<Mutex<HashMap<String, String>>>,
+    /// When true, `createAccount` returns a 500 so tests can exercise the
+    /// `ErrProvisioningFailed` path.
+    fail_create_account: Arc<std::sync::atomic::AtomicBool>,
+    /// When true, `createSession` returns a 401 so tests can exercise the
+    /// `ErrPermissionDenied` path (failed app-password login).
+    fail_create_session: Arc<std::sync::atomic::AtomicBool>,
 }
 
 async fn get_record_handler(
@@ -272,7 +299,14 @@ async fn list_records_handler(
     (StatusCode::OK, Json(json!({ "records": records }))).into_response()
 }
 
-async fn create_session_handler() -> Response {
+async fn create_session_handler(State(st): State<PdsState>) -> Response {
+    if st.fail_create_session.load(std::sync::atomic::Ordering::SeqCst) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "AuthFactorTokenRequired" })),
+        )
+            .into_response();
+    }
     // `did`/`handle` must be syntactically valid for atrium's session parsing.
     Json(json!({
         "accessJwt": "fake-jwt",
@@ -283,9 +317,19 @@ async fn create_session_handler() -> Response {
     .into_response()
 }
 
-async fn create_account_handler() -> Response {
+async fn create_account_handler(State(st): State<PdsState>) -> Response {
+    if st.fail_create_account.load(std::sync::atomic::Ordering::SeqCst) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "InternalServerError" })),
+        )
+            .into_response();
+    }
+    // `did`/`handle` must be syntactically valid for atrium's response parsing.
+    // The DID is fixed (like create_session_handler); the created account's
+    // repo is keyed by this DID in the mock's record map.
     Json(json!({
-        "did": "mock-pds",
+        "did": "did:plc:mockpds",
         "handle": "mock.pds.example",
         "accessJwt": "fake-jwt",
         "refreshJwt": "fake-refresh",
@@ -365,9 +409,38 @@ async fn get_latest_commit_handler(
 /// Start a mock PDS on a random port backed by the shared record map. The
 /// server runs for the lifetime of the test's tokio runtime.
 async fn start_mock_pds(records: RecordMap) -> SocketAddr {
+    start_mock_pds_with_flags(records, false, false).await
+}
+
+/// Like [`start_mock_pds`], but with `createAccount` failing when
+/// `fail_create_account` is true (to exercise the `ErrProvisioningFailed`
+/// path).
+async fn start_mock_pds_with_fail(records: RecordMap, fail_create_account: bool) -> SocketAddr {
+    start_mock_pds_with_flags(records, fail_create_account, false).await
+}
+
+/// Like [`start_mock_pds`], but with `createSession` failing when
+/// `fail_create_session` is true (to exercise the `ErrPermissionDenied` path
+/// for a failed app-password login).
+async fn start_mock_pds_with_fail_session(
+    records: RecordMap,
+    fail_create_session: bool,
+) -> SocketAddr {
+    start_mock_pds_with_flags(records, false, fail_create_session).await
+}
+
+/// Start a mock PDS with configurable `createAccount` / `createSession`
+/// failure flags.
+async fn start_mock_pds_with_flags(
+    records: RecordMap,
+    fail_create_account: bool,
+    fail_create_session: bool,
+) -> SocketAddr {
     let state = PdsState {
         records,
         heads: Arc::new(Mutex::new(HashMap::new())),
+        fail_create_account: Arc::new(std::sync::atomic::AtomicBool::new(fail_create_account)),
+        fail_create_session: Arc::new(std::sync::atomic::AtomicBool::new(fail_create_session)),
     };
     let app = axum::Router::new()
         .route(
@@ -1322,6 +1395,417 @@ async fn unprovisioned_account_is_repaired_not_offboarded() {
         .expect("store get")
         .expect("creds present");
     assert!(creds.provisioned, "account must be marked provisioned after repair");
+}
+
+// ─── 5b. createArbiter (new-account provisioning) ────────────────────────────
+
+/// Stand up a server whose `default_pds` points at a mock PDS, with a caller
+/// account holding a signing key, and return the router address + caller
+/// keypair/DID + the live state + the mock PDS record map.
+async fn create_arbiter_setup() -> (SocketAddr, KeyData, String, Arc<AppState>, RecordMap) {
+    let (caller_priv, caller_pub) = pds_keypair();
+    let pub_did_key = caller_pub.to_string();
+    let multibase = pub_did_key
+        .strip_prefix("did:key:")
+        .expect("pub key is did:key: prefixed")
+        .to_string();
+
+    let caller_did = unique_did("caller");
+    let records = Arc::new(Mutex::new(HashMap::new()));
+    let pds_addr = start_mock_pds(records.clone()).await;
+    let pds_url = format!("http://{pds_addr}");
+
+    let mut docs = HashMap::new();
+    docs.insert(
+        caller_did.clone(),
+        did_doc(&caller_did, &pds_url, Some(&multibase)),
+    );
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(MockResolver { docs });
+    let state = make_state_with_provisioning(resolver, pds_url, Some("test-invite".to_string()));
+
+    let app = handlers::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind router");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (addr, caller_priv, caller_did, state, records)
+}
+
+/// Mint a caller JWT bound to `createArbiter` for the given caller (issuer).
+fn create_arbiter_jwt(caller_priv: &KeyData, caller_did: &str) -> String {
+    mint_service_auth(
+        caller_priv,
+        caller_did,
+        SERVER_DID,
+        "town.muni.arbiter.createArbiter",
+        now_secs() + 60,
+    )
+}
+
+#[tokio::test]
+async fn create_arbiter_provisions_account_and_stays_offline() {
+    let (addr, caller_priv, caller_did, state, records) = create_arbiter_setup().await;
+    let jwt = create_arbiter_jwt(&caller_priv, &caller_did);
+
+    let url = format!("http://{addr}/xrpc/town.muni.arbiter.createArbiter");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .expect("createArbiter request");
+    assert_eq!(resp.status(), StatusCode::OK, "createArbiter should succeed");
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(
+        body.get("did").and_then(|v| v.as_str()),
+        Some("did:plc:mockpds"),
+        "createArbiter must return the created account's DID"
+    );
+
+    // The mock PDS returns a fixed DID for every created account; the server
+    // must have persisted credentials for it, marked provisioned (bootstrap
+    // records written).
+    let created_did = "did:plc:mockpds";
+    let creds = state
+        .store
+        .get(created_did)
+        .await
+        .expect("store get")
+        .expect("credentials persisted for created account");
+    assert!(creds.provisioned, "account must be marked provisioned");
+    assert_eq!(
+        creds.recovery_admin, caller_did,
+        "recovery admin must be the creating caller"
+    );
+
+    // The service + recovery bootstrap records must have been written to the
+    // new account's repo on the mock PDS.
+    let svc = records
+        .lock()
+        .await
+        .get(&(
+            created_did.to_string(),
+            SERVICE_COLLECTION.to_string(),
+            SERVICE_RKEY.to_string(),
+        ))
+        .cloned();
+    assert_eq!(
+        svc.and_then(|v| v.get("did").and_then(|d| d.as_str()).map(String::from)),
+        Some(SERVER_DID.to_string()),
+        "service record must point at this server"
+    );
+    let recovery = records
+        .lock()
+        .await
+        .get(&(
+            created_did.to_string(),
+            "town.muni.arbiter.recovery".to_string(),
+            "self".to_string(),
+        ))
+        .cloned();
+    assert_eq!(
+        recovery.and_then(|v| v.get("did").and_then(|d| d.as_str()).map(String::from)),
+        Some(caller_did.clone()),
+        "recovery record must designate the creating caller"
+    );
+
+    // No policy record is written and the arbiter is NOT brought online: it
+    // stays offline (fail-closed) until resetPolicy installs the first policy.
+    let root = records
+        .lock()
+        .await
+        .get(&(
+            created_did.to_string(),
+            ROOT_COLLECTION.to_string(),
+            ROOT_RKEY.to_string(),
+        ))
+        .cloned();
+    assert!(root.is_none(), "no policy record may be written by createArbiter");
+}
+
+#[tokio::test]
+async fn create_arbiter_returns_provisioning_failed_on_pds_error() {
+    // A mock PDS whose createAccount fails must surface the lexicon's
+    // `ErrProvisioningFailed` error (not a generic 500), so clients can
+    // distinguish a provisioning failure from other server errors.
+    let (caller_priv, caller_pub) = pds_keypair();
+    let multibase = caller_pub
+        .to_string()
+        .strip_prefix("did:key:")
+        .expect("pub key is did:key: prefixed")
+        .to_string();
+    let caller_did = unique_did("caller");
+    let records = Arc::new(Mutex::new(HashMap::new()));
+    let pds_addr = start_mock_pds_with_fail(records, true).await;
+    let pds_url = format!("http://{pds_addr}");
+
+    let mut docs = HashMap::new();
+    docs.insert(
+        caller_did.clone(),
+        did_doc(&caller_did, &pds_url, Some(&multibase)),
+    );
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(MockResolver { docs });
+    let state = make_state_with_provisioning(resolver, pds_url, Some("test-invite".to_string()));
+    let app = handlers::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind router");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let jwt = create_arbiter_jwt(&caller_priv, &caller_did);
+    let url = format!("http://{addr}/xrpc/town.muni.arbiter.createArbiter");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .expect("createArbiter request");
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "provisioning failure must be a 500"
+    );
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(
+        body.get("error").and_then(|v| v.as_str()),
+        Some("ErrProvisioningFailed"),
+        "error code must match the lexicon's ErrProvisioningFailed"
+    );
+    assert!(
+        body.get("message")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| m.contains("createAccount")),
+        "error message should carry the createAccount detail"
+    );
+}
+
+// ─── 5c. createAppPasswordArbiter (import existing account) ────────────────
+
+/// Stand up a server with a mock PDS and a caller account holding a signing
+/// key, and return the router address + caller keypair/DID + the live state +
+/// the mock PDS record map. `arbiter_did` is the account to import; its DID
+/// doc points at the mock PDS.
+async fn create_app_password_setup(
+    arbiter_did: &str,
+) -> (SocketAddr, KeyData, String, Arc<AppState>, RecordMap) {
+    let (caller_priv, caller_pub) = pds_keypair();
+    let multibase = caller_pub
+        .to_string()
+        .strip_prefix("did:key:")
+        .expect("pub key is did:key: prefixed")
+        .to_string();
+    let caller_did = unique_did("caller");
+    let records = Arc::new(Mutex::new(HashMap::new()));
+    let pds_addr = start_mock_pds(records.clone()).await;
+    let pds_url = format!("http://{pds_addr}");
+
+    let mut docs = HashMap::new();
+    docs.insert(
+        caller_did.clone(),
+        did_doc(&caller_did, &pds_url, Some(&multibase)),
+    );
+    docs.insert(
+        arbiter_did.to_string(),
+        did_doc(arbiter_did, &pds_url, None),
+    );
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(MockResolver { docs });
+    let state = make_state(resolver);
+
+    let app = handlers::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind router");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (addr, caller_priv, caller_did, state, records)
+}
+
+/// Mint a caller JWT bound to `createAppPasswordArbiter` for the given caller.
+fn create_app_password_jwt(caller_priv: &KeyData, caller_did: &str) -> String {
+    mint_service_auth(
+        caller_priv,
+        caller_did,
+        SERVER_DID,
+        "town.muni.arbiter.createAppPasswordArbiter",
+        now_secs() + 60,
+    )
+}
+
+#[tokio::test]
+async fn create_app_password_arbiter_imports_and_stays_offline() {
+    let arbiter_did = unique_did("import");
+    let (addr, caller_priv, caller_did, state, records) =
+        create_app_password_setup(&arbiter_did).await;
+    let jwt = create_app_password_jwt(&caller_priv, &caller_did);
+
+    let url = format!("http://{addr}/xrpc/town.muni.arbiter.createAppPasswordArbiter");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&jwt)
+        .json(&json!({ "arbiterDid": arbiter_did, "appPassword": "app-pw" }))
+        .send()
+        .await
+        .expect("createAppPasswordArbiter request");
+    assert_eq!(resp.status(), StatusCode::OK, "import should succeed");
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body, json!({ "ok": true }));
+
+    // Credentials persisted, marked provisioned, recovery admin = caller.
+    let creds = state
+        .store
+        .get(&arbiter_did)
+        .await
+        .expect("store get")
+        .expect("credentials persisted for imported account");
+    assert!(creds.provisioned, "account must be marked provisioned");
+    assert_eq!(creds.recovery_admin, caller_did);
+
+    // Service + recovery records written to the imported account's repo.
+    let svc = records
+        .lock()
+        .await
+        .get(&(
+            arbiter_did.clone(),
+            SERVICE_COLLECTION.to_string(),
+            SERVICE_RKEY.to_string(),
+        ))
+        .cloned();
+    assert_eq!(
+        svc.and_then(|v| v.get("did").and_then(|d| d.as_str()).map(String::from)),
+        Some(SERVER_DID.to_string()),
+        "service record must point at this server"
+    );
+    let recovery = records
+        .lock()
+        .await
+        .get(&(
+            arbiter_did.clone(),
+            "town.muni.arbiter.recovery".to_string(),
+            "self".to_string(),
+        ))
+        .cloned();
+    assert_eq!(
+        recovery.and_then(|v| v.get("did").and_then(|d| d.as_str()).map(String::from)),
+        Some(caller_did.clone()),
+        "recovery record must designate the importing caller"
+    );
+
+    // No policy record is written; the arbiter stays offline until resetPolicy.
+    let root = records
+        .lock()
+        .await
+        .get(&(
+            arbiter_did.clone(),
+            ROOT_COLLECTION.to_string(),
+            ROOT_RKEY.to_string(),
+        ))
+        .cloned();
+    assert!(root.is_none(), "no policy record may be written by import");
+}
+
+#[tokio::test]
+async fn create_app_password_arbiter_rejects_duplicate() {
+    let arbiter_did = unique_did("import");
+    let (addr, caller_priv, caller_did, state, _records) =
+        create_app_password_setup(&arbiter_did).await;
+    // Pre-seed credentials so the arbiter already exists on this server.
+    state
+        .store
+        .store(
+            arbiter_did.clone(),
+            test_creds("existing-pw"),
+        )
+        .await
+        .expect("store creds");
+    let jwt = create_app_password_jwt(&caller_priv, &caller_did);
+
+    let url = format!("http://{addr}/xrpc/town.muni.arbiter.createAppPasswordArbiter");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&jwt)
+        .json(&json!({ "arbiterDid": arbiter_did, "appPassword": "app-pw" }))
+        .send()
+        .await
+        .expect("createAppPasswordArbiter request");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "duplicate import must be a 409"
+    );
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(
+        body.get("error").and_then(|v| v.as_str()),
+        Some("ErrArbiterAlreadyExists"),
+        "error code must match the lexicon's ErrArbiterAlreadyExists"
+    );
+}
+
+#[tokio::test]
+async fn create_app_password_arbiter_denies_bad_app_password() {
+    // A mock PDS whose createSession fails (bad app password) must surface the
+    // lexicon's `ErrPermissionDenied` error.
+    let arbiter_did = unique_did("import");
+    let (caller_priv, caller_pub) = pds_keypair();
+    let multibase = caller_pub
+        .to_string()
+        .strip_prefix("did:key:")
+        .expect("pub key is did:key: prefixed")
+        .to_string();
+    let caller_did = unique_did("caller");
+    let records = Arc::new(Mutex::new(HashMap::new()));
+    let pds_addr = start_mock_pds_with_fail_session(records, true).await;
+    let pds_url = format!("http://{pds_addr}");
+
+    let mut docs = HashMap::new();
+    docs.insert(
+        caller_did.clone(),
+        did_doc(&caller_did, &pds_url, Some(&multibase)),
+    );
+    docs.insert(
+        arbiter_did.clone(),
+        did_doc(&arbiter_did, &pds_url, None),
+    );
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(MockResolver { docs });
+    let state = make_state(resolver);
+    let app = handlers::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind router");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let jwt = create_app_password_jwt(&caller_priv, &caller_did);
+    let url = format!("http://{addr}/xrpc/town.muni.arbiter.createAppPasswordArbiter");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&jwt)
+        .json(&json!({ "arbiterDid": arbiter_did, "appPassword": "wrong-pw" }))
+        .send()
+        .await
+        .expect("createAppPasswordArbiter request");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "bad app password must be forbidden"
+    );
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(
+        body.get("error").and_then(|v| v.as_str()),
+        Some("ErrPermissionDenied"),
+        "error code must match the lexicon's ErrPermissionDenied"
+    );
 }
 
 // ─── 6. resetPolicy (recovery admin) ────────────────────────────────────────

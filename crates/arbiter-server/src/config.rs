@@ -59,13 +59,25 @@ pub struct ServerConfig {
     pub db_file: String,
 
     /// Handle domain suffix for newly created stewarded accounts
-    /// (e.g. `.muni.town` → handle `arbiter-<random>.muni.town`).
+    /// (e.g. `.example.com` → handle `<random-base32>.example.com`).
     #[arg(
         long = "handle-suffix",
         env = "HANDLE_SUFFIX",
-        default_value = ".muni.town"
+        default_value = ".example.com"
     )]
     pub handle_suffix: String,
+
+    /// Email domain for newly created stewarded accounts. The reference PDS
+    /// requires an email on `com.atproto.server.createAccount`, so each new
+    /// account is given `<random-base32>@<domain>` (the same local label as
+    /// its handle). These are synthetic addresses; the PDS only needs them to
+    /// be valid + unique, not deliverable.
+    #[arg(
+        long = "steward-email-domain",
+        env = "STEWARD_EMAIL_DOMAIN",
+        default_value = "example.com"
+    )]
+    pub steward_email_domain: String,
 
     /// Max `createArbiter` calls allowed per caller per window. Set to 0 to
     /// disallow account creation entirely. This is deliberately aggressive by

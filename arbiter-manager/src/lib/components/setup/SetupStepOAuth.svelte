@@ -8,7 +8,7 @@
   async function proceedWithLogin() {
     const handle = handleInput.trim();
     if (!handle && auth.profile) {
-      setupState.step = 'app-password';
+      setupState.step = 'choose';
       setupState.error = undefined;
       setupState.loading = false;
       return;

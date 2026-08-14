@@ -31,9 +31,15 @@ pub static CONFIG: LazyLock<ServerConfig> = LazyLock::new(ServerConfig::parse);
 /// Shared server state handed to every request handler.
 ///
 /// `resolver` is injected (rather than using the static `RESOLVER`) so that
-/// tests can substitute a mock identity resolver.
+/// tests can substitute a mock identity resolver. `default_pds` and
+/// `invite_code` are injected (rather than read from the static `CONFIG`) so
+/// that tests can point provisioning at a mock PDS.
 pub struct AppState {
     pub arbiters: state::ArbiterCollection,
     pub store: Box<dyn credstore::CredentialStore>,
     pub resolver: Arc<dyn IdentityResolver>,
+    /// Default PDS URL to create new stewarded accounts against.
+    pub default_pds: String,
+    /// Invite code used to create new stewarded PDS accounts.
+    pub invite_code: Option<String>,
 }

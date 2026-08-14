@@ -37,6 +37,11 @@ pub struct PdsCredentials {
 #[async_trait]
 pub trait CredentialStore: Send + Sync {
     async fn store(&self, did: String, creds: PdsCredentials) -> Result<()>;
+    /// Insert credentials only if no row exists for `did`. Returns `true` if
+    /// the row was inserted, `false` if a row already existed (no-op). Used to
+    /// enforce the `ErrArbiterAlreadyExists` contract atomically against
+    /// concurrent imports.
+    async fn store_if_absent(&self, did: String, creds: PdsCredentials) -> Result<bool>;
     async fn get(&self, did: &str) -> Result<Option<PdsCredentials>>;
     async fn remove(&self, did: &str) -> Result<()>;
     async fn list(&self) -> Result<Vec<(String, PdsCredentials)>>;

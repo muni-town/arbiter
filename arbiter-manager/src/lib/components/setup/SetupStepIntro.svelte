@@ -15,7 +15,8 @@
     </h2>
     <p class="text-base text-base-600 dark:text-base-400 max-w-lg mx-auto">
       A community account is an AT Protocol account that's managed by your organization. This wizard
-      will guide you through setting up your PDS, authorizing an arbiter, and granting admin access.
+      will guide you through creating a new account or importing an existing one, authorizing an
+      arbiter, and granting admin access.
     </p>
 
     <Alert type="warning">

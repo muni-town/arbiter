@@ -162,7 +162,9 @@ The only built-in XRPCs are for creating arbiters. Two paths:
 3. Writes the initial `town.muni.arbiter.service/self` and
    `town.muni.arbiter.recovery/self` records (see §7) to the new account's
    repo using the credentials it just stored.
-4. Loads the (default/empty) policies and brings the arbiter online.
+4. Does **not** write any policy and does **not** bring the arbiter online:
+   it stays offline (fail-closed) until the recovery admin installs the first
+   policy via `town.muni.arbiter.resetPolicy` (see §7).
 
 Config required: default PDS URL, invite code(s).
 
@@ -186,6 +188,12 @@ authenticate to the stewarded account's PDS writes the
 `town.muni.arbiter.policy.*` records directly (bypassing the arbiter), and the
 arbiter picks up the change via Jetstream. There is **no server-enforced reset
 XRPC** in this phase — an arbiter-side escape hatch is future work.
+
+> **Update:** a server-enforced `town.muni.arbiter.resetPolicy` XRPC has since
+> landed (recovery admin only, optimistic-concurrency guarded). It is the
+> path that installs the first policy on a freshly provisioned account and
+> recovers a locked-out one. The direct-PDS-access path above remains as a
+> fallback for imported accounts whose holder retains PDS access.
 
 The recovery-admin DID is still designated in a PDS record
 (`town.muni.arbiter.recovery/self`), written at bootstrap (creator for new

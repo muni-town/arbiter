@@ -4,15 +4,19 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Provision a brand-new stewarded PDS account and bring its arbiter online.\n\nThe caller authenticates via serviceAuth (aud = arbiter-server DID,\nlxm = town.muni.arbiter.createArbiter). The server creates a new account\non the configured default PDS using an invite code + random password,\nstores the credentials, writes the service + recovery records from the\nnew account's session, and loads the (default/empty) policies.",
+      "description": "Provision a brand-new stewarded PDS account.\n\nThe caller authenticates via serviceAuth (aud = arbiter-server DID,\nlxm = town.muni.arbiter.createArbiter). The server creates a new account\non the configured default PDS using an invite code + random password,\nstores the credentials, and writes the service + recovery records from the\nnew account's session. No policy is written: the arbiter stays offline\n(fail-closed) until the recovery admin installs the first policy via\n`town.muni.arbiter.resetPolicy`.",
       "output": {
         "encoding": "application/json",
         "schema": {
           "type": "object",
           "properties": {
-            "ok": { "type": "boolean" }
+            "did": {
+              "type": "string",
+              "format": "did",
+              "description": "The DID of the newly created stewarded account."
+            }
           },
-          "required": ["ok"]
+          "required": ["did"]
         }
       },
       "errors": [

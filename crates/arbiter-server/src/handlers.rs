@@ -259,16 +259,16 @@ async fn reset_policy(state: &AppState, caller: &str, body: &Bytes) -> Result<Re
     let admin = policy::recovery_admin(state, &body.arbiter_did)
         .await
         .map_err(AppError::from)?
-        .ok_or_else(|| AppError::Forbidden("no recovery admin is set".to_string()))?;
+        .ok_or_else(|| AppError::PermissionDenied("no recovery admin is set".to_string()))?;
     if caller != admin {
-        return Err(AppError::Forbidden(format!(
+        return Err(AppError::PermissionDenied(format!(
             "caller `{caller}` is not the designated recovery admin `{admin}`"
         )));
     }
 
     // Validate the replacement policy before writing it.
     policy::compile_root(&body.policy).map_err(|e| {
-        AppError::BadRequest(format!("replacement policy failed to compile: {e:#}"))
+        AppError::InvalidPolicy(format!("replacement policy failed to compile: {e:#}"))
     })?;
 
     // Resolve the steward's PDS + credentials, then overwrite the root policy
@@ -369,7 +369,7 @@ static CREATE_ARBITER_COUNTS: LazyLock<moka::future::Cache<String, u64>> = LazyL
 async fn check_create_arbiter_rate(caller: &str) -> Result<(), AppError> {
     let limit = CONFIG.create_arbiter_rate_limit;
     if limit == 0 {
-        return Err(AppError::Forbidden(
+        return Err(AppError::PermissionDenied(
             "createArbiter is disabled (CREATE_ARBITER_RATE_LIMIT=0)".into(),
         ));
     }
@@ -378,7 +378,7 @@ async fn check_create_arbiter_rate(caller: &str) -> Result<(), AppError> {
         .await
         .unwrap_or(0);
     if count >= limit {
-        return Err(AppError::Forbidden(format!(
+        return Err(AppError::PermissionDenied(format!(
             "createArbiter rate limit exceeded ({limit} per {}s)",
             CONFIG.create_arbiter_rate_window_secs
         )));
@@ -403,10 +403,14 @@ async fn check_create_arbiter_rate(caller: &str) -> Result<(), AppError> {
 async fn create_arbiter(state: &AppState, caller: &str) -> Result<Response, AppError> {
     check_create_arbiter_rate(caller).await?;
 
-    let pds_url = CONFIG.default_pds.clone();
+    let pds_url = state.default_pds.clone();
     let password = random_secret(24);
-    let handle =
-        random_handle().map_err(|e| AppError::Other(anyhow::anyhow!("invalid handle: {e}")))?;
+    let local_label = random_local_label();
+    let handle = Handle::new(format!("{local_label}{}", CONFIG.handle_suffix))
+        .map_err(|e| AppError::Other(anyhow::anyhow!("invalid handle: {e}")))?;
+    // The reference PDS requires an email on createAccount; use a synthetic
+    // address sharing the handle's random local label so it is valid + unique.
+    let email = format!("{local_label}@{}", CONFIG.steward_email_domain);
 
     let provisioning = Agent::new(CredentialSession::new(
         time_bound_reqwest(&pds_url),
@@ -419,9 +423,9 @@ async fn create_arbiter(state: &AppState, caller: &str) -> Result<Response, AppE
         .server
         .create_account(
             create_account::InputData {
-                email: None,
+                email: Some(email),
                 handle,
-                invite_code: CONFIG.invite_code.clone(),
+                invite_code: state.invite_code.clone(),
                 password: Some(password.clone()),
                 did: None,
                 plc_op: None,
@@ -432,7 +436,7 @@ async fn create_arbiter(state: &AppState, caller: &str) -> Result<Response, AppE
             .into(),
         )
         .await
-        .map_err(|e| AppError::Other(anyhow::anyhow!("createAccount: {e}")))?;
+        .map_err(|e| AppError::ProvisioningFailed(format!("createAccount: {e}")))?;
 
     let new_did = account.data.did.as_str().to_string();
 
@@ -452,8 +456,15 @@ async fn create_arbiter(state: &AppState, caller: &str) -> Result<Response, AppE
         .await
         .map_err(AppError::from)?;
 
-    let writer = login_session(&new_did, &password, &pds_url).await?;
-    write_service_and_recovery(&writer, &new_did, caller).await?;
+    // The account was just created with the password we generated, so any
+    // login failure (including a 401) is a provisioning problem, not a caller
+    // permission issue.
+    let writer = login_session(&new_did, &password, &pds_url)
+        .await
+        .map_err(|e| AppError::ProvisioningFailed(format!("login after createAccount: {e}")))?;
+    write_service_and_recovery(&writer, &new_did, caller)
+        .await
+        .map_err(|e| AppError::ProvisioningFailed(format!("bootstrap record write: {e}")))?;
 
     // Bootstrap records written; the account is now fully provisioned.
     state
@@ -462,7 +473,10 @@ async fn create_arbiter(state: &AppState, caller: &str) -> Result<Response, AppE
         .await
         .map_err(AppError::from)?;
 
-    Ok(ok_response())
+    // Return the created account's DID so the caller can identify and manage
+    // it (the server generated the handle/DID, so the caller has no other way
+    // to learn it). The HTTP 200 status signals success.
+    Ok((StatusCode::OK, Json(json!({ "did": new_did }))).into_response())
 }
 
 /// Import an existing account (`town.muni.arbiter.createAppPasswordArbiter`).
@@ -486,39 +500,82 @@ async fn create_app_password_arbiter(
     body: &Bytes,
 ) -> Result<Response, AppError> {
     let body_json: Value = serde_json::from_slice(body)
-        .map_err(|e| AppError::Other(anyhow::anyhow!("invalid json body: {e}")))?;
+        .map_err(|e| AppError::BadRequest(format!("invalid json body: {e}")))?;
     let arbiter_did = body_json
         .get("arbiterDid")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Other(anyhow::anyhow!("missing arbiterDid")))?
+        .ok_or_else(|| AppError::BadRequest("missing arbiterDid".to_string()))?
         .to_string();
     let app_password = body_json
         .get("appPassword")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Other(anyhow::anyhow!("missing appPassword")))?
+        .ok_or_else(|| AppError::BadRequest("missing appPassword".to_string()))?
         .to_string();
+
     let pds_endpoint = state.resolver.resolve_pds_endpoint(&arbiter_did).await?;
 
     // Authenticating as the account proves control (app password) and is what
-    // authorizes stewardship takeover.
+    // authorizes stewardship takeover. `login_session` classifies the failure:
+    // a 401 (bad app password) -> ErrPermissionDenied; a transport error ->
+    // ErrProvisioningFailed.
     let writer = login_session(&arbiter_did, &app_password, &pds_endpoint).await?;
 
     // Persist credentials first so startup onboarding can repair the bootstrap
-    // records if a write below fails (`provisioned = false`).
-    state
+    // records if a write below fails (`provisioned = false`). The insert is
+    // atomic against concurrent imports: if a row already exists, the insert is
+    // a no-op. A fully-provisioned row means the arbiter is already stewarded
+    // -> reject the duplicate. A `provisioned = false` row means a previous
+    // attempt inserted credentials but failed before the bootstrap records
+    // landed; treat that as a retry and proceed with the writes (the account
+    // is not yet stewarded, so re-importing is safe and idempotent).
+    let inserted = state
         .store
-        .store(
+        .store_if_absent(
             arbiter_did.clone(),
             PdsCredentials {
-                password: app_password,
+                password: app_password.clone(),
                 recovery_admin: caller.to_string(),
                 provisioned: false,
             },
         )
         .await
         .map_err(AppError::from)?;
+    if !inserted {
+        let existing = state
+            .store
+            .get(&arbiter_did)
+            .await
+            .map_err(AppError::from)?
+            .ok_or_else(|| {
+                AppError::Other(anyhow::anyhow!(
+                    "store_if_absent reported a conflict but no row exists for `{arbiter_did}`"
+                ))
+            })?;
+        if existing.provisioned {
+            return Err(AppError::ArbiterAlreadyExists(format!(
+                "an arbiter for `{arbiter_did}` already exists on this server"
+            )));
+        }
+        // Partial-failure retry: overwrite the stale credentials with the
+        // current caller/password and proceed to (re)write the bootstrap
+        // records.
+        state
+            .store
+            .store(
+                arbiter_did.clone(),
+                PdsCredentials {
+                    password: app_password,
+                    recovery_admin: caller.to_string(),
+                    provisioned: false,
+                },
+            )
+            .await
+            .map_err(AppError::from)?;
+    }
 
-    write_service_and_recovery(&writer, &arbiter_did, caller).await?;
+    write_service_and_recovery(&writer, &arbiter_did, caller)
+        .await
+        .map_err(|e| AppError::ProvisioningFailed(format!("bootstrap record write: {e}")))?;
 
     // Bootstrap records written; the account is now fully provisioned.
     state
@@ -532,6 +589,13 @@ async fn create_app_password_arbiter(
 
 /// Log in as `did`/`password` against `pds_url` and wrap the session in an
 /// `Agent` for typed record writes.
+///
+/// Login failures are classified: an authentication failure (the PDS rejected
+/// the credentials, HTTP 401) maps to [`AppError::PermissionDenied`], while a
+/// transport error (PDS unreachable, timeout, 5xx) maps to
+/// [`AppError::ProvisioningFailed`]. Callers that only ever expect a reachable
+/// PDS (e.g. the create path, which just created the account) can treat any
+/// error as provisioning failure.
 async fn login_session(did: &str, password: &str, pds_url: &str) -> Result<SessionAgent, AppError> {
     let session = CredentialSession::new(
         time_bound_reqwest(pds_url),
@@ -540,8 +604,31 @@ async fn login_session(did: &str, password: &str, pds_url: &str) -> Result<Sessi
     session
         .login(did, password)
         .await
-        .map_err(|e| AppError::Other(anyhow::anyhow!("login {did}: {e}")))?;
+        .map_err(|e| classify_login_error(did, e))?;
     Ok(Agent::new(session))
+}
+
+/// Classify a `CredentialSession::login` error into an [`AppError`].
+///
+/// An authentication failure — an `XrpcResponse` with a 401 status, or an
+/// `Error::Authentication` (atrium surfaces a `WWW-Authenticate`-carrying 401
+/// as this variant) — means the PDS rejected the credentials (bad app password
+/// / account takedown). Anything else (transport, timeout, 5xx, malformed
+/// response) is a provisioning failure, not a credential problem.
+fn classify_login_error(
+    did: &str,
+    e: atrium_xrpc::Error<atrium_api::com::atproto::server::create_session::Error>,
+) -> AppError {
+    use atrium_xrpc::Error as XrpcError;
+    match &e {
+        XrpcError::XrpcResponse(resp) if resp.status == StatusCode::UNAUTHORIZED => {
+            AppError::PermissionDenied(format!("login as `{did}` rejected: {e}"))
+        }
+        XrpcError::Authentication(_) => {
+            AppError::PermissionDenied(format!("login as `{did}` rejected: {e}"))
+        }
+        _ => AppError::ProvisioningFailed(format!("login as `{did}` failed: {e}")),
+    }
 }
 
 /// Total timeout for provisioning / policy-write HTTP requests (createAccount,
@@ -760,22 +847,14 @@ fn random_secret(len: usize) -> String {
     encoded.chars().take(len).collect()
 }
 
-/// A random valid handle using the configured suffix (`<base32><suffix>`).
-///
-/// The local label is a cryptographically random value (CSPRNG) base32-encoded
-/// (RFC 4648, no padding, lowercased). Base32 uses only `[a-z2-7]`, a strict
-/// subset of the characters permitted in a handle label, and lowercase matches
-/// the ecosystem's handle normalization (some PDSes lowercase handles on
-/// registration), so the created account's handle equals the generated value.
-/// 8 bytes of entropy → 13 base32 chars. The trailing suffix supplies the TLD,
-/// which must start with a letter.
-fn random_handle() -> Result<Handle, &'static str> {
+/// A cryptographically random handle local label: 8 bytes of entropy base32-
+/// encoded (RFC 4648, no padding, lowercased) → 13 chars from `[a-z2-7]`.
+fn random_local_label() -> String {
     use data_encoding::BASE32_NOPAD;
     let mut bytes = [0u8; 8];
     rand::rng().fill_bytes(&mut bytes);
     // Encode (uppercase `[A-Z2-7]`), then lowercase to match the ecosystem's
     // handle normalization. `data-encoding` has no lowercase base32 output
     // encoding constant.
-    let encoded = BASE32_NOPAD.encode(&bytes).to_ascii_lowercase();
-    Handle::new(format!("{encoded}{}", CONFIG.handle_suffix))
+    BASE32_NOPAD.encode(&bytes).to_ascii_lowercase()
 }

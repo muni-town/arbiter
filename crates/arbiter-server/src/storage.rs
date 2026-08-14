@@ -39,6 +39,11 @@ const UPSERT_SQL: &str = "INSERT INTO arbiter_credentials (did, password, recove
        recovery_admin = excluded.recovery_admin,\n\
        provisioned = excluded.provisioned";
 
+/// Insert a credential row only if no row exists for the DID.
+const INSERT_IF_ABSENT_SQL: &str = "INSERT INTO arbiter_credentials (did, password, recovery_admin, provisioned)\
+     VALUES (?, ?, ?, ?)\
+     ON CONFLICT(did) DO NOTHING";
+
 /// Mark an account as fully provisioned (bootstrap records written).
 const MARK_PROVISIONED_SQL: &str =
     "UPDATE arbiter_credentials SET provisioned = 1 WHERE did = ?";
@@ -108,6 +113,23 @@ impl CredentialStore for TursoCredentialStore {
         .await
         .context("failed to store credentials")?;
         Ok(())
+    }
+
+    async fn store_if_absent(&self, did: String, creds: PdsCredentials) -> Result<bool> {
+        let conn = self.conn().await?;
+        let affected = conn
+            .execute(
+                INSERT_IF_ABSENT_SQL,
+                turso::params![
+                    did,
+                    creds.password,
+                    creds.recovery_admin,
+                    creds.provisioned as i64
+                ],
+            )
+            .await
+            .context("failed to insert credentials if absent")?;
+        Ok(affected > 0)
     }
 
     async fn get(&self, did: &str) -> Result<Option<PdsCredentials>> {

@@ -33,6 +33,8 @@ async fn main() -> anyhow::Result<()> {
         arbiters: ArbiterCollection::new(),
         store,
         resolver: RESOLVER.clone(),
+        default_pds: CONFIG.default_pds.clone(),
+        invite_code: CONFIG.invite_code.clone(),
     });
 
     // Load + onboard every known arbiter (fail-closed per arbiter; un-onboarded

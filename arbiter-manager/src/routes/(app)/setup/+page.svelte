@@ -5,12 +5,20 @@
   import { resetSetupState, setupState } from '$lib/setupState.svelte';
   import SetupStepIntro from '$lib/components/setup/SetupStepIntro.svelte';
   import SetupStepOAuth from '$lib/components/setup/SetupStepOAuth.svelte';
+  import SetupStepChoose from '$lib/components/setup/SetupStepChoose.svelte';
   import SetupStepAppPassword from '$lib/components/setup/SetupStepAppPassword.svelte';
   import SetupStepSelectAdmin from '$lib/components/setup/SetupStepSelectAdmin.svelte';
+  import SetupStepCreate from '$lib/components/setup/SetupStepCreate.svelte';
   import SetupStepComplete from '$lib/components/setup/SetupStepComplete.svelte';
 
   let step = $derived(setupState.step);
   let showFullReset = $state(false);
+
+  // The ordered steps for each mode. The create flow skips app-password and
+  // select-admin, so the stepper must not mark them as done.
+  const importSteps = ['intro', 'oauth', 'choose', 'app-password', 'select-admin', 'complete'];
+  const createSteps = ['intro', 'oauth', 'choose', 'create', 'complete'];
+  const steps = $derived(setupState.mode === 'create' ? createSteps : importSteps);
 </script>
 
 <div class="min-h-full flex flex-col">
@@ -19,12 +27,9 @@
     class="px-6 py-4 border-b border-base-100 dark:border-base-800 flex items-center justify-center gap-4"
   >
     <div class="flex items-center gap-2 text-xs font-medium">
-      {#each ['intro', 'oauth', 'app-password', 'select-admin', 'complete'] as s, i}
+      {#each steps as s, i}
         {@const active = step === s}
-        {@const done =
-          ['intro', 'oauth', 'app-password', 'select-admin', 'complete'].indexOf(
-            step,
-          ) > i}
+        {@const done = steps.indexOf(step) > i}
         <div class="flex items-center gap-2">
           <span
             class="w-6 h-6 rounded-full flex items-center justify-center transition-colors
@@ -56,13 +61,17 @@
               ? 'Overview'
               : s === 'oauth'
                 ? 'Sign In'
-                : s === 'app-password'
-                  ? 'App Password'
-                  : s === 'select-admin'
-                      ? 'Admin'
-                      : 'Done'}
+                : s === 'choose'
+                  ? 'Choose'
+                  : s === 'app-password'
+                    ? 'App Password'
+                    : s === 'select-admin'
+                        ? 'Admin'
+                        : s === 'create'
+                          ? 'Create'
+                          : 'Done'}
           </span>
-          {#if i < 5}
+          {#if i < steps.length - 1}
             <span class="w-6 h-px bg-base-300 dark:bg-base-700"></span>
           {/if}
         </div>
@@ -90,10 +99,14 @@
         <SetupStepIntro />
       {:else if step === 'oauth'}
         <SetupStepOAuth />
+      {:else if step === 'choose'}
+        <SetupStepChoose />
       {:else if step === 'app-password'}
         <SetupStepAppPassword />
       {:else if step === 'select-admin'}
         <SetupStepSelectAdmin />
+      {:else if step === 'create'}
+        <SetupStepCreate />
       {:else if step === 'complete'}
         <SetupStepComplete />
       {/if}

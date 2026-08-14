@@ -275,16 +275,22 @@ export const arbiter = {
   // ─── Arbiter provisioning ──────────────────────────────────────────
 
   /**
-   * Provision a brand-new stewarded PDS account and bring its arbiter online.
-   * No input body is needed — the server creates the account. Authenticated
-   * via a serviceAuth token scoped to `town.muni.arbiter.createArbiter`.
+   * Provision a brand-new stewarded PDS account. No input body is needed —
+   * the server creates the account on its configured default PDS and returns
+   * the new account's DID. Authenticated via a serviceAuth token scoped to
+   * `town.muni.arbiter.createArbiter`.
    */
-  async createArbiter(): Promise<void> {
-    await xrpc(PUBLIC_ARBITER_URL, town.muni.arbiter.createArbiter, {
+  async createArbiter(): Promise<string> {
+    const res = await xrpc(PUBLIC_ARBITER_URL, town.muni.arbiter.createArbiter, {
       headers: {
         Authorization: `Bearer ${await this.getServiceAuth('town.muni.arbiter.createArbiter')}`,
       },
     });
+    const did = res.body?.did;
+    if (typeof did !== 'string' || !isDidString(did)) {
+      throw new Error('createArbiter did not return a valid DID');
+    }
+    return did;
   },
 
   /**
