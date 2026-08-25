@@ -33,7 +33,11 @@
             },
             "body": {
               "type": "unknown",
-              "description": "Optional JSON body for the inner request."
+              "description": "Optional body for the inner request. A JSON value is proxied as JSON; the AT Protocol binary marker { \"$bytes\": <base64> } proxies raw bytes (e.g. a blob upload)."
+            },
+            "encoding": {
+              "type": "string",
+              "description": "Optional content-type (encoding) for the inner request body (e.g. image/png). Defaults to application/json."
             }
           },
           "required": ["arbiterDid", "target", "method", "nsid"]

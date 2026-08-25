@@ -129,9 +129,53 @@ struct ProxyBody {
     /// Optional query parameters for the inner request.
     #[serde(default)]
     parameters: Option<Value>,
-    /// Optional JSON body for the inner request.
+    /// Optional body for the inner request.
+    ///
+    /// Either a JSON value (the common case) or the AT Protocol binary marker
+    /// `{ "$bytes": <base64> }` (carrying an arbitrary byte payload, e.g. a
+    /// blob upload). See [`decode_proxy_body`].
     #[serde(default)]
     body: Option<Value>,
+    /// Optional content-type (`encoding`) for the inner request body.
+    #[serde(default)]
+    encoding: Option<String>,
+}
+
+/// The AT Protocol JSON encoding of a binary payload: `{ "$bytes": base64 }`.
+/// Mirrors `@atproto/lex-json`'s `encodeLexBytes` / `parseLexBytes`.
+const BYTES_BODY_KEY: &str = "$bytes";
+
+/// Convert a proxy-envelope body value into the inner request's input.
+///
+/// A `{ "$bytes": <base64> }` object is decoded to raw bytes (so blob uploads
+/// pass through the policy machine untouched); any other value is forwarded as
+/// JSON data. Both padded and unpadded base64 are accepted.
+fn decode_proxy_body(body: Value) -> Result<InputDataOrBytes<Value>, AppError> {
+    use base64::Engine;
+    let bytes = body.as_object().and_then(|obj| {
+        if obj.len() == 1 {
+            obj.get(BYTES_BODY_KEY)
+        } else {
+            None
+        }
+    });
+    match bytes {
+        Some(Value::String(b64)) => {
+            // Accept both padded and unpadded base64 (the client's
+            // `encodeLexBytes` emits unpadded, but a padded form is valid too),
+            // mirroring the AT `$bytes` convention.
+            let engine = base64::engine::general_purpose::GeneralPurpose::new(
+                &base64::alphabet::STANDARD,
+                base64::engine::general_purpose::GeneralPurposeConfig::new()
+                    .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+            );
+            let raw = engine.decode(b64).map_err(|e| {
+                AppError::BadRequest(format!("invalid base64 in `$bytes` body: {e}"))
+            })?;
+            Ok(InputDataOrBytes::Bytes(raw))
+        }
+        _ => Ok(InputDataOrBytes::Data(body)),
+    }
 }
 
 /// Maximum number of remote XRPC calls a single policy evaluation may issue
@@ -178,12 +222,24 @@ async fn proxy_request(state: &AppState, caller: &str, body: &Bytes) -> Result<R
         .method
         .parse()
         .map_err(|_| AppError::BadRequest(format!("invalid method `{}`", proxy.method)))?;
+    let input = proxy
+        .body
+        .map(decode_proxy_body)
+        .transpose()?;
+    // JSON bodies default to `application/json` (the historical behavior); the
+    // prior code always sent `application/json` even with no body. A raw-bytes
+    // body carries the caller-supplied `encoding` (e.g. image/png).
+    let encoding = match (&input, proxy.encoding.as_deref()) {
+        (_, Some(enc)) => Some(enc.to_string()),
+        (Some(InputDataOrBytes::Bytes(_)), None) => None,
+        _ => Some("application/json".to_string()),
+    };
     let req = XrpcRequest {
         method,
         nsid: proxy.nsid,
         parameters: proxy.parameters,
-        input: proxy.body.map(InputDataOrBytes::Data),
-        encoding: Some("application/json".to_string()),
+        input,
+        encoding,
     };
 
     let ctx = RequestCtx {
@@ -857,4 +913,75 @@ fn random_local_label() -> String {
     // handle normalization. `data-encoding` has no lowercase base32 output
     // encoding constant.
     BASE32_NOPAD.encode(&bytes).to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atrium_xrpc::InputDataOrBytes;
+
+    /// A `{ "$bytes": <base64> }` body decodes to raw bytes (blob upload).
+    ///
+    /// The payload is deliberately *not* a multiple of 3 bytes, so its unpadded
+    /// base64 length is not a multiple of 4 — the case that must decode despite
+    /// missing padding.
+    #[test]
+    fn bytes_body_decodes_to_raw_bytes() {
+        use base64::Engine;
+        // 16 bytes (not divisible by 3) → unpadded base64 of length 22 (not a
+        // multiple of 4).
+        let payload = b"\x89PNG\r\n\x1a\n\x00\x01\x02\x03\x04\x05\x06\x07".to_vec();
+        assert_ne!(payload.len() % 3, 0);
+        let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&payload);
+        assert_ne!(encoded.len() % 4, 0);
+        let body = json!({ BYTES_BODY_KEY: encoded });
+        match decode_proxy_body(body).unwrap() {
+            InputDataOrBytes::Bytes(bytes) => assert_eq!(bytes, payload),
+            _ => panic!("expected bytes body, got data"),
+        }
+    }
+
+    /// Padded base64 is also accepted; both forms must round-trip to the same
+    /// bytes.
+    #[test]
+    fn bytes_body_accepts_padded_base64() {
+        use base64::Engine;
+        let payload = b"hello".to_vec();
+        let padded = base64::engine::general_purpose::STANDARD.encode(&payload);
+        assert!(padded.ends_with('='));
+        let body = json!({ BYTES_BODY_KEY: padded });
+        match decode_proxy_body(body).unwrap() {
+            InputDataOrBytes::Bytes(bytes) => assert_eq!(bytes, payload),
+            _ => panic!("expected bytes body, got data"),
+        }
+    }
+
+    /// A `$bytes` value that is not valid base64 is surfaced as a request error
+    /// rather than silently degrading the upload to a JSON body.
+    #[test]
+    fn invalid_bytes_base64_is_an_error() {
+        let body = json!({ BYTES_BODY_KEY: "not-valid-base64!!!" });
+        assert!(decode_proxy_body(body).is_err());
+    }
+
+    /// An ordinary JSON body passes through as JSON data (unchanged).
+    #[test]
+    fn json_body_passes_through_as_data() {
+        let body = json!({ "record": { "text": "hi" } });
+        match decode_proxy_body(body.clone()).unwrap() {
+            InputDataOrBytes::Data(json) => assert_eq!(json, body),
+            _other => panic!("expected json data, got bytes"),
+        }
+    }
+
+    /// A `{ "$bytes": ... }` object with extra fields is treated as plain
+    /// JSON, not bytes (matches the strict AT `$bytes` shape).
+    #[test]
+    fn non_singleton_bytes_object_stays_json() {
+        let body = json!({ BYTES_BODY_KEY: "aGk=", "extra": 1 });
+        match decode_proxy_body(body.clone()).unwrap() {
+            InputDataOrBytes::Data(json) => assert_eq!(json, body),
+            _other => panic!("expected json data, got bytes"),
+        }
+    }
 }

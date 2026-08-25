@@ -11,7 +11,7 @@
  */
 
 import { PUBLIC_ARBITER_URL, PUBLIC_ARBITER_DID } from '$env/static/public';
-import { xrpc, type LexMap, isDidString, isNsidString } from '@atproto/lex';
+import { xrpc, type LexMap, isDidString, isNsidString, encodeLexBytes } from '@atproto/lex';
 import { XrpcResponseError } from '@atproto/lex';
 import type { AtprotoDid } from '@atcute/lexicons/syntax';
 import * as town from '$lib/lexicons/town';
@@ -49,6 +49,10 @@ export interface ProxyOperation {
   parameters?: LexMap;
   /** Optional JSON body for the inner request. */
   body?: LexMap;
+  /** Optional raw-bytes body for the inner request (e.g. a blob upload). */
+  bytes?: Uint8Array;
+  /** Optional content-type (encoding) for the inner request body. */
+  encoding?: string;
 }
 
 /** A proxied record value returned by the arbiter. */
@@ -121,7 +125,10 @@ export const arbiter = {
         method: op.method,
         nsid: op.nsid,
         parameters: op.parameters,
-        body: op.body,
+        // A raw-bytes body is carried in the envelope as the AT Protocol binary
+        // marker `{ $bytes: base64 }`; the arbiter decodes it back to bytes.
+        body: (op.bytes ? encodeLexBytes(op.bytes) : op.body) as LexMap | undefined,
+        encoding: op.encoding,
       },
       headers: {
         Authorization: `Bearer ${token}`,
@@ -213,6 +220,28 @@ export const arbiter = {
     });
     const { uri, cid } = body;
     return { uri: typeof uri === 'string' ? uri : '', cid: typeof cid === 'string' ? cid : '' };
+  },
+
+  /**
+   * Upload a blob (e.g. an avatar image) to the stewarded account's PDS,
+   * proxied through the arbiter so the policy governs the upload and the blob
+   * is stored in the stewarded account's repo. `contentType` becomes the
+   * inner request's `Content-Type` (e.g. `image/png`).
+   *
+   * Returns the inner `com.atproto.blob.uploadBlob` response body, which
+   * carries the blob reference (`{ blob: { $type, ref, mimeType, size } }`).
+   */
+  async uploadBlob(
+    did: string,
+    data: Uint8Array,
+    contentType: string,
+  ): Promise<LexMap> {
+    return this.proxy(did, {
+      nsid: 'com.atproto.blob.uploadBlob',
+      method: 'POST',
+      bytes: data,
+      encoding: contentType,
+    });
   },
 
   // ─── Policy (root Rego record) ─────────────────────────────────────
