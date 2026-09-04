@@ -1,4 +1,4 @@
-//! Jetstream subscription for policy/service-record hot reload + auto-delete.
+//! Jetstream subscription for config/policy/service-record hot reload + auto-delete.
 //!
 //! Subscribes to ATProto Jetstream over a **WebSocket driven by `reqwest`**
 //! (via `reqwest-websocket`), parsing each message with `atproto-jetstream`'s
@@ -17,15 +17,28 @@
 //!
 //! - `town.muni.arbiter.service` (the `self` service record) — arbiter
 //!   lifecycle (absent or repointed -> offboard).
-//! - `town.muni.arbiter.policy.root` / `town.muni.arbiter.policy.sub` — policy
-//!   hot reload.
+//! - `town.muni.arbiter.config` (the `self` config record) — trusted scopes +
+//!   pipeline hot reload.
+//! - `town.muni.arbiter.policy` — policy-record writes in **any** repo. A
+//!   policy record may be local (the stewarded account's repo) or a remote
+//!   (app-owned) shared layer; the policy module's reverse index maps each
+//!   record's `at://` URI to the arbiters whose pipeline references it, so a
+//!   write reloads exactly those arbiters.
 //!
-//! On every relevant `commit`/`delete` event, the record's `rev` is gated
-//! through [`crate::state::ArbiterCollection::is_newer`] (older/duplicate revs
-//! are discarded) and, if newer, the arbiter is reloaded via
-//! [`crate::policy::load_and_onboard`], which re-fetches the *current* records
-//! from the PDS and reapplies the lifecycle. Because `load_and_onboard` always
-//! reads the latest PDS state (never the event payload), a reordered or
+//! Rev gating is per-repo. Steward-repo events (service/config records, which
+//! exist only in a stewarded account's own repo) are gated through
+//! [`crate::state::ArbiterCollection::is_newer`]: the entry's `rev_floor` is
+//! that repo's own head, so an older/duplicate rev is discarded. Remote-record
+//! events (`town.muni.arbiter.policy` writes in *another* repo) are
+//! deliberately NOT gated: each repo's rev stream is an independent TID
+//! timeline, so a remote rev compared against the steward's floor is
+//! meaningless and could silently skip a real update whenever the remote PDS
+//! clock lags the steward's floor. Every accepted event reloads the arbiter
+//! via [`crate::policy::load_and_onboard`], which re-fetches the *current*
+//! records from the PDS and reapplies the lifecycle — so an ungated remote
+//! event can only cause a redundant reload, never a missed or regressed
+//! update (the same tradeoff `is_newer` accepts when no floor is known), and
+//! because `load_and_onboard` never applies the event payload, a reordered or
 //! duplicate event can never regress policy.
 //!
 //! `subscribe` owns reconnection (with bounded backoff) — a single connect is
@@ -43,17 +56,20 @@ use reqwest_websocket::{Message, RequestBuilderExt};
 
 use crate::policy::{OnboardOutcome, load_and_onboard, refresh_all_after_reconnect};
 use crate::{AppState, CONFIG};
-
 /// Collections this server watches on Jetstream.
 const WATCHED_COLLECTIONS: &[&str] = &[
     "town.muni.arbiter.service",
-    "town.muni.arbiter.policy.root",
-    "town.muni.arbiter.policy.sub",
+    "town.muni.arbiter.config",
+    "town.muni.arbiter.policy",
 ];
 
 /// Subscribe to Jetstream and drive:
-///  - `town.muni.arbiter.policy.*` writes -> monotonic-rev reload
-///    (`load_and_onboard`, gated by `is_newer`/`set_rev`)
+///  - `town.muni.arbiter.policy` writes (any repo) -> reload exactly the
+///    arbiters whose pipeline references the record (reverse index). Not
+///    rev-gated: the event rev belongs to the record's repo, while the floor
+///    gate compares against the steward repo's head (see `ReloadHandler::reload`)
+///  - `town.muni.arbiter.config/self` writes
+///    in a stewarded repo -> monotonic-rev reload (`load_and_onboard`)
 ///  - `town.muni.arbiter.service/self` writes/deletes -> auto-delete lifecycle
 ///    (absent -> offboard; repointed at another server -> offboard + store.remove)
 ///
@@ -149,9 +165,7 @@ async fn run_subscription(state: &Arc<AppState>) -> anyhow::Result<()> {
     ws.send(jetstream_update_message()).await
         .map_err(|e| anyhow!("jetstream update message send failed: {e}"))?;
 
-    let handler = ReloadHandler {
-        state: Arc::clone(state),
-    };
+    let handler = ReloadHandler::new(Arc::clone(state));
 
     // Pump frames. The WebSocket is a `Stream<Item = Result<Message, Error>>`.
     // Each `next()` is wrapped in `JETSTREAM_STALL_TIMEOUT` so a half-open
@@ -233,11 +247,15 @@ fn jetstream_update_message() -> Message {
 /// hot-reload/auto-delete indefinitely.
 const JETSTREAM_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Handler that reloads arbiters on watched policy/service-record events.
+/// Handler that reloads arbiters on watched config/policy/service-record events.
 ///
 /// The subscription is not DID-filtered (see [`subscribe`]), so this handler
 /// checks, per event, that the server currently stewards the affected account.
-struct ReloadHandler {
+///
+/// Public so integration tests can drive individual events through the same
+/// dispatch path the live WebSocket uses, without a real Jetstream connection.
+pub struct ReloadHandler {
+    /// Shared server state the handler reloads against.
     state: Arc<AppState>,
 }
 
@@ -246,16 +264,18 @@ impl EventHandler for ReloadHandler {
     async fn handle_event(&self, event: Arc<JetstreamEvent>) -> anyhow::Result<()> {
         // Only repo commit/delete events carry record changes; identity and
         // account events are irrelevant to policy.
-        let (did, rev, collection) = match &*event {
+        let (did, rev, collection, rkey) = match &*event {
             JetstreamEvent::Commit { did, commit, .. } => (
                 did,
                 commit.rev.as_str(),
                 commit.collection.as_str(),
+                commit.rkey.as_str(),
             ),
             JetstreamEvent::Delete { did, commit, .. } => (
                 did,
                 commit.rev.as_str(),
                 commit.collection.as_str(),
+                commit.rkey.as_str(),
             ),
             _ => return Ok(()),
         };
@@ -264,11 +284,60 @@ impl EventHandler for ReloadHandler {
         if !is_watched_collection(collection) {
             return Ok(());
         }
-        // Only process accounts we actually steward (have credentials for).
-        // The subscription is not DID-filtered, so this per-event check is what
-        // limits the stream to our stewarded accounts. It also handles a DID
-        // purged after a repoint.
-        let stewarded = match self.state.store.get(did).await {
+
+        if collection == crate::policy::POLICY_COLLECTION {
+            // A policy-record write in ANY repo: local records and remote
+            // (app-owned) shared layers are the same shape, so look up the
+            // record's `at://` URI in the policy module's reverse index and
+            // reload exactly the arbiters whose pipeline references it.
+            let uri = format!("at://{did}/{collection}/{rkey}");
+            for arbiter_did in crate::policy::referencing_arbiters(&uri) {
+                // Index backlinks can outlive an offboard/purge; only reload
+                // accounts we currently steward (a redundant reload for a
+                // purged DID would just re-apply the lifecycle, but skipping
+                // keeps the stream cheap).
+                if self.is_stewarded(&arbiter_did).await {
+                    // Ungated (rev = None): the event rev belongs to the
+                    // record's repo, while the rev-floor gate compares against
+                    // the steward repo's head — cross-repo revs are
+                    // incomparable (see `reload`).
+                    self.reload(&arbiter_did, None).await;
+                }
+            }
+            return Ok(());
+        }
+
+        // Service + config records only exist in a stewarded account's own
+        // repo. Only process accounts we actually steward (have credentials
+        // for): the subscription is not DID-filtered, so this per-event check
+        // is what limits the stream to our stewarded accounts. It also
+        // handles a DID purged after a repoint.
+        if self.is_stewarded(did).await {
+            // Rev-gated (Some): these collections exist only in the steward
+            // repo — the same repo whose head is the load-time rev floor.
+            self.reload(did, Some(rev)).await;
+        }
+        Ok(())
+    }
+
+    fn handler_id(&self) -> &str {
+        "arbiter-policy-reload"
+    }
+}
+
+impl ReloadHandler {
+    /// Create a handler over `state`. The production subscription builds one
+    /// per connect; tests build one to dispatch events directly.
+    pub fn new(state: Arc<AppState>) -> Self {
+        Self { state }
+    }
+
+    /// Whether the server currently stewards `did` (holds credentials for it).
+    ///
+    /// The subscription is not DID-filtered, so this per-event check is what
+    /// limits the stream to our stewarded accounts.
+    async fn is_stewarded(&self, did: &str) -> bool {
+        match self.state.store.get(did).await {
             Ok(Some(_)) => true,
             Ok(None) => false,
             Err(e) => {
@@ -277,17 +346,32 @@ impl EventHandler for ReloadHandler {
                     error = %format!("{e:#}"),
                     "credential lookup failed; skipping jetstream event"
                 );
-                return Ok(());
+                false
             }
-        };
-        if !stewarded {
-            return Ok(());
         }
+    }
 
-        // Discard events at or below the load-time rev floor: their state is
-        // already reflected in the loaded records (see `ArbiterCollection::is_newer`).
-        if !self.state.arbiters.is_newer(did, rev).await {
-            return Ok(());
+    /// Reload a single arbiter: re-fetch current PDS state and reapply the
+    /// lifecycle + pipeline. Shared by every event path.
+    ///
+    /// `rev` gates the reload — but only for steward-repo events (`Some`):
+    /// the load-time `rev_floor` is the *steward* repo's own head (see
+    /// `ArbiterCollection::is_newer`), so an event at or below it refers to
+    /// state already reflected in the loaded records and is discarded.
+    /// Remote-record events pass `None` and skip the gate: each repo's rev
+    /// stream is an independent TID timeline, so comparing a remote rev
+    /// against the steward's floor is meaningless and could silently skip a
+    /// real update whenever the remote PDS clock lags the floor. Skipping
+    /// the gate only risks a redundant reload — every reload re-fetches
+    /// current state, never the event payload — the same tradeoff
+    /// `is_newer` accepts when no floor is known.
+    async fn reload(&self, did: &str, rev: Option<&str>) {
+        // Discard steward-repo events at or below the load-time rev floor:
+        // their state is already reflected in the loaded records.
+        if let Some(rev) = rev {
+            if !self.state.arbiters.is_newer(did, rev).await {
+                return;
+            }
         }
 
         // Re-fetch the current PDS state and reapply the lifecycle + policies.
@@ -295,7 +379,7 @@ impl EventHandler for ReloadHandler {
         // events cannot regress policy. `load_and_onboard` sets the new rev
         // floor from the PDS head it just read, so the next gating decision
         // reflects the freshest state.
-        // 
+        //
         // TODO: maybe we should try to surgically update instead of refreshing the
         // whole policy by re-loading all the records in the future, but we need to
         // analyze carefully for correctness before doing that.
@@ -320,11 +404,6 @@ impl EventHandler for ReloadHandler {
                 self.state.arbiters.offboard(did).await;
             }
         }
-        Ok(())
-    }
-
-    fn handler_id(&self) -> &str {
-        "arbiter-policy-reload"
     }
 }
 

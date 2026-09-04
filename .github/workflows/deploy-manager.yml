@@ -52,7 +52,7 @@ jobs:
           cat > static/oauth-client-metadata.json <<EOF
           {
             "client_id": "$BASE_URL/oauth-client-metadata.json",
-            "scope": "atproto identity:* rpc:com.atproto.repo.putRecord?aud=* rpc:com.atproto.repo.getRecord?aud=* rpc:app.bsky.actor.getProfile?aud=* rpc:town.muni.arbiter.createArbiter?aud=* rpc:town.muni.arbiter.createAppPasswordArbiter?aud=* rpc:town.muni.arbiter.proxy?aud=* rpc:town.muni.arbiter.resetPolicy?aud=*",
+            "scope": "atproto identity:* rpc:com.atproto.repo.putRecord?aud=* rpc:com.atproto.repo.getRecord?aud=* rpc:app.bsky.actor.getProfile?aud=* rpc:town.muni.arbiter.createArbiter?aud=* rpc:town.muni.arbiter.createAppPasswordArbiter?aud=* rpc:town.muni.arbiter.proxy?aud=* rpc:town.muni.arbiter.installPolicy?aud=*",
             "redirect_uris": ["$BASE_URL/oauth/callback"],
             "response_types": ["code"],
             "grant_types": ["authorization_code", "refresh_token"],

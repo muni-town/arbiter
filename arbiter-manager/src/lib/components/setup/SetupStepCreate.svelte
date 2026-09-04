@@ -1,68 +1,54 @@
 <script lang="ts">
   import { Button } from '@foxui/core';
   import { setupState } from '$lib/setupState.svelte';
-  import { AtprotoHandlePopup, type Profile } from '@foxui/all';
   import { isAtprotoDid } from '@atproto/oauth-client-browser';
-  import { isActorIdentifier } from '@atcute/lexicons/syntax';
-  import { defaultPolicyWithOwner } from '$lib/default-policy';
+  import { DEFAULT_POLICY_URI } from '$lib/default-policy';
   import { arbiter } from '$lib/arbiter';
   import { auth } from '$lib/auth.svelte';
-  import { actorResolver } from '$lib/resolver';
-
-  let selectedAdmin: Profile | undefined = $state(undefined);
 
   function goBack() {
     setupState.step = 'oauth';
   }
 
-  /**
-   * The foxui `AtprotoHandlePopup` fires `onselected` with a hardcoded
-   * `did: ''` when the user just types a handle and presses Enter without
-   * picking a dropdown result, so `selectedAdmin.did` may be empty. Resolve
-   * the handle to its DID in that case.
-   */
-  async function ownerDid(): Promise<string> {
-    if (!selectedAdmin) throw new Error('Please resolve an admin DID first');
-    if (selectedAdmin.did) return selectedAdmin.did;
-    if (!selectedAdmin.handle) throw new Error('You must select an admin.');
-    if (!isActorIdentifier(selectedAdmin.handle)) throw new Error('Invalid admin handle');
-    const resolved = await actorResolver.resolve(selectedAdmin.handle);
-    return resolved.did;
+  /** The pre-existing default policy URI the bootstrap policy layers reference. */
+  function defaultPolicyUri(): string {
+    return setupState.defaultPolicyUri ?? DEFAULT_POLICY_URI;
   }
 
   async function createAndFinish() {
-    if (!selectedAdmin) {
-      setupState.error = 'Please resolve an admin DID first';
-      return;
-    }
-
     setupState.loading = true;
     setupState.error = undefined;
 
     try {
       if (!isAtprotoDid(auth.did)) throw new Error('Not logged in with valid DID');
 
-      // Resolve the owner DID BEFORE provisioning. If this fails (e.g. an
-      // unresolvable admin handle), we abort before creating any account, so
-      // no orphan is left behind.
-      const owner = await ownerDid();
-
-      // If a previous attempt already provisioned the account but failed to
-      // install the policy, skip createArbiter (which would hit the rate limit
-      // or create a second account) and only retry the policy install.
+      // If a previous attempt already provisioned the account (its DID was
+      // persisted after a successful createArbiter), skip re-provisioning and
+      // just redo the resetConfig below (idempotent).
       let did = setupState.createDid;
       if (!did) {
-        // Provision a brand-new stewarded account on the server's default PDS.
-        // The server returns the new account's DID; the caller (this OAuth
-        // account) becomes its recovery admin.
+        // Provision a brand-new stewarded account on the server's default
+        // PDS. The server returns the new account's DID; the caller (this
+        // OAuth account) becomes its recovery admin. No policy is authored
+        // here: the arbiter stays offline (fail-closed) until the bootstrap
+        // config record below brings it online.
         did = await arbiter.createArbiter();
         setupState.createDid = did;
       }
 
-      // Install the first policy. The creator is the recovery admin, so they
-      // may call resetPolicy to bring the freshly provisioned (offline) arbiter
-      // online with the initial policy.
-      await arbiter.resetPolicy(did, defaultPolicyWithOwner(owner));
+      // Bootstrap the fresh (offline) arbiter: point its config at the
+      // PRE-EXISTING default policy record via resetConfig — the
+      // recovery-admin-only hatch works while the arbiter is offboarded, and
+      // bringing the config record into existence brings the arbiter online.
+      // No record is authored and installPolicy is NOT used: it is
+      // append-only and policy-layer-gated, while resetConfig is the designated
+      // bootstrap/recovery hatch. The referenced record must be published
+      // somewhere reachable (see DEFAULT_POLICY_URI); until it is, the
+      // arbiter fails closed.
+      await arbiter.resetConfig(did, {
+        trustedScopes: [],
+        policyLayers: [defaultPolicyUri()],
+      });
 
       setupState.step = 'complete';
       setupState.error = undefined;
@@ -75,8 +61,8 @@
       if (!setupState.createDid && /rate limit|ErrPermissionDenied/i.test(msg)) {
         setupState.error =
           'The arbiter server is rate-limiting account creation. If a previous attempt ' +
-          'succeeded but the response was lost, the account may already exist — retry in a ' +
-          'minute to install its policy.';
+          'succeeded but the response was lost, the account may already exist — retry in ' +
+          'a minute to finish setting it up.';
       } else {
         setupState.error = `Failed: ${msg}`;
       }
@@ -90,14 +76,15 @@
     <h2 class="text-xl font-semibold text-base-900 dark:text-base-50">Create a New Account</h2>
     <p class="text-sm text-base-600 dark:text-base-400">
       The arbiter server will create a brand-new AT Protocol account on its configured PDS and
-      return its DID. You (the signed-in account) become its recovery admin. Then choose an account
-      to have <strong>Owner</strong> access to this community's arbiter.
+      return its DID. You (the signed-in account) become its recovery admin.
+    </p>
+    <p class="text-xs text-base-500 dark:text-base-500">
+      The new arbiter's policy layers reference the shared default policy record and start with no
+      trusted scopes — manage both from the policy editor afterwards.
     </p>
   </div>
 
   <div class="space-y-4">
-    <AtprotoHandlePopup onselected={(actor) => (selectedAdmin = actor)} />
-
     {#if setupState.error}
       <p class="text-sm text-red-500">{setupState.error}</p>
     {/if}
@@ -105,11 +92,11 @@
 
   <div class="flex justify-between pt-2">
     <Button variant="ghost" onclick={goBack} disabled={setupState.loading}>Back</Button>
-    <Button onclick={createAndFinish} disabled={setupState.loading || !selectedAdmin}>
+    <Button onclick={createAndFinish} disabled={setupState.loading}>
       {setupState.loading
         ? 'Working…'
         : setupState.createDid
-          ? 'Retry Policy Install'
+          ? 'Retry Setup'
           : 'Create Account'}
     </Button>
   </div>

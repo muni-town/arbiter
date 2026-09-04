@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use anyhow::{Context, Result, anyhow};
 use atrium_xrpc::{
     InputDataOrBytes,
@@ -13,20 +11,24 @@ use crate::{
     xrpc::{XrpcEndpoint, XrpcError, XrpcOutput, XrpcRequest, XrpcResult},
 };
 
-/// Async host functions registered on every arbiter policy VM (mirrors
-/// `arbiter-server::policy::HOST_FNS`).
-pub const HOST_FNS: &[&str] = &["xrpc", "policy"];
-/// Rego entrypoint evaluated to produce a request's result (mirrors
-/// `arbiter-server::policy::ENTRYPOINT`).
+/// Async host functions registered on every pipeline-layer policy VM.
+pub const HOST_FNS: &[&str] = &["xrpc"];
+/// Rego entrypoint evaluated to produce a request's result.
 pub const ENTRYPOINT: &str = "data.arbiter.result";
+
+/// Rego entrypoint evaluated to produce a scope policy's decision: a plain
+/// boolean answering "is this request within the virtual scope"
+pub const SCOPE_ENTRYPOINT: &str = "data.arbiter.allow";
 
 /// Compile a Rego policy with the arbiter's host functions and entrypoint,
 /// validating it before it is installed.
 ///
 /// This runs the full [`PolicyVm`] compile path (including the async host
 /// functions) so that malformed policies — bad Rego syntax, missing
-/// entrypoint, or calls to the `xrpc`/`policy` builtins with the wrong
-/// arity — are caught here rather than at evaluation time.
+/// entrypoint, or calls to the `xrpc` builtin with the wrong arity — are
+/// caught here rather than at evaluation time. This is the right validator
+/// for pipeline layers (see [`Layer`]); scope policies are validated with
+/// [`ScopePolicy::new`], which compiles without host functions instead.
 pub fn validate_policy(policy: &str) -> Result<()> {
     PolicyVm::new(policy, Value::new_object(), ENTRYPOINT, HOST_FNS)
         .map(|_| ())
@@ -40,13 +42,10 @@ pub fn validate_policy(policy: &str) -> Result<()> {
 /// object of the form `{ "$__bytes__": <index> }`, where `<index>` refers to an
 /// entry in [`ArbiterReqMachine::buffers`].
 pub const BYTES_KEY: &str = "$__bytes__";
-/// The maximum depth of nested `policy` host-function calls (sub-policy
-/// invocations) permitted while evaluating a single request. Bounds the
-/// `callers` stack so a recursive or cyclic policy cannot grow it without
-/// limit.
-const MAX_POLICY_DEPTH: usize = 16;
 
-/// Per-request context injected into the Rego policy's `input` value.
+/// Per-request context injected into the Rego `input` of pipeline-layer
+/// policies (a [`ScopePolicy`] sees only the request core, without these
+/// fields).
 ///
 /// These fields vary per request and have no other delivery channel (the
 /// `PolicyVm`'s `data` is baked at compile time and `request_to_input`
@@ -68,80 +67,245 @@ pub struct RequestCtx {
 /// The state of an arbiter for an individual ATProto account.
 #[derive(Debug)]
 pub struct Arbiter {
-    /// The policies for this arbiter.
-    pub(crate) policies: Policies,
+    /// The policy pipeline evaluated for every request.
+    pub(crate) pipeline: Pipeline,
 }
 
 impl Arbiter {
-    /// Create a new arbiter from the given root and sub-policies.
+    /// Create a new arbiter from the given policy pipeline.
     ///
-    /// The policies must have been compiled with the `xrpc` and `policy`
-    /// builtins registered as async host functions (see
-    /// [`PolicyVm::new`]); the request machine interprets those host calls.
-    pub fn new(policies: Policies) -> Self {
-        Self { policies }
+    /// Layers are evaluated in order for each request (see [`Pipeline`] for
+    /// the layer output convention). They must have been compiled with the
+    /// arbiter's async host functions (see [`HOST_FNS`] and
+    /// [`Layer::compile`]) so the request machine can interpret their `xrpc`
+    /// suspensions.
+    pub fn new(pipeline: Pipeline) -> Self {
+        Self { pipeline }
     }
 
     /// Get a state machine that may be driven to respond to the provided XRPC
     /// request.
     pub fn handle_request(&self, req: XrpcRequest, ctx: RequestCtx) -> ArbiterReqMachine {
-        ArbiterReqMachine::new(self.policies.clone(), req, ctx)
+        ArbiterReqMachine::new(self.pipeline.clone(), req, ctx)
     }
 }
 
-/// A root policy and optional sub-policies.
+/// One layer of an arbiter's policy pipeline: a compiled policy plus the
+/// provenance of the record it was loaded from.
+///
+/// A layer is compiled with the arbiter's async host functions ([`HOST_FNS`])
+/// and the [`ENTRYPOINT`] rule (`data.arbiter.result`), so it may suspend on
+/// `xrpc` host calls; [`Layer::compile`] runs that compilation and validation.
+/// The provenance (the `at://` URI of the policy record this layer was loaded
+/// from, and the record CID/revision at load time) lets a host (the server,
+/// simulator) reload exactly the layers whose underlying records change.
 #[derive(Clone, Debug)]
-pub struct Policies {
-    /// The root policy is the first policy and is run for every single request.
-    ///
-    /// It may _optionally_ offload decisions to other sub-policies as a part
-    /// of its execution.
-    root_policy: PolicyVm,
-    /// The set of installed sub-policies. Sub-policies are allowed to send
-    /// requests to other sub-policies if they wish.
-    sub_policies: HashMap<String, PolicyVm>,
+pub struct Layer {
+    /// The compiled policy evaluated for this layer.
+    pub policy: PolicyVm,
+    /// The `at://` URI of the policy record this layer was loaded from, e.g.
+    /// `at://did:plc:abc/town.muni.arbiter.policy/my-policy`.
+    pub uri: String,
+    /// The record CID (revision) of the policy record at the time the layer
+    /// was loaded, when known. `None` for layers loaded without a revision.
+    pub cid: Option<String>,
 }
 
-impl Policies {
-    /// Create a new set of policies from a root policy and a map of named
-    /// sub-policies.
-    pub fn new(root_policy: PolicyVm, sub_policies: HashMap<String, PolicyVm>) -> Self {
+impl Layer {
+    /// Bundle an already-compiled policy with its provenance.
+    pub fn new(policy: PolicyVm, uri: impl Into<String>, cid: Option<String>) -> Self {
         Self {
-            root_policy,
-            sub_policies,
+            policy,
+            uri: uri.into(),
+            cid,
         }
     }
 
-    /// Borrow the root policy.
-    fn root(&self) -> &PolicyVm {
-        &self.root_policy
+    /// Compile a layer from Rego source and record its provenance.
+    ///
+    /// Runs the full [`PolicyVm`] compile path (with [`HOST_FNS`] and
+    /// [`ENTRYPOINT`]), so malformed policies — bad Rego syntax, a missing
+    /// entrypoint, or `xrpc` calls with the wrong arity — fail here rather
+    /// than at evaluation time.
+    pub fn compile(policy: &str, uri: impl Into<String>, cid: Option<String>) -> Result<Self> {
+        let policy = PolicyVm::new(policy, Value::new_object(), ENTRYPOINT, HOST_FNS)?;
+        Ok(Self::new(policy, uri, cid))
+    }
+}
+
+/// An ordered pipeline of policy [`Layer`]s.
+///
+/// Layers are composed positionally, in the order given, and every layer is
+/// started with the same request input (the shape the request machine builds:
+/// `method`, `nsid`, `parameters`, `body`, `encoding`, plus the [`RequestCtx`]
+/// fields `arbiterDid`, `pdsEndpoint`, `callerDid`, and `xrpcEndpoint`).
+///
+/// # Layer output convention
+///
+/// Each layer's `data.arbiter.result` output is interpreted as:
+///
+/// - `{ "handleBuiltin": true }` — **hand off**: the request is handed to the
+///   arbiter's built-in handler; the machine ends with
+///   [`ArbiterReqMachineStep::HandToBuiltin`] and later layers are not
+///   evaluated. This marker is checked before the pass marker, so it wins
+///   when both are present;
+/// - `{ "pass": true }` — defer to the next layer;
+/// - `{ "ok": true, "output" | "bytes": ... }` — **handle**: the layer's
+///   output becomes the response and later layers are not evaluated;
+/// - `{ "ok": false, "error": { status, ... } }` — **deny**: the layer's
+///   error becomes the response and later layers are not evaluated.
+///
+/// The first layer that hands off, handles, or denies wins. When every layer
+/// passes — or the pipeline is empty — the request is denied with a default
+/// 403 (`error: "Denied"`) response. Any other layer output is malformed and
+/// surfaces as a 500 `InternalError` response.
+///
+/// ```text
+/// let mut pipeline = Pipeline::new();
+/// pipeline.push(Layer::compile(src, at_uri, Some(record_cid))?);
+/// let arbiter = Arbiter::new(pipeline);
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct Pipeline {
+    /// The layers in evaluation order.
+    layers: Vec<Layer>,
+}
+
+impl Pipeline {
+    /// Create an empty pipeline. Requests evaluated against an empty pipeline
+    /// are denied by default.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Borrow a named sub-policy.
-    fn sub(&self, name: &str) -> Option<&PolicyVm> {
-        self.sub_policies.get(name)
+    /// Create a pipeline from an already-ordered list of layers.
+    pub fn from_layers(layers: Vec<Layer>) -> Self {
+        Self { layers }
+    }
+
+    /// Append a layer to the end of the pipeline.
+    pub fn push(&mut self, layer: Layer) {
+        self.layers.push(layer);
+    }
+
+    /// Borrow the layers in evaluation order.
+    pub fn layers(&self) -> &[Layer] {
+        &self.layers
+    }
+
+    /// The number of layers in the pipeline.
+    pub fn len(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Whether the pipeline has no layers (every request is denied).
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty()
+    }
+}
+
+/// A pure scope policy: an allow/deny predicate answering a single question —
+/// *is this request within the virtual scope?*
+///
+/// Scope policies are compiled with **no host functions** and evaluated
+/// synchronously: evaluation cannot suspend, issue remote requests, or
+/// observe anything besides the request core, so a scope policy is a pure
+/// function of the request.
+///
+/// The Rego source must define the [`SCOPE_ENTRYPOINT`] rule
+/// (`data.arbiter.allow`) returning a boolean:
+///
+/// ```rego
+/// package arbiter
+///
+/// default allow := false
+///
+/// allow if {
+///     input.method == "GET"
+///     startswith(input.nsid, "com.example.calendars")
+/// }
+/// ```
+///
+/// The policy's `input` is the request core `{ method, nsid, parameters,
+/// body, encoding }` — the pipeline-layer input minus the [`RequestCtx`]
+/// context fields, which scope policies never see. A `body` is the JSON
+/// value, null, or a [`BYTES_KEY`] marker; scope policies have no host
+/// functions, so a marker body can never be resolved to bytes.
+///
+/// [`ScopePolicy::evaluate`] returns `Ok(true)` only for a boolean `true`
+/// result. A boolean `false`, an undefined rule, or any non-boolean value
+/// denies the request; evaluation failures return `Err`, which fail-closed
+/// callers treat as a deny.
+///
+/// The source is fully validated at construction time (see [`PolicyVm::new`]):
+/// malformed Rego, a missing entrypoint, or any reference to a host function
+/// fails compilation — never at evaluation time.
+#[derive(Clone, Debug)]
+pub struct ScopePolicy {
+    vm: PolicyVm,
+}
+
+impl ScopePolicy {
+    /// Compile and validate a scope policy from Rego source.
+    ///
+    /// Compiles with no host functions against the [`SCOPE_ENTRYPOINT`] rule.
+    /// Fails on malformed Rego, a missing `data.arbiter.allow` entrypoint, or
+    /// any use of host functions — scope policies are pure functions of the
+    /// request core and have none.
+    pub fn new(policy: &str) -> Result<Self> {
+        let vm = PolicyVm::new(policy, Value::new_object(), SCOPE_ENTRYPOINT, &[])?;
+        Ok(Self { vm })
+    }
+
+    /// Evaluate the scope policy synchronously against a request.
+    ///
+    /// Returns `Ok(true)` only when `data.arbiter.allow` evaluates to boolean
+    /// `true`. A boolean `false`, an undefined rule, or any non-boolean result
+    /// denies the request (`Ok(false)`). Returns `Err` when evaluation itself
+    /// fails (a VM error, e.g. the execution time limit) — fail-closed callers
+    /// should treat `Err` as a deny.
+    pub fn evaluate(&self, req: &XrpcRequest) -> Result<bool> {
+        // Scope policies cannot make host calls, so no buffer is ever
+        // resolved here; the throwaway list only backs the shared request-core
+        // conversion for byte-marker bodies.
+        let mut buffers = Vec::new();
+        let input = ArbiterReqMachine::request_core_to_input(&mut buffers, req)?.into_value();
+        let mut vm = self.vm.clone();
+        let PolicyVmOutput::Completed(value) = vm.start(input)? else {
+            // Unreachable: with no host functions registered the VM has
+            // nothing to suspend on.
+            anyhow::bail!("scope policy suspended despite having no host functions");
+        };
+        Ok(matches!(value, Value::Bool(true)))
     }
 }
 
 /// A state machine for an individual arbiter request, that may be driven to
 /// completion by the caller.
 ///
-/// The machine is sans-io: it runs the installed Rego policies and, whenever a
-/// policy triggers a request to a remote XRPC endpoint (via the `xrpc` host
-/// function), it suspends and surfaces a
-/// [`ArbiterReqMachineStep::RemoteXrpcRequest`] to the caller. The caller is
+/// The machine is sans-io: it evaluates the arbiter's policy pipeline and,
+/// whenever a layer triggers a request to a remote XRPC endpoint (via the
+/// `xrpc` host function), it suspends and surfaces a
+/// [`ArbiterReqMachineStep::RemoteXrpcRequest`] to the caller; the caller is
 /// responsible for actually issuing the request and feeding the response back
-/// in via [`ArbiterReqMachine::resume`].
+/// in via [`ArbiterReqMachine::resume`]. When a layer hands the request to the
+/// arbiter's built-in handler (`{ "handleBuiltin": true }`), the machine ends
+/// with [`ArbiterReqMachineStep::HandToBuiltin`], leaving the built-in serving
+/// to the caller.
 pub struct ArbiterReqMachine {
     /// The XRPC request that we are responding to.
     req: XrpcRequest,
-    /// The policies to be used to respond to the request.
-    policies: Policies,
+    /// The policy pipeline layers used to respond to the request.
+    pipeline: Pipeline,
     /// The list of bytes buffers used by the machine.
     ///
     /// Binary payloads that Rego cannot represent are stashed here and
     /// referred to from policy values via the [`BYTES_KEY`] marker.
     buffers: Vec<Vec<u8>>,
+    /// The Rego `input` value for the request, computed at [`Self::start`]
+    /// and reused to start every pipeline layer (all layers evaluate the
+    /// same input).
+    input: Option<Value>,
     /// The current status of the machine.
     status: ArbiterReqMachineStatus,
     ctx: RequestCtx,
@@ -169,24 +333,26 @@ impl std::fmt::Debug for ArbiterReqMachine {
 ///
 /// Between [`ArbiterReqMachine::start`] / [`ArbiterReqMachine::resume`] calls
 /// the machine is either freshly initialized, waiting on a remote XRPC
-/// response (with the entire in-flight policy stack stashed), or done. While
-/// driving, the active policy stack is held in the locals of the driving loop.
+/// response (with the active layer's policy VM stashed), or done. While
+/// driving, the active layer's policy VM is held in the locals of the driving
+/// loop.
 enum ArbiterReqMachineStatus {
     /// Machine has just been initialized and has not yet been started.
     Init,
-    /// A policy has triggered a remote XRPC call which we are waiting on the
-    /// response to.
+    /// A policy layer has triggered a remote XRPC call which we are waiting on
+    /// the response to.
     ///
     /// `frame` is the policy VM that issued the remote request (suspended
-    /// inside its host-function call), and `callers` is the stack of policy VMs
-    /// waiting for `frame` (a sub-policy) to complete.
+    /// inside its host-function call) and `layer` is the index of that layer
+    /// in the pipeline, needed to advance past it if it completes with a pass
+    /// once the response arrives.
     ///
     /// `frame` is boxed because it is moved out of the enum on resume (via
     /// `std::mem::replace`), and `PolicyVm` is large enough that boxing avoids
     /// a large enum variant size penalty.
     WaitingOnRemoteXrpcResp {
         frame: Box<PolicyVm>,
-        callers: Vec<PolicyVm>,
+        layer: usize,
     },
     /// The machine has produced its final result.
     Done,
@@ -196,10 +362,10 @@ impl std::fmt::Debug for ArbiterReqMachineStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Init => write!(f, "Init"),
-            Self::WaitingOnRemoteXrpcResp { frame: _, callers } => f
+            Self::WaitingOnRemoteXrpcResp { frame: _, layer } => f
                 .debug_struct("WaitingOnRemoteXrpcResp")
                 .field("frame", &"..")
-                .field("callers", &format_args!("{} frames", callers.len()))
+                .field("layer", layer)
                 .finish(),
             Self::Done => write!(f, "Done"),
         }
@@ -210,6 +376,15 @@ impl std::fmt::Debug for ArbiterReqMachineStatus {
 pub enum ArbiterReqMachineStep {
     /// The policy evaluation is completed with an XRPC response.
     Completed(XrpcResult),
+    /// The pipeline has handed the request to the arbiter's built-in handler
+    /// (a layer completed with `{ "handleBuiltin": true }`): evaluation is
+    /// terminal and the caller serves the request itself.
+    ///
+    /// The machine is generic and never decides whether the request's NSID
+    /// actually has a built-in implementation. The caller (the server) maps
+    /// this step onto its built-in handler registry and must surface an
+    /// error when the NSID has no built-in.
+    HandToBuiltin,
     /// The policy evaluation has triggered a request to a remote XRPC endpoint.
     /// The caller must execute the XRPC request and provide the response to the
     /// machine to continue.
@@ -247,6 +422,7 @@ impl std::fmt::Debug for ArbiterReqMachineStep {
                     ))
                     .finish(),
             },
+            Self::HandToBuiltin => write!(f, "HandToBuiltin"),
             Self::RemoteXrpcRequest { endpoint, request } => f
                 .debug_struct("RemoteXrpcRequest")
                 .field("endpoint", endpoint)
@@ -266,23 +442,64 @@ impl std::fmt::Debug for ArbiterReqMachineStep {
     }
 }
 
+/// The layer a machine transition evaluates: its pipeline index, the running
+/// VM frame, and the output that frame just produced.
+///
+/// # Index invariant
+///
+/// `index` is only ever minted by [`ArbiterReqMachine::start_layer`] (so it is
+/// always in-bounds for the machine's pipeline snapshot — `start_layer` uses
+/// `get`, it cannot return `Some` out of bounds) or recycled from a
+/// suspension, which stored a previously validated index. Every use funnels
+/// back through `start_layer`, whose out-of-bounds case is the exhaustion
+/// encoding (default deny) — never a panic or a wrong-layer path.
+struct ActiveLayer {
+    index: usize,
+    frame: PolicyVm,
+    output: PolicyVmOutput,
+}
+
+/// The transition handed to [`ArbiterReqMachine::drive_from`].
+///
+/// [`Transition::Exhausted`] is only producible on the start path — the
+/// pipeline is empty or every layer passed. A resumed layer is by definition
+/// still active, so [`ArbiterReqMachine::resume_inner`] can only produce
+/// [`Transition::Active`]: the invalid combination is unrepresentable.
+enum Transition {
+    /// A layer produced an output: evaluate it (pass, handle, deny, or
+    /// builtin handoff).
+    Active(ActiveLayer),
+    /// The pipeline had no layer to evaluate — it is empty, or every layer
+    /// passed and the index ran past the end. This is a designed terminal
+    /// state, not a failure: the fail-closed contract maps it to the default
+    /// deny response (403-class), while genuine internal failures travel as
+    /// `Err` and surface as 500 InternalServerError. Encoding exhaustion as
+    /// a variant (rather than an error payload) keeps that distinction
+    /// type-level: callers can never mistake an expected pass-chain
+    /// completion for a broken machine.
+    Exhausted,
+}
+
 impl ArbiterReqMachine {
-    /// Create a new [`ArbiterReqMachine]
-    pub fn new(policies: Policies, req: XrpcRequest, ctx: RequestCtx) -> Self {
+    /// Create a new [`ArbiterReqMachine`].
+    pub fn new(pipeline: Pipeline, req: XrpcRequest, ctx: RequestCtx) -> Self {
         Self {
             req,
-            policies,
+            pipeline,
             buffers: Vec::new(),
+            input: None,
             status: ArbiterReqMachineStatus::Init,
             ctx,
         }
     }
 
-    /// Start evaluating the request against the root policy.
+    /// Start evaluating the request against the first pipeline layer.
     ///
-    /// Returns the first step of the evaluation: either a completed result or a
-    /// request to a remote XRPC endpoint that must be fulfilled before
-    /// continuing via [`Self::resume`].
+    /// Returns the first step of the evaluation: a completed result, a
+    /// hand-off of the request to the arbiter's built-in handler
+    /// ([`ArbiterReqMachineStep::HandToBuiltin`]), or a request to a remote
+    /// XRPC endpoint that must be fulfilled before continuing via
+    /// [`Self::resume`].
     ///
     /// # Panics
     ///
@@ -308,31 +525,35 @@ impl ArbiterReqMachine {
         self.drive_from(first)
     }
 
-    /// Produce the first `(frame, callers, output)` triple for [`Self::start`].
+    /// Produce the first transition for [`Self::start`]: pipeline layer 0,
+    /// started with the request input, or [`Transition::Exhausted`] when the
+    /// pipeline is empty (converted to the default deny by
+    /// [`Self::drive_from`]).
     ///
-    /// Errors here (e.g. policy compilation/input conversion failures) are
+    /// Errors here (e.g. input conversion or policy start failures) are
     /// converted to an error XRPC response by [`Self::drive_from`].
-    fn start_inner(&mut self) -> Result<(PolicyVm, Vec<PolicyVm>, PolicyVmOutput)> {
+    fn start_inner(&mut self) -> Result<Transition> {
         let input = Self::request_to_input(&mut self.buffers, &self.req, &self.ctx)?;
-        let mut root = self.policies.root().clone();
-        let output = root.start(input)?;
-        Ok((root, Vec::new(), output))
+        self.input = Some(input);
+        Ok(match self.start_layer(0)? {
+            Some(active) => Transition::Active(active),
+            None => Transition::Exhausted,
+        })
     }
 
-    /// Produce the next `(frame, callers, output)` triple for [`Self::resume`].
+    /// Produce the next transition for [`Self::resume`]: the suspended
+    /// layer's VM resumed with the remote response value. Always
+    /// [`Transition::Active`] — a resumed layer is by definition still active.
     ///
     /// Panics on host-contract violations (resuming when not waiting). Other
     /// errors are converted to an error XRPC response by [`Self::drive_from`].
-    fn resume_inner(
-        &mut self,
-        response: XrpcResult,
-    ) -> Result<(PolicyVm, Vec<PolicyVm>, PolicyVmOutput)> {
-        let (mut frame, callers) = match std::mem::replace(
+    fn resume_inner(&mut self, response: XrpcResult) -> Result<Transition> {
+        let (mut frame, index) = match std::mem::replace(
             &mut self.status,
             ArbiterReqMachineStatus::Done,
         ) {
-            ArbiterReqMachineStatus::WaitingOnRemoteXrpcResp { frame, callers } => {
-                (*frame, callers)
+            ArbiterReqMachineStatus::WaitingOnRemoteXrpcResp { frame, layer } => {
+                (*frame, layer)
             }
             other => {
                 self.status = other;
@@ -343,7 +564,7 @@ impl ArbiterReqMachine {
         };
         let value = Self::xrpc_result_to_value(&mut self.buffers, &response)?;
         let output = frame.resume(value)?;
-        Ok((frame, callers, output))
+        Ok(Transition::Active(ActiveLayer { index, frame, output }))
     }
 
     /// Take the result of [`Self::start_inner`] / [`Self::resume_inner`] and
@@ -352,22 +573,25 @@ impl ArbiterReqMachine {
     ///
     /// Host-contract violations panic (handled by the inner functions); policy
     /// and runtime errors — VM execution failures, malformed policy output,
-    /// missing sub-policies, invalid host-call arguments — become
+    /// invalid host-call arguments — become
     /// [`ArbiterReqMachineStep::Completed`] carrying an `Err` [`XrpcResult`]
     /// with a 500 status. This keeps the caller's driving loop simple: it only
     /// ever matches on [`ArbiterReqMachineStep`], never on `Result::Err`.
-    fn drive_from(
-        &mut self,
-        first: Result<(PolicyVm, Vec<PolicyVm>, PolicyVmOutput)>,
-    ) -> ArbiterReqMachineStep {
-        let (frame, callers, output) = match first {
-            Ok(triple) => triple,
+    fn drive_from(&mut self, transition: Result<Transition>) -> ArbiterReqMachineStep {
+        let active = match transition {
+            Ok(Transition::Active(active)) => active,
+            // The pipeline is empty: there is no layer to start, so the
+            // request is denied by default.
+            Ok(Transition::Exhausted) => {
+                self.status = ArbiterReqMachineStatus::Done;
+                return ArbiterReqMachineStep::Completed(Err(Self::default_deny()));
+            }
             Err(e) => {
                 self.status = ArbiterReqMachineStatus::Done;
                 return ArbiterReqMachineStep::Completed(Err(Self::internal_error(e)));
             }
         };
-        match self.drive_loop(frame, callers, output) {
+        match self.drive_loop(active) {
             Ok(step) => step,
             Err(e) => {
                 self.status = ArbiterReqMachineStatus::Done;
@@ -376,76 +600,87 @@ impl ArbiterReqMachine {
         }
     }
 
-    /// Drive the currently active policy frame to its next suspension or
-    /// completion, handling host-function calls recursively.
+    /// Drive the currently active policy layer to its next suspension or
+    /// completion, advancing through the pipeline when a layer passes.
     ///
-    /// `frame` is the active policy (with an [`PolicyVmOutput`] freshly
-    /// produced by starting or resuming it) and `callers` is the stack of
-    /// policy VMs waiting for `frame` (a sub-policy) to complete. The function
-    /// loops, driving `frame` forward, until it either:
-    ///
-    /// - completes with no callers left (the root policy finished) → emits
+    /// `active` carries the active layer's index, its policy VM, and an
+    /// [`PolicyVmOutput`] freshly produced by starting or resuming it. The
+    /// function loops, driving the frame forward, until it either:
+    /// - completes with `{ "handleBuiltin": true }` → the request is handed to
+    ///   the arbiter's built-in handler: emits
+    ///   [`ArbiterReqMachineStep::HandToBuiltin`], or
+    /// - completes with a handle/deny output (the layer decided) → emits
     ///   [`ArbiterReqMachineStep::Completed`], or
-    /// - triggers an `xrpc` host call → suspends, stashes the stack into
+    /// - completes with `{ "pass": true }` → the next layer is started and
+    ///   driven in turn; past the end of the pipeline the request is denied
+    ///   with the default deny response, or
+    /// - triggers an `xrpc` host call → suspends, stashes the layer's VM into
     ///   [`ArbiterReqMachineStatus::WaitingOnRemoteXrpcResp`], and emits
     ///   [`ArbiterReqMachineStep::RemoteXrpcRequest`].
     ///
-    /// A `policy` host call is handled inline: the caller frame is pushed onto
-    /// `callers` and the named sub-policy is started and driven in turn. An
-    /// unknown host function resumes the issuing policy with an error envelope
-    /// so the policy can decide how to handle it. Any other error (VM failure,
-    /// bad conversion, missing sub-policy) propagates via `?` and is turned
-    /// into an error XRPC response by [`Self::drive_from`].
-    /// A `policy` host call that would exceed [`MAX_POLICY_DEPTH`] aborts with a
-    /// terminal error (surfaced as a 500 XRPC response) rather than resuming the
-    /// policy, so a runaway recursive policy cannot loop forever.
-    fn drive_loop(
-        &mut self,
-        mut frame: PolicyVm,
-        mut callers: Vec<PolicyVm>,
-        mut output: PolicyVmOutput,
-    ) -> Result<ArbiterReqMachineStep> {
+    /// The built-in handoff is checked before the pass marker, so a layer
+    /// emitting both `{ "handleBuiltin": true }` and `{ "pass": true }` hands
+    /// off rather than deferring.
+    ///
+    /// An unknown host function resumes the issuing policy with an error
+    /// envelope so the policy can decide how to handle it. Any other error
+    /// (VM failure, bad conversion, invalid host-call arguments) propagates
+    /// via `?` and is turned into an error XRPC response by
+    /// [`Self::drive_from`].
+    fn drive_loop(&mut self, active: ActiveLayer) -> Result<ArbiterReqMachineStep> {
+        let ActiveLayer {
+            mut index,
+            mut frame,
+            mut output,
+        } = active;
         loop {
             match output {
                 PolicyVmOutput::Completed(value) => {
-                    if let Some(mut caller) = callers.pop() {
-                        // A sub-policy finished; resume its caller with the
-                        // envelope value the sub-policy produced.
-                        output = caller.resume(value)?;
-                        frame = caller;
-                        continue;
+                    if is_handle_builtin_output(&value) {
+                        // The layer handed the request to the arbiter's
+                        // built-in handler: evaluation is terminal. The
+                        // machine is generic — whether the request's NSID
+                        // actually has a built-in implementation is decided
+                        // by the caller (the server), which maps this step
+                        // onto its built-in handler registry.
+                        self.status = ArbiterReqMachineStatus::Done;
+                        return Ok(ArbiterReqMachineStep::HandToBuiltin);
                     }
-                    // The root policy finished: this is the final result.
+                    if is_pass_output(&value) {
+                        // The layer passed: defer to the next layer in the
+                        // pipeline.
+                        index += 1;
+                        match self.start_layer(index)? {
+                            Some(next) => {
+                                index = next.index;
+                                frame = next.frame;
+                                output = next.output;
+                                continue;
+                            }
+                            // Fell off the end of the pipeline: the request is
+                            // denied by default.
+                            None => {
+                                self.status = ArbiterReqMachineStatus::Done;
+                                return Ok(ArbiterReqMachineStep::Completed(Err(
+                                    Self::default_deny(),
+                                )));
+                            }
+                        }
+                    }
+                    // The layer handled (ok=true) or denied (ok=false): its
+                    // output is the final result.
                     let result = Self::value_to_xrpc_result(&self.buffers, &value)?;
                     self.status = ArbiterReqMachineStatus::Done;
                     return Ok(ArbiterReqMachineStep::Completed(result));
                 }
                 PolicyVmOutput::HostCall { fn_name, arg } => {
                     match fn_name.as_str() {
-                        "policy" => {
-                            if callers.len() >= MAX_POLICY_DEPTH {
-                                anyhow::bail!(
-                                    "policy call depth limit ({MAX_POLICY_DEPTH}) exceeded"
-                                );
-                            }
-                            let name = Self::field_string(&arg, "name")?;
-                            let input = Self::arg_to_policy_input(&arg)?;
-                            let mut sub = self
-                                .policies
-                                .sub(&name)
-                                .with_context(|| format!("no sub-policy named `{name}`"))?
-                                .clone();
-                            let sub_output = sub.start(input)?;
-                            callers.push(frame);
-                            frame = sub;
-                            output = sub_output;
-                        }
                         "xrpc" => {
                             let endpoint = Self::field_string(&arg, "did")?;
                             let request = Self::arg_to_xrpc_request(&self.buffers, &arg)?;
                             self.status = ArbiterReqMachineStatus::WaitingOnRemoteXrpcResp {
                                 frame: Box::new(frame),
-                                callers,
+                                layer: index,
                             };
                             return Ok(ArbiterReqMachineStep::RemoteXrpcRequest {
                                 endpoint,
@@ -469,9 +704,29 @@ impl ArbiterReqMachine {
         }
     }
 
+    /// Start the pipeline layer at `layer_idx` in a fresh execution context,
+    /// with the request input. Returns `Ok(None)` when `layer_idx` is past the
+    /// end of the pipeline.
+    fn start_layer(&self, layer_idx: usize) -> Result<Option<ActiveLayer>> {
+        let Some(layer) = self.pipeline.layers.get(layer_idx) else {
+            return Ok(None);
+        };
+        let input = self
+            .input
+            .clone()
+            .expect("input is computed before the first layer is started");
+        let mut frame = layer.policy.clone();
+        let output = frame.start(input)?;
+        Ok(Some(ActiveLayer {
+            index: layer_idx,
+            frame,
+            output,
+        }))
+    }
+
     /// Convert an internal error into a 500 [`XrpcError`] so it can be surfaced
     /// as a terminal error XRPC response.
-    fn internal_error(e: anyhow::Error) -> XrpcError {
+    pub(crate) fn internal_error(e: anyhow::Error) -> XrpcError {
         XrpcError {
             status: http::StatusCode::INTERNAL_SERVER_ERROR,
             error: Some(XrpcErrorKind::Undefined(ErrorResponseBody {
@@ -481,19 +736,29 @@ impl ArbiterReqMachine {
         }
     }
 
+    /// The default deny response for a request no pipeline layer handled:
+    /// every layer passed, or the pipeline is empty.
+    fn default_deny() -> XrpcError {
+        XrpcError {
+            status: http::StatusCode::FORBIDDEN,
+            error: Some(XrpcErrorKind::Undefined(ErrorResponseBody {
+                error: Some("Denied".to_string()),
+                message: Some("request denied by the arbiter policy pipeline".to_string()),
+            })),
+        }
+    }
+
     // ----- value <-> XRPC conversions --------------------------------------
 
-    /// Convert an incoming [`XrpcRequest`] into the Rego `input` value that the
-    /// root policy (and any sub-policy) receives.
+    /// Build the request-core portion of the Rego `input` value:
+    /// `{ method, nsid, parameters, body, encoding }`, where `body` is either
+    /// the JSON value or a [`BYTES_KEY`] marker (with the bytes stashed into
+    /// `buffers`).
     ///
-    /// The input has the shape `{ method, nsid, parameters, body }`, where
-    /// `body` is either the JSON value or a [`BYTES_KEY`] marker (with the
-    /// bytes stashed into `buffers`).
-    fn request_to_input(
-        buffers: &mut Vec<Vec<u8>>,
-        req: &XrpcRequest,
-        ctx: &RequestCtx,
-    ) -> Result<Value> {
+    /// This is the entire input a [`ScopePolicy`] sees; pipeline layers
+    /// receive these fields plus the [`RequestCtx`] context (see
+    /// [`Self::request_to_input`]).
+    fn request_core_to_input(buffers: &mut Vec<Vec<u8>>, req: &XrpcRequest) -> Result<Object> {
         let mut input = Object::new();
         input.insert(Value::from("method"), Value::from(req.method.as_str()));
         input.insert(Value::from("nsid"), Value::from(req.nsid.as_str()));
@@ -512,6 +777,19 @@ impl ArbiterReqMachine {
             Value::from("encoding"),
             req.encoding.clone().map(Value::from).unwrap_or(Value::Null),
         );
+        Ok(input)
+    }
+
+    /// Convert an incoming [`XrpcRequest`] into the full Rego `input` value
+    /// that every pipeline layer receives: the request core (see
+    /// [`Self::request_core_to_input`]) plus the [`RequestCtx`] context
+    /// fields.
+    fn request_to_input(
+        buffers: &mut Vec<Vec<u8>>,
+        req: &XrpcRequest,
+        ctx: &RequestCtx,
+    ) -> Result<Value> {
+        let mut input = Self::request_core_to_input(buffers, req)?;
         // Per-request context (see `RequestCtx`).
         input.insert(
             Value::from("arbiterDid"),
@@ -579,27 +857,9 @@ impl ArbiterReqMachine {
         })
     }
 
-    /// Convert a `policy` host-call argument object into the `input` value for
-    /// the named sub-policy.
-    ///
-    /// The sub-policy receives the same `{ method, nsid, parameters, body,
-    /// encoding }` shape as the root policy. A [`BYTES_KEY`] marker in `body`
-    /// is passed through unchanged: the buffer index stays valid because
-    /// `buffers` is shared across the whole machine. `encoding` defaults to
-    /// null if the host-call argument omits it.
-    fn arg_to_policy_input(arg: &Value) -> Result<Value> {
-        let obj = arg
-            .as_object()
-            .context("policy host call arg must be an object")?;
-        let mut input = Object::new();
-        for key in ["method", "nsid", "parameters", "body", "encoding"] {
-            let v = obj.get(&Value::from(key)).cloned().unwrap_or(Value::Null);
-            input.insert(Value::from(key), v);
-        }
-        Ok(input.into_value())
-    }
-
-    /// Convert the final root-policy result value into an [`XrpcResult`].
+    /// Convert a pipeline layer's handle/deny output value into an
+    /// [`XrpcResult`] (the response the layer decided on, per the convention
+    /// documented on [`Pipeline`]).
     ///
     /// The value is the ok/err envelope:
     /// - `{ "ok": true, "output": <json> }` → `Ok(Data(json))`
@@ -654,8 +914,7 @@ impl ArbiterReqMachine {
     }
 
     /// Convert an [`XrpcResult`] into the ok/err envelope value that is passed
-    /// back to a policy as the result of an `xrpc` host call (and,
-    /// symmetrically, produced by sub-policies).
+    /// back to a policy as the result of an `xrpc` host call.
     ///
     /// A `Bytes` output is stashed into `buffers` and represented via a
     /// [`BYTES_KEY`] marker. Error bodies are JSON-only, matching atrium's
@@ -788,8 +1047,21 @@ fn field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
 fn field_bool(value: &Value, key: &str) -> Result<bool> {
     let v = field(value, key).with_context(|| format!("missing boolean field `{key}`"))?;
     v.as_bool()
-        .copied()
+        .map(|b| *b)
         .with_context(|| format!("field `{key}` must be a boolean"))
+}
+
+/// Whether a layer's output value is the pass marker, `{ "pass": true }`,
+/// which defers the decision to the next pipeline layer.
+fn is_pass_output(value: &Value) -> bool {
+    matches!(field(value, "pass"), Some(v) if matches!(v.as_bool(), Ok(&true)))
+}
+
+/// Whether a layer's output value is the built-in-handler handoff marker,
+/// `{ "handleBuiltin": true }`, which ends evaluation and hands the request
+/// to the arbiter's built-in handler.
+fn is_handle_builtin_output(value: &Value) -> bool {
+    matches!(field(value, "handleBuiltin"), Some(v) if matches!(v.as_bool(), Ok(&true)))
 }
 
 /// Read a required `u16` field from an object value.

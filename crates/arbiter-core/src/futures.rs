@@ -1,5 +1,5 @@
 use crate::{
-    arbiter::{Arbiter, ArbiterReqMachine, ArbiterReqMachineStep, Policies, RequestCtx},
+    arbiter::{Arbiter, ArbiterReqMachine, ArbiterReqMachineStep, Pipeline, RequestCtx},
     xrpc::{XrpcEndpoint, XrpcRequest, XrpcResult},
 };
 
@@ -22,7 +22,7 @@ pub trait ArbiterAsyncIo: Send + Sync {
 
 /// An async version of the [`Arbiter`].
 pub struct AsyncArbiter<Io: ArbiterAsyncIo> {
-    policies: Policies,
+    pipeline: Pipeline,
     io: Io,
 }
 
@@ -31,22 +31,22 @@ impl Arbiter {
     /// an async context without having to manually drive the state machine.
     pub fn into_async<Io: ArbiterAsyncIo>(self, io: Io) -> AsyncArbiter<Io> {
         AsyncArbiter {
-            policies: self.policies,
+            pipeline: self.pipeline,
             io,
         }
     }
 }
 
 impl<Io: ArbiterAsyncIo> AsyncArbiter<Io> {
-    /// Create a new [`AsyncArbiter`] from it's policies and [`ArbiterAsyncIo`]
-    /// implementation.
-    pub fn new(policies: Policies, io: Io) -> Self {
-        Self { policies, io }
+    /// Create a new [`AsyncArbiter`] from its policy pipeline and
+    /// [`ArbiterAsyncIo`] implementation.
+    pub fn new(pipeline: Pipeline, io: Io) -> Self {
+        Self { pipeline, io }
     }
 
-    /// Handle an XRPC request by routing through the arbiter's policies.
+    /// Handle an XRPC request by routing through the arbiter's policy pipeline.
     pub async fn handle_request(&self, req: XrpcRequest, ctx: RequestCtx) -> XrpcResult {
-        ArbiterReqMachine::new(self.policies.clone(), req, ctx)
+        ArbiterReqMachine::new(self.pipeline.clone(), req, ctx)
             .into_future(&self.io)
             .await
     }
@@ -55,6 +55,13 @@ impl<Io: ArbiterAsyncIo> AsyncArbiter<Io> {
 impl ArbiterReqMachine {
     /// Convert the [`ArbiterReqMachine`] into a future that will automatically
     /// advance the state machine using the provided IO implementation.
+    ///
+    /// The async driver has no built-in handler registry, so a pipeline layer
+    /// that hands the request to the arbiter's built-in handler
+    /// ([`ArbiterReqMachineStep::HandToBuiltin`]) cannot be fulfilled here and
+    /// surfaces as a 500 `InternalError` response. Callers that need built-in
+    /// handling must drive [`ArbiterReqMachine`] manually and map the step
+    /// themselves.
     pub fn into_future<Io: ArbiterAsyncIo>(mut self, io: &Io) -> impl Future<Output = XrpcResult> {
         use ArbiterReqMachineStep::*;
         async move {
@@ -62,6 +69,12 @@ impl ArbiterReqMachine {
             loop {
                 match step {
                     Completed(result) => return result,
+                    HandToBuiltin => {
+                        return Err(Self::internal_error(anyhow::anyhow!(
+                            "the policy pipeline handed the request to the arbiter's \
+                             built-in handler, which the async driver cannot execute"
+                        )));
+                    }
                     RemoteXrpcRequest { endpoint, request } => {
                         let resp = io.xrpc_request(endpoint, request).await;
                         step = self.resume(resp);

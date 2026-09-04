@@ -188,6 +188,7 @@ dependencies = [
  "atproto-identity",
  "atproto-jetstream",
  "atproto-oauth",
+ "atproto-record",
  "atrium-api",
  "atrium-xrpc",
  "atrium-xrpc-client",
@@ -203,6 +204,7 @@ dependencies = [
  "reqwest-websocket",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "tower",
@@ -419,6 +421,26 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+]
+
+[[package]]
+name = "atproto-record"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52a83494a80a9add1c3678e821f92153a4b5d139c0b6898bbf5eb97501cf2359"
+dependencies = [
+ "anyhow",
+ "atproto-dasl",
+ "atproto-identity",
+ "base64",
+ "chrono",
+ "cid",
+ "multihash",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

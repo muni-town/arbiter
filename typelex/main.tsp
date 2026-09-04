@@ -57,6 +57,9 @@ namespace town.muni.arbiter.defs {
   /** The requesting user is not allowed to make the request. */
   model ErrPermissionDenied {}
 
+  /** A policy failed to compile, a config input was invalid, or a pipeline-referenced policy record is missing or malformed. */
+  model ErrInvalidPolicy {}
+
   /**
    * The config was changed by another request during the execution of this request.
    * 
@@ -606,6 +609,208 @@ namespace town.muni.arbiter.updateDidDoc {
     }
   ): {
     @required did: did,
+  };
+}
+
+namespace town.muni.arbiter.config {
+  /**
+   * Trusted scopes and policy pipeline configuration for a stewarded
+   * arbiter.
+   *
+   * One record per arbiter (rkey `self`) in the stewarded account's repo,
+   * maintained by `town.muni.arbiter.installPolicy` appends, wholesale
+   * `town.muni.arbiter.resetConfig` rewrites, and direct repo writes, and
+   * hot-reloaded over Jetstream. `trustedScopes` gates which
+   * `*.arbiter.proxy` scopes the arbiter accepts at all; `policyLayers` is the
+   * ordered community policy pipeline evaluated after the scope gate.
+   */
+  @rec("literal:self")
+  model Main {
+    /**
+     * NSID scopes (e.g. `community.lexicon.authCalendar`) this arbiter
+     * accepts. A scoped proxy request's scope — its NSID with the
+     * `.arbiter.proxy` suffix stripped — must be exactly one of these
+     * entries; anything else is rejected before the policy pipeline runs.
+     */
+    @required trustedScopes: string[],
+    /**
+     * Ordered `at://` URIs of `town.muni.arbiter.policy` records (or
+     * same-shaped records in other repos) forming the community policy
+     * pipeline. Evaluated in order: `pass` defers to the next layer, the first
+     * layer that handles or denies wins, and falling off the end denies.
+     */
+    @required policyLayers: string[],
+  }
+}
+
+namespace town.muni.arbiter.policy {
+  /**
+   * A named Rego policy in a stewarded arbiter's policy pipeline.
+   *
+   * The rkey is the policy name; referenced from
+   * `town.muni.arbiter.config/self`'s `policyLayers` as
+   * `at://<did>/town.muni.arbiter.policy/<rkey>`. Remote (app-owned) shared
+   * policies use the same record shape in another repo.
+   */
+  @rec("any")
+  model Main {
+    /** Rego source text for the policy. */
+    @required policy: string,
+  }
+}
+
+namespace town.muni.arbiter.recovery {
+  /**
+   * Recovery-admin designation record for a stewarded arbiter.
+   *
+   * This record is the source of truth for who may recover the arbiter: the
+   * arbiter server re-reads it on every `town.muni.arbiter.installPolicy`
+   * call, and rewriting it rotates the recovery admin with effect on the
+   * next call. Written by the arbiter server at provisioning/import time
+   * (the provisioning caller) and re-written by it when repairing a
+   * half-provisioned account.
+   */
+  @rec("literal:self")
+  model Main {
+    /**
+     * The DID of the account's designated recovery admin — the only account
+     * that may install policies via `town.muni.arbiter.installPolicy` (until
+     * the record is rewritten).
+     */
+    @required did: did,
+  }
+}
+
+namespace town.muni.arbiter.installPolicy {
+  /**
+   * Append a policy layer and/or trusted scopes to a stewarded arbiter's
+   * community policy configuration.
+   *
+   * The caller authenticates via serviceAuth (aud = arbiter-server DID,
+   * lxm = town.muni.arbiter.installPolicy). The request is approved one of
+   * two ways:
+   *
+   * 1. Recovery-admin bypass: the caller is the DID designated in the
+   *    arbiter's `town.muni.arbiter.recovery/self` record. The record is
+   *    re-read from the repo on every call, so rewriting it rotates the
+   *    recovery admin with effect on the next installPolicy call. This path
+   *    bypasses the pipeline and works even while the arbiter is offboarded
+   *    (the bootstrap path: provisioning/import writes the record naming the
+   *    caller, so the very first install always comes from the recovery
+   *    admin).
+   *
+   * 2. Community pipeline: any other caller's install request is evaluated
+   *    by the arbiter's installed policy pipeline (the pipeline sees the
+   *    request with nsid `town.muni.arbiter.installPolicy`). A layer may
+   *    deny the install, answer it itself, or approve it by completing with
+   *    `{ "handleBuiltin": true }`, which hands the request to this
+   *    endpoint's built-in handler to perform the install. Falling off the
+   *    end of the pipeline denies (fail-closed). The arbiter must be online
+   *    for this path; if it is offboarded the request is denied and the
+   *    recovery admin should use `town.muni.arbiter.resetConfig` to restore
+   *    it.
+   *
+   * Semantics — append only. The referenced policy layer is appended at the
+   * END of the arbiter's policy layers (lowest priority: an appended layer only
+   * sees requests the community's existing layers pass), and the trusted
+   * scopes are unioned into the existing set (already-present entries keep
+   * their position, new ones are appended, duplicates are dropped). Nothing
+   * already installed is ever removed or reordered. Re-installing a policy
+   * whose at:// URI is already in the pipeline does not duplicate it or
+   * elevate its priority: its position is kept, and updated behavior comes
+   * from updating the referenced record in its own repo (the update
+   * propagates over Jetstream to every arbiter referencing it). When the
+   * request would change nothing, the config record is not rewritten.
+   *
+   * This endpoint never writes policy records: `policy` must reference an
+   * existing `town.muni.arbiter.policy` record (in any repo — the caller's
+   * own, the stewarded account's, or a shared app-owned one) that the
+   * caller wrote beforehand, and it must compile. When the merged scopes or
+   * policy layers differ from the current ones, they are written to
+   * `town.muni.arbiter.config/self` in the stewarded account's repo
+   * (putRecord with swapCommit CAS), then the arbiter is re-onboarded.
+   *
+   * If no recovery admin is designated in the record, or the account is
+   * not stewarded by this server, this endpoint is unavailable (forbidden).
+   */
+  @procedure
+  @errors(
+    town.muni.arbiter.defs.ErrPermissionDenied,
+    town.muni.arbiter.defs.ErrInvalidPolicy,
+  )
+  op main(
+    @required input: {
+      /** The stewarded account whose policy layers to append to. */
+      @required arbiterDid: did,
+      /**
+       * At-uri of a `town.muni.arbiter.policy` record to append to the
+       * arbiter's policy layers as their last (lowest-priority) layer. The record may live in
+       * any repo (the caller's own, the stewarded account's, or a shared
+       * app-owned one), must already exist, carry a string `policy` field,
+       * and compile. Must be shaped
+       * `at://<did>/town.muni.arbiter.policy/<rkey>`. This endpoint never
+       * writes policy records. Omit to change trusted scopes only.
+       */
+      policy?: string,
+      /**
+       * NSID scopes (e.g. `community.lexicon.authCalendar`) the arbiter
+       * accepts, unioned into the existing set: entries already trusted
+       * keep their position, new ones are appended, duplicates are
+       * dropped. Required; may be empty (a policy-only or no-op install).
+       * A scoped proxy request's scope — its NSID with the
+       * `.arbiter.proxy` suffix stripped — must be exactly one of the
+       * resulting entries.
+       */
+      @required trustedScopes: string[],
+    }
+  ): {
+    @required ok: boolean
+  };
+}
+namespace town.muni.arbiter.resetConfig {
+  /**
+   * Recovery hatch: replace a stewarded arbiter's configuration record
+   * wholesale.
+   *
+   * The caller authenticates via serviceAuth (aud = arbiter-server DID,
+   * lxm = town.muni.arbiter.resetConfig). Only the account designated in
+   * the arbiter's `town.muni.arbiter.recovery/self` record (the recovery
+   * admin) may reset; the record is re-read from the repo on every call, so
+   * rewriting it rotates the recovery admin with effect on the next call.
+   *
+   * This endpoint never evaluates the policy pipeline and works while the
+   * arbiter is offboarded (a broken config is exactly what it repairs): the
+   * `town.muni.arbiter.config/self` record is replaced verbatim (putRecord
+   * with swap_commit CAS, the same machinery as installPolicy) and the
+   * arbiter is re-onboarded. The body is shape-validated only — no pipeline
+   * compile checks and no record-existence checks: if the new config also
+   * fails to load, reset again.
+   */
+  @procedure
+  @errors(town.muni.arbiter.defs.ErrPermissionDenied)
+  op main(
+    @required input: {
+      /** The stewarded account whose configuration to replace. */
+      @required arbiterDid: did,
+      /**
+       * NSID scopes (e.g. `community.lexicon.authCalendar`) the arbiter
+       * accepts. A scoped proxy request's scope — its NSID with the
+       * `.arbiter.proxy` suffix stripped — must be exactly one of these
+       * entries. Written to the arbiter's `town.muni.arbiter.config/self`
+       * record verbatim.
+       */
+      @required trustedScopes: string[],
+      /**
+       * Ordered `at://` URIs of `town.muni.arbiter.policy` records forming
+       * the policy layers. Written to the arbiter's
+       * `town.muni.arbiter.config/self` record verbatim; entries are not
+       * validated beyond their shape — if the new config fails to load,
+       * reset again.
+       */
+      @required policyLayers: string[],
+    }
+  ): {
+    @required ok: boolean
   };
 }
 

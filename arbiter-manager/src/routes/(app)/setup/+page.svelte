@@ -66,10 +66,10 @@
                   : s === 'app-password'
                     ? 'App Password'
                     : s === 'select-admin'
-                        ? 'Admin'
-                        : s === 'create'
-                          ? 'Create'
-                          : 'Done'}
+                      ? 'Finish'
+                      : s === 'create'
+                        ? 'Create'
+                        : 'Done'}
           </span>
           {#if i < steps.length - 1}
             <span class="w-6 h-px bg-base-300 dark:bg-base-700"></span>

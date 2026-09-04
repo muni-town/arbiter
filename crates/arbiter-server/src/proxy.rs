@@ -24,6 +24,7 @@ use atrium_xrpc_client::reqwest::{ReqwestClient, ReqwestClientBuilder};
 use moka::future::Cache;
 use serde_json::Value;
 use tracing::warn;
+use crate::CONFIG;
 
 /// An authenticated session against a stewarded account's PDS.
 type Session = CredentialSession<MemorySessionStore, ReqwestClient>;
@@ -174,6 +175,25 @@ fn enforce_response_size(
 /// out. We reject oversized responses here, before they reach the machine.
 const MAX_PROXIED_RESPONSE_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 
+/// Reject a policy-issued remote XRPC call whose target DID is the arbiter
+/// server itself (`CONFIG.server_did`): the arbiter must never proxy to
+/// itself — a pipeline issuing `installPolicy` (or any other arbiter NSID)
+/// back at the arbiter would loop pipeline → install → pipeline. Mirrors the
+/// machine's unknown-host-fn path: the issuing policy receives the error
+/// envelope and decides how to handle it.
+fn self_target_error(endpoint: &str) -> XrpcError {
+    XrpcError {
+        status: axum::http::StatusCode::BAD_REQUEST,
+        error: Some(XrpcErrorKind::Undefined(ErrorResponseBody {
+            error: Some("SelfProxyForbidden".into()),
+            message: Some(format!(
+                "refusing to proxy to the arbiter server itself (`{endpoint}`): \
+                 the arbiter must never proxy to itself"
+            )),
+        })),
+    }
+}
+
 /// Send `request` to `endpoint` (`did#service`), authenticating to the
 /// destination as the stewarded account.
 ///
@@ -195,6 +215,16 @@ pub async fn execute_remote(
         Some((d, s)) => (d.to_string(), s.to_string()),
         None => (endpoint.to_string(), String::from("atproto_pds")),
     };
+    // Recursion guard, before any dispatch (no session login is attempted):
+    // a target DID equal to this server's own DID is always a self-proxy.
+    if target_did_str == CONFIG.server_did {
+        warn!(
+            stewarded_did,
+            endpoint,
+            "policy tried to proxy to the arbiter server itself; refusing"
+        );
+        return Err(self_target_error(endpoint));
+    }
     let target_did = match Did::new(target_did_str) {
         Ok(d) => d,
         Err(e) => {

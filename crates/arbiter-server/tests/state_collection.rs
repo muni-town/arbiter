@@ -1,38 +1,35 @@
 //! Unit tests for `ArbiterCollection` — the in-memory arbiter registry.
 //!
-//! These tests cover the critical security invariants from SERVER_PLAN.md §4:
+//! These tests cover the critical security invariants from SERVER_PLAN §4:
 //! - **Monotonic rev gating**: older/duplicate revs must not regress policy.
 //! - **Fail-closed**: un-onboarded arbiters must refuse requests (503).
-//! - **Lifecycle**: onboard / offboard / contains.
+//! - **Lifecycle**: onboard / offboard.
+//! - **Trusted-scope gate**: scoped requests are gated on the loaded config's
+//!   `trustedScopes` before any policy runs.
 
-use std::collections::HashMap;
-
-use arbiter_core::arbiter::{Arbiter, ArbiterReqMachineStep, Policies, RequestCtx};
-use arbiter_core::policy::PolicyVm;
+use arbiter_core::arbiter::{Arbiter, ArbiterReqMachineStep, Layer, Pipeline, RequestCtx};
 use arbiter_core::xrpc::{XrpcOutput, XrpcRequest};
 use atrium_xrpc::http;
-use regorus::Value;
 
 use arbiter_server::error::AppError;
 use arbiter_server::state::ArbiterCollection;
 
-/// Build a simple `Arbiter` with a root policy that immediately returns success.
+/// Build a simple `Arbiter` with a single pipeline layer that immediately
+/// returns success.
 fn test_arbiter() -> Arbiter {
-    let root = PolicyVm::new(
+    Arbiter::new(Pipeline::from_layers(vec![Layer::compile(
         r#"
         package arbiter
         result := { "ok": true, "output": { "got": input.nsid } }
         "#,
-        Value::new_object(),
-        "data.arbiter.result",
-        &["xrpc", "policy"],
+        "builtin:test",
+        None,
     )
-    .expect("policy compiles");
-    Arbiter::new(Policies::new(root, HashMap::new()))
+    .expect("policy compiles")]))
 }
 
-/// An arbiter whose root policy echoes a fixed `tag`, so tests can tell which
-/// policy instance is currently active.
+/// An arbiter whose single pipeline layer echoes a fixed `tag`, so tests can
+/// tell which policy instance is currently active.
 fn tagged_arbiter(tag: &str) -> Arbiter {
     let src = format!(
         r#"
@@ -40,12 +37,15 @@ fn tagged_arbiter(tag: &str) -> Arbiter {
         result := {{ "ok": true, "output": {{ "tag": "{tag}" }} }}
         "#
     );
-    let root = PolicyVm::new(&src, Value::new_object(), "data.arbiter.result", &["xrpc", "policy"])
-        .expect("policy compiles");
-    Arbiter::new(Policies::new(root, HashMap::new()))
+    Arbiter::new(Pipeline::from_layers(vec![Layer::compile(
+        &src,
+        "builtin:tagged",
+        None,
+    )
+    .expect("policy compiles")]))
 }
 
-/// Run the arbiter's root policy for `did` and return the `tag` in the output,
+/// Run the arbiter's pipeline for `did` and return the `tag` in the output,
 /// asserting the machine completes immediately.
 async fn active_tag(col: &ArbiterCollection, did: &str) -> String {
     let mut drive = col
@@ -102,8 +102,14 @@ async fn fail_closed_unonboarded() {
 #[tokio::test]
 async fn onboard_then_request_succeeds() {
     let col = ArbiterCollection::new();
-    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string(), None)
-        .await;
+    col.onboard(
+        DID_A.to_string(),
+        test_arbiter(),
+        PDS_A.to_string(),
+        Vec::new(),
+        None,
+    )
+    .await;
 
     assert!(is_serving(&col, DID_A).await);
 
@@ -130,8 +136,14 @@ async fn onboard_then_request_succeeds() {
 #[tokio::test]
 async fn offboard_then_fail_closed() {
     let col = ArbiterCollection::new();
-    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string(), None)
-        .await;
+    col.onboard(
+        DID_A.to_string(),
+        test_arbiter(),
+        PDS_A.to_string(),
+        Vec::new(),
+        None,
+    )
+    .await;
     assert!(
         col.offboard(DID_A).await,
         "offboard should return was-active"
@@ -151,6 +163,45 @@ async fn offboard_unknown_returns_false() {
     assert!(!col.offboard("did:plc:unknown").await);
 }
 
+// ─── trusted-scope gate ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn trusted_scope_gate() {
+    // The scope gate mirrors begin_request's fail-closed semantics: an
+    // un-onboarded DID is not ready, a trusted prefix passes, and an
+    // untrusted prefix is rejected before any policy runs.
+    let col = ArbiterCollection::new();
+    let err = col
+        .check_trusted_scope(DID_A, "community.test.cal")
+        .await
+        .err()
+        .expect("un-onboarded DID must fail the scope gate");
+    assert!(matches!(&err, AppError::ArbiterNotReady(_)));
+
+    col.onboard(
+        DID_A.to_string(),
+        test_arbiter(),
+        PDS_A.to_string(),
+        vec!["community.test.cal".to_string()],
+        None,
+    )
+    .await;
+
+    col.check_trusted_scope(DID_A, "community.test.cal")
+        .await
+        .expect("trusted prefix must pass");
+
+    let err = col
+        .check_trusted_scope(DID_A, "community.other.thing")
+        .await
+        .err()
+        .expect("untrusted prefix must be rejected");
+    assert!(
+        matches!(&err, AppError::Forbidden(_)),
+        "expected Forbidden, got {err:?}"
+    );
+}
+
 // ─── stale onboard does not regress (concurrent reload race) ────────────────
 
 #[tokio::test]
@@ -161,26 +212,34 @@ async fn stale_onboard_does_not_regress() {
     let col = ArbiterCollection::new();
 
     // Fresh load at rev "ccc" with tag "new".
-    col.onboard(
-        DID_A.to_string(),
-        tagged_arbiter("new"),
-        PDS_A.to_string(),
-        Some("ccc".to_string()),
-    )
-    .await;
+    let fresh_applied = col
+        .onboard(
+            DID_A.to_string(),
+            tagged_arbiter("new"),
+            PDS_A.to_string(),
+            Vec::new(),
+            Some("ccc".to_string()),
+        )
+        .await;
+    assert!(fresh_applied, "fresh load must apply");
     assert_eq!(active_tag(&col, DID_A).await, "new");
 
     // Stale load at rev "aaa" (older snapshot) finishing afterwards.
-    col.onboard(
-        DID_A.to_string(),
-        tagged_arbiter("stale"),
-        PDS_A.to_string(),
-        Some("aaa".to_string()),
-    )
-    .await;
+    let stale_applied = col
+        .onboard(
+            DID_A.to_string(),
+            tagged_arbiter("stale"),
+            PDS_A.to_string(),
+            Vec::new(),
+            Some("aaa".to_string()),
+        )
+        .await;
 
-    // The newer policy and floor must remain active.
+    // The newer policy and floor must remain active, and the stale load must
+    // report itself as not applied, so callers never propagate its pipeline
+    // state (e.g. never index it).
     assert_eq!(active_tag(&col, DID_A).await, "new", "stale load regressed policy");
+    assert!(!stale_applied, "stale load must report not-applied");
     assert!(
         !col.is_newer(DID_A, "bbb").await,
         "stale load lowered the floor"
@@ -196,6 +255,7 @@ async fn equal_floor_onboard_replaces() {
         DID_A.to_string(),
         tagged_arbiter("v1"),
         PDS_A.to_string(),
+        Vec::new(),
         Some("bbb".to_string()),
     )
     .await;
@@ -203,6 +263,7 @@ async fn equal_floor_onboard_replaces() {
         DID_A.to_string(),
         tagged_arbiter("v2"),
         PDS_A.to_string(),
+        Vec::new(),
         Some("bbb".to_string()),
     )
     .await;
@@ -216,8 +277,14 @@ async fn rev_first_is_always_newer_without_floor() {
     // With no floor (e.g. a fresh arbiter where we failed to read the PDS head),
     // any rev is accepted — there is nothing to compare against.
     let col = ArbiterCollection::new();
-    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string(), None)
-        .await;
+    col.onboard(
+        DID_A.to_string(),
+        test_arbiter(),
+        PDS_A.to_string(),
+        Vec::new(),
+        None,
+    )
+    .await;
     assert!(
         col.is_newer(DID_A, "aaa").await,
         "without a floor, the first rev should be accepted"
@@ -235,6 +302,7 @@ async fn rev_at_or_below_floor_rejected() {
         DID_A.to_string(),
         test_arbiter(),
         PDS_A.to_string(),
+        Vec::new(),
         Some("ccc".to_string()),
     )
     .await;
@@ -259,6 +327,7 @@ async fn rev_newer_accepted() {
         DID_A.to_string(),
         test_arbiter(),
         PDS_A.to_string(),
+        Vec::new(),
         Some("aaa".to_string()),
     )
     .await;
@@ -279,6 +348,7 @@ async fn rev_older_rejected() {
         DID_A.to_string(),
         test_arbiter(),
         PDS_A.to_string(),
+        Vec::new(),
         Some("bbb".to_string()),
     )
     .await;
@@ -295,6 +365,7 @@ async fn rev_duplicate_rejected() {
         DID_A.to_string(),
         test_arbiter(),
         PDS_A.to_string(),
+        Vec::new(),
         Some("aaa".to_string()),
     )
     .await;
@@ -326,6 +397,7 @@ async fn rev_floor_reset_on_reonboard() {
         DID_A.to_string(),
         test_arbiter(),
         PDS_A.to_string(),
+        Vec::new(),
         Some("ccc".to_string()),
     )
     .await;
@@ -335,6 +407,7 @@ async fn rev_floor_reset_on_reonboard() {
         DID_A.to_string(),
         test_arbiter(),
         PDS_A.to_string(),
+        Vec::new(),
         Some("eee".to_string()),
     )
     .await;
@@ -350,10 +423,22 @@ async fn multiple_dids_independent() {
     let did_b = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
     let pds_b = "http://pds-b.example";
 
-    col.onboard(DID_A.to_string(), test_arbiter(), PDS_A.to_string(), None)
-        .await;
-    col.onboard(did_b.to_string(), test_arbiter(), pds_b.to_string(), None)
-        .await;
+    col.onboard(
+        DID_A.to_string(),
+        test_arbiter(),
+        PDS_A.to_string(),
+        Vec::new(),
+        None,
+    )
+    .await;
+    col.onboard(
+        did_b.to_string(),
+        test_arbiter(),
+        pds_b.to_string(),
+        Vec::new(),
+        None,
+    )
+    .await;
 
     assert!(is_serving(&col, DID_A).await);
     assert!(is_serving(&col, did_b).await);

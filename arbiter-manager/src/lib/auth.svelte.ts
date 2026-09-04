@@ -21,7 +21,8 @@ const atprotoOauthScope = [
   'rpc:town.muni.arbiter.createArbiter?aud=*',
   'rpc:town.muni.arbiter.createAppPasswordArbiter?aud=*',
   'rpc:town.muni.arbiter.proxy?aud=*',
-  'rpc:town.muni.arbiter.resetPolicy?aud=*',
+  'rpc:town.muni.arbiter.installPolicy?aud=*',
+  'rpc:town.muni.arbiter.resetConfig?aud=*',
 ].join(' ');
 
 export class Auth {

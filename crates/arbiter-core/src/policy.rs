@@ -32,8 +32,8 @@ pub struct PolicyVm {
 ///
 /// The limit is enforced cooperatively by the [`RegoVM`]'s execution timer: it
 /// ticks once per VM instruction and only counts wall-clock time spent *inside*
-/// the policy evaluator. Time spent in async host functions (e.g. `xrpc` and
-/// `policy` calls) is suspended out, so the budget bounds the work the untrusted
+/// the policy evaluator. Time spent in async host functions (e.g. `xrpc`
+/// calls) is suspended out, so the budget bounds the work the untrusted
 /// policy can perform, not host latency. A tight infinite loop will burn this
 /// budget and be aborted with a time-limit error.
 const DEFAULT_EXECUTION_TIME_LIMIT: Duration = Duration::from_millis(100);

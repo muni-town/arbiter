@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use arbiter_server::{
-    AppState, CONFIG, credstore::CredentialStore, handlers, jetstream, policy, resolver::RESOLVER,
-    state::ArbiterCollection, storage,
+    AppState, CONFIG, credstore::CredentialStore, handlers, jetstream, permission_set, policy,
+    resolver::RESOLVER, state::ArbiterCollection, storage,
 };
 
 #[tokio::main]
@@ -33,6 +33,9 @@ async fn main() -> anyhow::Result<()> {
         arbiters: ArbiterCollection::new(),
         store,
         resolver: RESOLVER.clone(),
+        scopes: permission_set::ScopeResolver::new(Arc::new(
+            permission_set::AtprotoLexiconSource::new(RESOLVER.clone()),
+        )),
         default_pds: CONFIG.default_pds.clone(),
         invite_code: CONFIG.invite_code.clone(),
     });

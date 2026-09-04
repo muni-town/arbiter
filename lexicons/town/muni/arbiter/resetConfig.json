@@ -1,0 +1,50 @@
+{
+  "lexicon": 1,
+  "id": "town.muni.arbiter.resetConfig",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Recovery hatch: replace a stewarded arbiter's configuration record\nwholesale.\n\nThe caller authenticates via serviceAuth (aud = arbiter-server DID,\nlxm = town.muni.arbiter.resetConfig). Only the account designated in\nthe arbiter's `town.muni.arbiter.recovery/self` record (the recovery\nadmin) may reset; the record is re-read from the repo on every call, so\nrewriting it rotates the recovery admin with effect on the next call.\n\nThis endpoint never evaluates the policy pipeline and works while the\narbiter is offboarded (a broken config is exactly what it repairs): the\n`town.muni.arbiter.config/self` record is replaced verbatim (putRecord\nwith swap_commit CAS, the same machinery as installPolicy) and the\narbiter is re-onboarded. The body is shape-validated only — no pipeline\ncompile checks and no record-existence checks: if the new config also\nfails to load, reset again.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "arbiterDid": {
+              "type": "string",
+              "format": "did",
+              "description": "The stewarded account whose configuration to replace."
+            },
+            "trustedScopes": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "NSID scopes (e.g. `community.lexicon.authCalendar`) the arbiter accepts.\nA scoped proxy request's scope — its NSID with the `.arbiter.proxy` suffix\nstripped — must be exactly one of these entries. Written to the arbiter's\n`town.muni.arbiter.config/self` record verbatim."
+            },
+            "policyLayers": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Ordered `at://` URIs of `town.muni.arbiter.policy` records forming the\npolicy layers. Written to the arbiter's `town.muni.arbiter.config/self`\nrecord verbatim; entries are not validated beyond their shape — if the\nnew config fails to load, reset again."
+            }
+          },
+          "required": ["arbiterDid", "trustedScopes", "policyLayers"]
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "ok": { "type": "boolean" }
+          },
+          "required": ["ok"]
+        }
+      },
+      "errors": [
+        {
+          "name": "ErrPermissionDenied",
+          "description": "The caller is not the recovery admin designated in\n`town.muni.arbiter.recovery/self`, no (valid) recovery admin is\ndesignated there, or the account is not stewarded by this server."
+        }
+      ]
+    }
+  }
+}

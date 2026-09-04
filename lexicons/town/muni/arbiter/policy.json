@@ -1,0 +1,21 @@
+{
+  "lexicon": 1,
+  "id": "town.muni.arbiter.policy",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A named Rego policy in a stewarded arbiter's policy pipeline.\n\nThe rkey is the policy name; referenced from\n`town.muni.arbiter.config/self`'s `policyLayers` as\n`at://<did>/town.muni.arbiter.policy/<rkey>`. Remote (app-owned) shared\npolicies use the same record shape in another repo.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "properties": {
+          "policy": {
+            "type": "string",
+            "description": "Rego source text for the policy."
+          }
+        },
+        "required": ["policy"]
+      }
+    }
+  }
+}

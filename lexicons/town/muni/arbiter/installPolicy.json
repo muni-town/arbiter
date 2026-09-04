@@ -1,0 +1,54 @@
+{
+  "lexicon": 1,
+  "id": "town.muni.arbiter.installPolicy",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Append a policy layer and/or trusted scopes to a stewarded\narbiter's community policy configuration.\n\nThe caller authenticates via serviceAuth (aud = arbiter-server DID,\nlxm = town.muni.arbiter.installPolicy). The request is approved one of\ntwo ways:\n\n1. Recovery-admin bypass: the caller is the DID designated in the\n   arbiter's `town.muni.arbiter.recovery/self` record. The record is\n   re-read from the repo on every call, so rewriting it rotates the\n   recovery admin with effect on the next installPolicy call. This path\n   bypasses the pipeline and works even while the arbiter is offboarded\n   (the bootstrap path: provisioning/import writes the record naming the\n   caller, so the very first install always comes from the recovery\n   admin).\n\n2. Community pipeline: any other caller's install request is evaluated\n   by the arbiter's installed policy pipeline (the pipeline sees the\n   request with nsid `town.muni.arbiter.installPolicy`). A layer may\n   deny the install, answer it itself, or approve it by completing with\n   `{ \"handleBuiltin\": true }`, which hands the request to this\n   endpoint's built-in handler to perform the install. Falling off the\n   end of the pipeline denies (fail-closed). The arbiter must be online\n   for this path; if it is offboarded the request is denied and the\n   recovery admin should use `town.muni.arbiter.resetConfig` to restore\n   it.\n\nSemantics — append only. The referenced policy layer is appended at the\nEND of the arbiter's policy layers (lowest priority: an appended layer only\nsees requests the community's existing layers pass), and the trusted\nscopes are unioned into the existing set (already-present entries keep\ntheir position, new ones are appended, duplicates are dropped). Nothing\nalready installed is ever removed or reordered. Re-installing a policy\nwhose at:// URI is already in the pipeline does not duplicate it or\nelevate its priority: its position is kept, and updated behavior comes\nfrom updating the referenced record in its own repo (the update\npropagates over Jetstream to every arbiter referencing it). When the\nrequest would change nothing, the config record is not rewritten.\n\nThis endpoint never writes policy records: `policy` must reference an\nexisting `town.muni.arbiter.policy` record (in any repo — the caller's\nown, the stewarded account's, or a shared app-owned one) that the\ncaller wrote beforehand, and it must compile. When the merged scopes or\npolicy layers differ from the current ones, they are written to\n`town.muni.arbiter.config/self` in the stewarded account's repo\n(putRecord with swapCommit CAS), then the arbiter is re-onboarded.\n\nIf no recovery admin is designated in the record, or the account is\nnot stewarded by this server, this endpoint is unavailable (forbidden).",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "arbiterDid": {
+              "type": "string",
+              "format": "did",
+              "description": "The stewarded account whose policy layers to append to."
+            },
+            "policy": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "At-uri of a `town.muni.arbiter.policy` record to append to the\narbiter's policy layers as their last (lowest-priority) layer. The record may live in\nany repo (the caller's own, the stewarded account's, or a shared\napp-owned one), must already exist, carry a string `policy` field,\nand compile. Must be shaped `at://<did>/town.muni.arbiter.policy/<rkey>`.\nThis endpoint never writes policy records. Omit to change trusted\nscopes only."
+            },
+            "trustedScopes": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "NSID scopes (e.g. `community.lexicon.authCalendar`) the arbiter\naccepts, unioned into the existing set: entries already trusted keep\ntheir position, new ones are appended, duplicates are dropped.\nRequired; may be empty (a policy-only or no-op install). A scoped\nproxy request's scope — its NSID with the `.arbiter.proxy` suffix\nstripped — must be exactly one of the resulting entries."
+            }
+          },
+          "required": ["arbiterDid", "trustedScopes"]
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "ok": { "type": "boolean" }
+          },
+          "required": ["ok"]
+        }
+      },
+      "errors": [
+        {
+          "name": "ErrPermissionDenied",
+          "description": "The caller is not the recovery admin designated in\n`town.muni.arbiter.recovery/self`, no (valid) recovery admin is\ndesignated there, or the account is not stewarded by this server."
+        },
+        {
+          "name": "ErrInvalidPolicy",
+          "description": "The `policy` at-uri is malformed or does not reference a\n`town.muni.arbiter.policy` record, the referenced record is missing,\nmalformed, or fails to compile, or a trusted scope is not a valid\nNSID."
+        }
+      ]
+    }
+  }
+}

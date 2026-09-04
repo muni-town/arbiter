@@ -13,9 +13,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PdsCredentials {
     pub password: String,
-    /// The recovery-admin DID (`town.muni.arbiter.recovery/self`) designated at
-    /// provisioning time (the caller). Persisted so a half-provisioned account
-    /// can be repaired at startup / on reconnect without the original caller.
+    /// Bootstrap designation of the recovery-admin DID, recorded at
+    /// provisioning/import time (the caller). The authoritative recovery admin
+    /// is the `did` field of the account's `town.muni.arbiter.recovery/self`
+    /// record, which the server re-reads on every `installPolicy` call; this
+    /// stored copy exists only so `repair_provisioning` can (re)write that
+    /// record for half-provisioned accounts.
     pub recovery_admin: String,
     /// Whether the `service/self` + `recovery/self` bootstrap records were
     /// successfully written. `false` means the account is only partially

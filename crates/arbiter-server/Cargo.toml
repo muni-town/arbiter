@@ -29,6 +29,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 moka = { version = "0.12", features = ["future"] }
 atproto-identity = "0.14.5"
 atproto-oauth = "0.14.5"
+atproto-record = "0.14.5"
 atrium-xrpc-client = { version = "0.5.15", features = ["reqwest"], default-features = false }
 atrium-xrpc = "0.12.4"
 atrium-api = { version = "0.25.8", default-features = false, features = ["agent"] }
@@ -48,3 +49,8 @@ atproto-jetstream = "0.14.5"
 reqwest-websocket = "0.4"
 # Stream/Sink combinators for the reqwest-websocket WebSocket.
 futures-util = "0.3"
+
+[dev-dependencies]
+# sha2-256 record CIDs for the mock PDS in the integration tests (the same
+# shape real PDS records carry).
+sha2 = "0.10"

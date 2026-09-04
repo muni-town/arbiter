@@ -19,8 +19,10 @@ use tokio::sync::OnceCell;
 use crate::credstore::{CredentialStore, PdsCredentials};
 
 /// Schema for the credentials table. `password` is stored in plaintext (see module docs).
-/// The PDS endpoint is resolved from the DID doc. `recovery_admin` is the caller
-/// that provisioned the account (used to repair a half-provisioned account).
+/// The PDS endpoint is resolved from the DID doc. `recovery_admin` is the
+/// bootstrap designation of the recovery admin (the provisioning caller); the
+/// authoritative admin is the `town.muni.arbiter.recovery/self` record, and
+/// this value only repairs a half-provisioned account by re-writing it.
 /// `provisioned` distinguishes a partially-provisioned account (bootstrap
 /// records not yet written) from a fully-provisioned one (whose service record
 /// disappearing later is a deliberate auto-delete, not to be repaired).

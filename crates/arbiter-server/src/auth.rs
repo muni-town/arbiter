@@ -4,6 +4,10 @@
 //! (issued via `com.atproto.server.getServiceAuth`) and yields the caller DID
 //! (the token `iss`) and the bound `lxm`.
 //!
+//! The `aud` claim must name this server — either the bare server DID or the
+//! `<server_did>#arbiter` fragment form a PDS sends when proxying an app's
+//! scoped request to the arbiter service.
+//!
 //! Verification model: the token is signed **by the caller account** (not by
 //! the PDS). The `iss` claim is the caller's DID; we resolve that DID document,
 //! extract its signing key from the verification methods, and verify the JWT
@@ -149,13 +153,18 @@ impl FromRequestParts<Arc<AppState>> for CallerDid {
         let claims = verify(jwt, &key_data)
             .map_err(|e| AppError::Unauthorized(format!("serviceAuth verification failed: {e}")))?;
 
-        // 5. Check `aud == CONFIG.server_did`.
+        // 5. Check `aud` is this server: either the bare server DID, or the
+        //    `<server_did>#arbiter` fragment form a PDS sends when proxying an
+        //    app's request to the arbiter's service (atproto proxying sets
+        //    `aud` to the target DID's service-audience form).
         let aud = claims
             .jose
             .audience
             .as_deref()
             .ok_or_else(|| AppError::Unauthorized("serviceAuth missing `aud` claim".into()))?;
-        if aud != CONFIG.server_did {
+        let aud_ok = aud == CONFIG.server_did
+            || aud == format!("{}#arbiter", CONFIG.server_did);
+        if !aud_ok {
             return Err(AppError::Unauthorized(format!(
                 "serviceAuth `aud` `{aud}` does not match this server `{}`",
                 CONFIG.server_did

@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "record",
-      "description": "Recovery-admin designation record. Documents who is intended to\nrecover the arbiter. The arbiter does not yet act on this record;\nrecovery is via direct PDS access for now.",
+      "description": "Recovery-admin designation record for a stewarded arbiter. This record\nis the source of truth for who may recover the arbiter: the arbiter\nserver re-reads it on every `town.muni.arbiter.installPolicy` call, and\nrewriting it rotates the recovery admin with effect on the next call.\nWritten by the arbiter server at provisioning/import time (did = the\nprovisioning caller) and re-written by it when repairing a\nhalf-provisioned account.",
       "key": "literal:self",
       "record": {
         "type": "object",
@@ -12,7 +12,7 @@
           "did": {
             "type": "string",
             "format": "did",
-            "description": "The DID of the designated recovery admin."
+            "description": "The DID of the account's designated recovery admin — the only\naccount that may install policies via `town.muni.arbiter.installPolicy`\n(until the record is rewritten)."
           }
         },
         "required": ["did"]

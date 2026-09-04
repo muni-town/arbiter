@@ -2,9 +2,9 @@
 
 A total rewrite of `arbiter-server`. The existing `crates/arbiter-server` code
 (salvo, JSON-file persistence, the member/space XRPCs, the `atproto-proxy`
-routing) is a throwaway — do not port from it. `arbiter-core` is unchanged and
-already fits the model: `Policies { root_policy, sub_policies: HashMap<String, _> }`
-maps directly onto the PDS record scheme below.
+routing) is a throwaway — do not port from it. `arbiter-core` supplies the
+model: an ordered policy pipeline (`arbiter_core::arbiter::Pipeline`) maps
+directly onto the PDS record scheme below.
 
 ## 1. Identity & routing
 
@@ -88,33 +88,48 @@ panic/500-with-trace.
 
 Policies live as PDS records on the stewarded account's repo:
 
-- `town.muni.arbiter.policy.root/self` — the root Rego policy.
-- `town.muni.arbiter.policy.sub/<name>` — named sub-policies.
-
-These map 1:1 onto `Policies::new(root, HashMap<name>)`.
+- `town.muni.arbiter.config/self` — the arbiter config: `trustedScopes`
+  (NSID scopes accepted via the scoped `*.arbiter.proxy` endpoints) plus
+  the ordered `at://` policy pipeline.
+- `town.muni.arbiter.policy/<rkey>` — a named Rego policy (the rkey is
+  the policy name), referenced from the config's `policyLayers` as
+  `at://<did>/town.muni.arbiter.policy/<rkey>`. Remote (app-owned) shared
+  policies use the same record shape in another repo.
 
 ### Startup
 
-On boot the server fetches the latest root + sub-policies from each stewarded
-account's PDS. **Fail closed**: until an arbiter's policies have loaded, it
-refuses requests for that arbiter. Retry the fetch with exponential backoff.
-Do not serve stale/unknown policy.
+On boot the server loads each stewarded account's `config/self` record and
+resolves its pipeline — fetching every referenced policy record (local or
+remote) and compiling it. **Fail closed**: until an arbiter's config +
+pipeline have loaded, it refuses requests for that arbiter. Each load is
+retried with bounded exponential backoff; after repeated consecutive
+failures the arbiter is left offboarded and a later Jetstream event or
+restart retries. Do not serve stale/unknown policy.
 
 ### Hot reload
 
 The server subscribes to Jetstream and watches for writes to the
-`town.muni.arbiter.policy.*` collections. On a policy update it reinstantiates
-the arbiter so subsequent requests use the new policies.
+`town.muni.arbiter.policy` collection in any repo — a shared policy-record
+write reloads exactly the arbiters whose pipeline references it — and for
+`town.muni.arbiter.config/self` writes in stewarded repos. On an update it
+reinstantiates the arbiter so subsequent requests use the new pipeline.
 
 **Monotonic versioning (required):** Jetstream can deliver reordered or
-duplicate events. Track the last-applied `rev` (the repo commit `rev` from the
-Jetstream commit event) per policy record key. Only apply an update when its
-`rev` is strictly newer than the last-applied `rev` for that record; discard
-older/duplicate events. Without this, a reordered event regresses policy — a
-security bug in an enforcement server.
+duplicate events. Track a per-arbiter `rev_floor` — the steward repo's
+head `rev` (via `getRepoStatus`) captured before the records are read; if
+the PDS reports none, the floor is unset. A steward-repo event with
+`rev <= floor` describes state already reflected in the loaded records and
+is discarded. Every accepted event re-runs the full load (re-reading the
+PDS, never applying the event payload) and re-captures the floor from the
+fresh head, so a reordered or duplicate event regresses nothing and no
+per-record dedup map is needed. Events from other repos (remote
+policy-record writes) skip the gate — each repo's `rev` stream is an
+independent TID timeline — and only risk a redundant reload, never a
+missed or regressed update.
 
-In-flight requests keep the old policy because `Arbiter::handle_request`
-clones `Policies` per request.
+In-flight requests keep the old pipeline: a request machine is built from
+the arbiter's loaded pipeline at request start, so a concurrent reload
+only affects subsequent requests.
 
 ### Lifecycle / auto-delete
 
@@ -163,9 +178,20 @@ The only built-in XRPCs are for creating arbiters. Two paths:
    `town.muni.arbiter.recovery/self` records (see §7) to the new account's
    repo using the credentials it just stored.
 4. Does **not** write any policy and does **not** bring the arbiter online:
-   it stays offline (fail-closed) until the recovery admin installs the first
-   policy via `town.muni.arbiter.resetPolicy` (see §7).
-
+   it stays offline (fail-closed) until it is configured. Bootstrap is
+   out-of-band, by credential class:
+   - **Imported accounts** (the manager holds the app password): the manager
+     writes the default `town.muni.arbiter.policy` record and the initial
+     `town.muni.arbiter.config/self` record directly to the repo via the
+     app-password session (pre-arbiter — nothing installed yet, so there is
+     no pipeline to gate it), and the arbiter comes online via Jetstream.
+   - **Created accounts** (the manager holds no app password): the
+     provisioning admin publishes the default policy record to their OWN
+     repo (OAuth session), then calls `town.muni.arbiter.resetConfig` —
+     they are the recovery admin per the freshly-written
+     `recovery/self` record, and `resetConfig` is admin-only,
+     offboarded-capable, shape-validated-only.
+   `installPolicy` itself is for later app-initiated appends (see §7).
 Config required: default PDS URL, invite code(s).
 
 ### Import existing account
@@ -174,8 +200,8 @@ Config required: default PDS URL, invite code(s).
 **app password** for an existing account (proving they control it). The server
 stores the credentials in Turso and proceeds as above. Being able to log into
 the existing account is itself the recovery guarantee — the holder can always
-write policy records directly to the PDS repo (bypassing the arbiter), and the
-arbiter reloads them via Jetstream.
+write policy records directly to the PDS repo (bypassing the arbiter), and
+the arbiter reloads them via Jetstream.
 
 > Bootstrap requests are **not** steady-state proxy requests: they use a
 > built-in NSID, not `arbiter-proxy`, and the auth subject is the creator /
@@ -183,28 +209,35 @@ arbiter reloads them via Jetstream.
 
 ## 7. Recovery
 
-Recovery from a policy lockout is **direct PDS access** for now: whoever can
-authenticate to the stewarded account's PDS writes the
-`town.muni.arbiter.policy.*` records directly (bypassing the arbiter), and the
-arbiter picks up the change via Jetstream. There is **no server-enforced reset
-XRPC** in this phase — an arbiter-side escape hatch is future work.
+Recovery from a policy lockout is the server-enforced
+`town.muni.arbiter.installPolicy` XRPC: APPEND semantics only. The
+referenced policy layer (an existing `town.muni.arbiter.policy` record the
+caller wrote to a repo beforehand — this endpoint never writes policy
+records) is appended at the END of the pipeline (lowest priority) and
+trusted scopes are unioned in; nothing already installed is ever removed or
+reordered. When the merged config differs from the current one, it is
+written to `town.muni.arbiter.config/self` in the stewarded repo via the
+steward session — the config write is the install's activation point,
+CAS-guarded against the repo head (putRecord swap_commit) and skipped
+entirely on a no-op re-install. The arbiter is re-onboarded so it takes
+effect. It works even when the installed policy blocks normal updates: the
+gate is a plain identity check, not a policy evaluation.
 
-> **Update:** a server-enforced `town.muni.arbiter.resetPolicy` XRPC has since
-> landed (recovery admin only, optimistic-concurrency guarded). It is the
-> path that installs the first policy on a freshly provisioned account and
-> recovers a locked-out one. The direct-PDS-access path above remains as a
-> fallback for imported accounts whose holder retains PDS access.
+The gate is the recovery admin designated in the account's
+`town.muni.arbiter.recovery/self` PDS record. That record is the source of
+truth: the server re-reads it from the repo on every `installPolicy` call,
+so rewriting it rotates the admin with effect on the next call. The record
+is written at provisioning/import time (did = the creator of a new account,
+the importer of an app-password account); the server-side credential store
+keeps only a bootstrap copy of the designation, used solely by repair to
+re-write the record for half-provisioned accounts. If no (valid) recovery
+admin is designated in the record, installPolicy is forbidden (fail-closed).
 
-The recovery-admin DID is still designated in a PDS record
-(`town.muni.arbiter.recovery/self`), written at bootstrap (creator for new
-accounts, importer for imports). The record documents who is intended to
-recover, but the arbiter does not yet act on it.
-
-**Known gap:** for new accounts the arbiter holds the credentials (random
-password in Turso), so the creator does **not** have direct PDS access and
-cannot self-recover via the record path until the escape hatch lands. For
-imported accounts the holder retains PDS access and can reset directly.
-Accepted for now.
+**Rotation:** rewriting `town.muni.arbiter.recovery/self` rotates the admin
+with effect on the next `installPolicy` call; formal transfer/revocation
+semantics are future work (see §11). For imported accounts the holder
+retains PDS access and can additionally write policy records directly to
+the repo (bypassing the arbiter), which the arbiter picks up via Jetstream.
 
 ## 8. HTTP
 
@@ -212,7 +245,8 @@ Switch from `salvo` to **`axum`**. The server is a transparent XRPC proxy with
 two handler classes:
 
 - Built-in NSIDs (`town.muni.arbiter.createArbiter`,
-  `town.muni.arbiter.createAppPasswordArbiter`) — handled directly.
+  `town.muni.arbiter.createAppPasswordArbiter`,
+  `town.muni.arbiter.installPolicy`) — handled directly.
 - Everything else — catch-all: verify serviceAuth, build policy context,
   evaluate policy via the arbiter's `StateMachine`, proxy to `arbiter-proxy`
   on allow, return the policy denial on deny.
@@ -234,6 +268,7 @@ Surviving built-in XRPCs:
 
 - `town.muni.arbiter.createArbiter`
 - `town.muni.arbiter.createAppPasswordArbiter`
+- `town.muni.arbiter.installPolicy`
 
 No `deleteArbiter` XRPC — arbiter teardown is automatic via the
 `town.muni.arbiter.service/self` record (see §4, Lifecycle / auto-delete).
@@ -241,8 +276,8 @@ No `deleteArbiter` XRPC — arbiter teardown is automatic via the
 New record collections (not XRPCs):
 
 - `town.muni.arbiter.service/self`
-- `town.muni.arbiter.policy.root/self`
-- `town.muni.arbiter.policy.sub/*`
+- `town.muni.arbiter.config/self`
+- `town.muni.arbiter.policy/<rkey>` (rkey = policy name)
 - `town.muni.arbiter.recovery/self`
 
 ## 10. Testing
@@ -267,10 +302,8 @@ another server → arbiter stops serving and purges credentials).
 - **Multi-instance.** Two replicas loading the same arbiter diverge on policy
   and race on `createArbiter`. Needs an ownership/partitioning layer (which
   replica owns which arbiter DID) before horizontal scale. Not now.
-- **Recovery escape hatch.** A server-enforced, scoped, audited policy-reset
-  path for new accounts whose credentials the arbiter holds (the creator has
-  no direct PDS access). Not now; recovery is direct-PDS-access-based until
-  this lands (see §7).
-- **Recovery-admin rotation/revocation.** The `town.muni.arbiter.recovery/self`
-  record is editable by the account holder; formal transfer/revocation
-  semantics deferred.
+- **Recovery-admin rotation/revocation.** Rotation exists: rewriting the
+  `town.muni.arbiter.recovery/self` record rotates the admin with effect on
+  the next `installPolicy` call (the server-side stored designation is only
+  the bootstrap value for repairing half-provisioned accounts). Formal
+  transfer/revocation semantics and manager UX deferred.

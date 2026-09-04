@@ -4,14 +4,24 @@
  * Provides a single `arbiter` object with methods to:
  *  - Obtain a service auth token scoped to the arbiter-server DID.
  *  - Read / write PDS records proxied through the arbiter's `town.muni.arbiter.proxy`
- *    procedure (the only way to reach a stewarded account's PDS).
- *  - Read / write the root Rego policy record.
+ *  - Read the community config record (trusted scopes + policy layers) and
+ *    the policy records it references.
+ *  - Append ONE policy layer — an `at://` URI of a `town.muni.arbiter.policy`
+ *    record — and trusted scopes via `town.muni.arbiter.installPolicy`
+ *    (approved by the installed policy layers via a `handleBuiltin` layer outcome;
+ *    the recovery admin bypasses the layers). Appends only: existing layers
+ *    and scopes are never removed or reordered, and no records are written —
+ *    locally authored policies are published first via the proxied
+ *    `putRecord` path and then installed by URI.
+ *  - Replace the community config wholesale via `town.muni.arbiter.resetConfig`
+ *    (recovery-admin-only recovery hatch; no policy evaluation, works while
+ *    the arbiter is offline).
  *  - Discover whether a stewarded account has an arbiter service record.
  *  - Provision a new arbiter, or import an existing account via app password.
  */
 
 import { PUBLIC_ARBITER_URL, PUBLIC_ARBITER_DID } from '$env/static/public';
-import { xrpc, type LexMap, isDidString, isNsidString, encodeLexBytes } from '@atproto/lex';
+import { xrpc, type LexMap, isDidString, isNsidString, isAtUriString, encodeLexBytes } from '@atproto/lex';
 import { XrpcResponseError } from '@atproto/lex';
 import type { AtprotoDid } from '@atcute/lexicons/syntax';
 import * as town from '$lib/lexicons/town';
@@ -19,9 +29,11 @@ import * as com from '$lib/lexicons/com';
 import { auth } from '$lib/auth.svelte';
 import { didResolver } from '$lib/resolver';
 
-/** Policy record collection + rkey. */
-const POLICY_COLLECTION = 'town.muni.arbiter.policy.root';
-const POLICY_RKEY = 'self';
+/** Policy record collection (rkey = the policy name). */
+export const POLICY_COLLECTION = 'town.muni.arbiter.policy';
+/** Community config record collection + rkey (exported for bootstrap writes). */
+export const CONFIG_COLLECTION = 'town.muni.arbiter.config';
+export const CONFIG_RKEY = 'self';
 
 /** Service record collection + rkey (discovery). */
 const SERVICE_COLLECTION = 'town.muni.arbiter.service';
@@ -30,9 +42,25 @@ const SERVICE_RKEY = 'self';
 /** The `did#service` fragment for a steward's PDS. */
 const AT_PROTO_PDS_FRAGMENT = 'atproto_pds';
 
-/** Fallback policy returned when no root policy record exists yet. */
-const DEFAULT_POLICY =
-  '# Enter your Rego policy here\n\npackage arbiter\n\nresult := { "ok": true, "output": null }\n';
+/** Starter Rego source for a new policy layer entry. */
+export const NEW_POLICY_TEMPLATE =
+  '# A policy layer. The layers are evaluated in order:\n' +
+  '#   { "pass": true }             — defer to the next layer\n' +
+  '#   { "handleBuiltin": true }    — hand off to the arbiter\'s built-in handler\n' +
+  '#   { "ok": true, "output": ... }  — handle: respond / proxy the request\n' +
+  '#   { "ok": false, "error": ... }  — deny the request\n' +
+  '\n' +
+  'package arbiter\n' +
+  '\n' +
+  'result := { "pass": true }\n';
+
+/** The community config record: trusted scopes + ordered policy layers. */
+export interface ArbiterConfig {
+  /** NSID scopes the arbiter accepts; a scoped request's scope must match one exactly. */
+  trustedScopes: string[];
+  /** Ordered `at://` URIs of policy records. */
+  policyLayers: string[];
+}
 
 /** Minimal DID document shape we care about (for PDS endpoint discovery). */
 interface MinimalDidDoc {
@@ -57,6 +85,23 @@ export interface ProxyOperation {
 
 /** A proxied record value returned by the arbiter. */
 type RecordValue = Record<string, unknown>;
+/**
+ * A failed public record fetch, carrying the HTTP status (and the XRPC error
+ * code from the response body, when present) so callers can distinguish
+ * "record missing" from network / server failures.
+ */
+export class PublicRecordError extends Error {
+  constructor(
+    message: string,
+    /** HTTP status code of the failed response. */
+    readonly status: number,
+    /** The XRPC error code from the response body, if any (e.g. `RecordNotFound`). */
+    readonly code?: string,
+  ) {
+    super(message);
+    this.name = 'PublicRecordError';
+  }
+}
 
 /** Read the string `policy` field off an arbitrary record value, if present. */
 function policySource(value: unknown): string | undefined {
@@ -65,6 +110,29 @@ function policySource(value: unknown): string | undefined {
     if (typeof candidate === 'string') return candidate;
   }
   return undefined;
+}
+
+/** The parsed parts of an `at://` record URI. */
+export interface AtUriParts {
+  did: string;
+  collection: string;
+  rkey: string;
+}
+
+/**
+ * Parse an `at://<did>/<collection>/<rkey>` record URI into its parts, or
+ * return `null` if it is malformed.
+ */
+export function parseAtUri(uri: string): AtUriParts | null {
+  const match = /^at:\/\/([^/]+)\/([^/]+)\/(.+)$/.exec(uri);
+  if (!match) return null;
+  const [, did, collection, rkey] = match;
+  return { did, collection, rkey };
+}
+
+/** Build the `at://` URI of a policy record in a steward's repo. */
+export function policyUri(did: string, rkey: string): string {
+  return `at://${did}/${POLICY_COLLECTION}/${rkey}`;
 }
 
 /**
@@ -165,6 +233,9 @@ export const arbiter = {
    * Fetch a public record directly from the steward's PDS (no auth, no
    * proxying). Resolves the `#atproto_pds` endpoint from the DID doc and
    * issues `com.atproto.repo.getRecord`. Returns the record `value`.
+   *
+   * Throws `PublicRecordError` (carrying the HTTP status and the XRPC error
+   * code) when the fetch fails.
    */
   async getPublicRecord(
     did: string,
@@ -179,7 +250,15 @@ export const arbiter = {
 
     const res = await fetch(url);
     if (!res.ok) {
-      throw new Error(`getRecord ${collection}/${rkey} failed: ${res.status}`);
+      // Parse the XRPC error body (best effort) so callers can tell "record
+      // missing" (`RecordNotFound`) from network / server failures.
+      const errBody = (await res.json().catch(() => null)) as { error?: unknown } | null;
+      const code = typeof errBody?.error === 'string' ? errBody.error : undefined;
+      throw new PublicRecordError(
+        `getRecord ${collection}/${rkey} failed: ${res.status}${code ? ` (${code})` : ''}`,
+        res.status,
+        code,
+      );
     }
     const body: unknown = await res.json();
     if (!body || typeof body !== 'object' || !('value' in body)) {
@@ -213,8 +292,8 @@ export const arbiter = {
         record,
         // The PDS does not have the custom `town.muni.arbiter.*` lexicons
         // registered, so validating would reject them (`Unknown lexicon
-        // type`). The arbiter validates Rego itself on reset; write without
-        // server-side lexicon validation.
+        // type`). The arbiter validates Rego itself on install; write
+        // without server-side lexicon validation.
         validate: false,
       },
     });
@@ -244,41 +323,203 @@ export const arbiter = {
     });
   },
 
-  // ─── Policy (root Rego record) ─────────────────────────────────────
+  // ─── Policy layers (config + policy records) ──────────────────────────
 
   /**
-   * Read the root Rego policy for a stewarded account.
+   * Read a community's config record (`town.muni.arbiter.config/self`) —
+   * trusted scopes + the ordered policy layers.
    *
-   * The policy record lives in the steward's public repo, so it is read
-   * directly from the steward's PDS (`com.atproto.repo.getRecord`) with no
-   * auth — proxying it through the arbiter would require the policy to allow
-   * its own `getRecord`, which it must not. Returns the `policy` string; if
-   * the record does not exist (or cannot be read), a default placeholder is
-   * returned so the editor is still usable.
+   * The record lives in the steward's public repo, so it is read directly
+   * from the steward's PDS (`com.atproto.repo.getRecord`) with no auth.
+   * Empty defaults are returned only when the config record does not exist
+   * yet (the arbiter is offline until its first install) — any other failure
+   * (network, 5xx, …) is rethrown so callers surface the error instead of
+   * silently editing an empty config.
    */
-  async getPolicy(did: string): Promise<string> {
+  async getConfig(did: string): Promise<ArbiterConfig> {
+    let value: RecordValue;
     try {
-      const value = await this.getPublicRecord(did, POLICY_COLLECTION, POLICY_RKEY);
-      return policySource(value) ?? DEFAULT_POLICY;
-    } catch {
-      return DEFAULT_POLICY;
+      value = await this.getPublicRecord(did, CONFIG_COLLECTION, CONFIG_RKEY);
+    } catch (err) {
+      // A missing config record is the only recoverable case; network/5xx
+      // failures must propagate so PolicyTab shows its error branch instead
+      // of empty editors (which would misrepresent the live configuration).
+      if (
+        err instanceof PublicRecordError &&
+        (err.status === 404 || err.code === 'RecordNotFound')
+      ) {
+        return { trustedScopes: [], policyLayers: [] };
+      }
+      throw err;
     }
+    const strings = (v: unknown): string[] =>
+      Array.isArray(v) ? v.filter((s): s is string => typeof s === 'string') : [];
+    return {
+      trustedScopes: strings(value.trustedScopes),
+      policyLayers: strings(value.policyLayers),
+    };
   },
 
   /**
-   * Write (replace) the root Rego policy for a stewarded account by writing
-   * the `town.muni.arbiter.policy.root/self` record via the arbiter proxy.
+   * Read a policy record's Rego source from the steward's public repo.
+   * Throws if the record does not exist or has no `policy` field.
    */
-  async setPolicy(did: string, policy: string): Promise<void> {
+  async getPolicyRecord(did: string, rkey: string): Promise<string> {
+    const value = await this.getPublicRecord(did, POLICY_COLLECTION, rkey);
+    const source = policySource(value);
+    if (source == null) {
+      throw new Error(`Policy record \`${rkey}\` has no \`policy\` field`);
+    }
+    return source;
+  },
+
+  /**
+   * Write a policy record (`town.muni.arbiter.policy/<rkey>`) — the Rego
+   * source — to the stewarded account's repo via `com.atproto.repo.putRecord`,
+   * proxied through the arbiter. This is how locally authored policies are
+   * published: `installPolicy` only appends `at://` URIs and never writes
+   * records, so a new or edited policy must be written here first and then
+   * installed by URI (a fresh URI appends at the end of the policy layers; a
+   * URI already in the layers updates the layer in place).
+   *
+   * The proxied write is evaluated by the installed policy layers (the
+   * default policy allows the community's admin and the stewarded account).
+   */
+
+  async putPolicyRecord(did: string, rkey: string, rego: string): Promise<void> {
+    await this.putRecord(did, POLICY_COLLECTION, { policy: rego }, rkey);
+  },
+
+  /**
+   * Write the community config record (`town.muni.arbiter.config/self`) —
+   * the full trusted-scopes + policy-layers replacement — directly to the
+   * stewarded account's repo via `com.atproto.repo.putRecord`, proxied
+   * through the arbiter. This is the full-restructuring path (reorder /
+   * remove / replace layer entries, remove scopes): `installPolicy` can
+   * only append.
+   *
+   * The proxied write is evaluated by the installed policy layers (the
+   * default policy allows the community's admin and the stewarded account),
+   * and the record is the source of truth — the arbiter hot-reloads it over
+   * Jetstream. For the offline/recovery hatch use `resetConfig` instead.
+   */
+  async putConfig(
+    did: string,
+    config: {
+      /** NSID scopes the arbiter accepts; a scoped request's scope must match one exactly. */
+      trustedScopes: string[];
+      /** Ordered `at://` URIs of policy records. */
+      policyLayers: string[];
+    },
+  ): Promise<void> {
     await this.putRecord(
       did,
-      POLICY_COLLECTION,
-      {
-        $type: 'town.muni.arbiter.policy.root',
-        policy,
-      },
-      POLICY_RKEY,
+      CONFIG_COLLECTION,
+      { trustedScopes: config.trustedScopes, policyLayers: config.policyLayers },
+      CONFIG_RKEY,
     );
+  },
+
+  /**
+   * Append one policy layer and/or trusted scopes to a stewarded arbiter's
+   * configuration via `town.muni.arbiter.installPolicy`.
+   *
+   * `policy` is the `at://` URI of a `town.muni.arbiter.policy` record in any
+   * repo (the community's own or an app's shared record) — installPolicy
+   * never writes records, so publish a locally authored policy first with
+   * `putPolicyRecord` and then install its URI.
+   *
+   * Append semantics: the policy layer is added to the END of the layers —
+   * the lowest-priority position, so an appended layer only sees requests
+   * the community's existing layers pass — and the trusted scopes are
+   * unioned in (new entries appended + deduped, existing order preserved).
+   * Nothing already in the config is ever removed or reordered.
+   * Re-installing a URI that is already in the layers keeps its
+   * position (no duplicate, no priority change). `trustedScopes` is required
+   * and may be empty (a policy install without scope changes is legal);
+   * omitting `policy` appends scopes only.
+   *
+   * Authenticated via a serviceAuth token scoped to
+   * `town.muni.arbiter.installPolicy`. The request is evaluated by the
+   * arbiter's installed policy layers: a layer approves the install by
+   * emitting `{"handleBuiltin": true}`, which hands the request to the
+   * server's built-in append handler; a layer may also deny the install.
+   * The account designated in the arbiter's `town.muni.arbiter.recovery/self`
+   * record (the recovery admin) bypasses the layers; the record is re-read
+   * on every call, so rewriting it rotates the recovery admin with effect on
+   * the next installPolicy call. The server writes the `config/self` record
+   * when anything changed and synchronously re-onboards the arbiter.
+   */
+  async installPolicy(
+    did: string,
+    install: {
+      /**
+       * `at://` URI of the `town.muni.arbiter.policy` record to append
+       * (omit for a scope-only install).
+       */
+      policy?: string;
+      /**
+       * NSID scopes to append to the arbiter's trusted set (deduped
+       * server-side; may be empty).
+       */
+      trustedScopes: string[];
+    },
+  ): Promise<void> {
+    if (!isDidString(did)) throw new Error(`Invalid arbiter DID \`${did}\``);
+    if (
+      install.policy !== undefined &&
+      !isAtUriString(install.policy)
+    ) {
+      throw new Error(`Invalid policy URI \`${install.policy}\``);
+    }
+    await xrpc(PUBLIC_ARBITER_URL, town.muni.arbiter.installPolicy, {
+      body: {
+        arbiterDid: did,
+        ...(install.policy !== undefined ? { policy: install.policy } : {}),
+        trustedScopes: install.trustedScopes,
+      },
+      headers: {
+        Authorization: `Bearer ${await this.getServiceAuth('town.muni.arbiter.installPolicy')}`,
+      },
+    });
+  },
+
+  /**
+   * Replace a stewarded arbiter's community config (trusted scopes + policy
+   * layers) wholesale. Recovery admin only. Also the setup wizard's
+   * bootstrap step for a freshly provisioned (offline) arbiter: point its
+   * config at the pre-existing default policy record (see
+   * `DEFAULT_POLICY_URI` in `$lib/default-policy`).
+   *
+   * Authenticated via a serviceAuth token scoped to
+   * `town.muni.arbiter.resetConfig`. Only the account designated in the
+   * arbiter's `town.muni.arbiter.recovery/self` record (the recovery admin)
+   * may call it. This is the recovery hatch: the request performs no policy
+   * evaluation and is served directly even while the arbiter is offboarded
+   * (e.g. a broken config prevented the policy layers from loading). The body is
+   * only shape-validated — if the new config fails to load, reset again. The
+   * record is written with repo-head CAS and the arbiter is re-onboarded.
+   */
+  async resetConfig(
+    did: string,
+    config: {
+      /** NSID scopes the arbiter accepts; a scoped request's scope must match one exactly. */
+      trustedScopes: string[];
+      /** Ordered `at://` URIs of policy records. */
+      policyLayers: string[];
+    },
+  ): Promise<void> {
+    if (!isDidString(did)) throw new Error(`Invalid arbiter DID \`${did}\``);
+    await xrpc(PUBLIC_ARBITER_URL, town.muni.arbiter.resetConfig, {
+      body: {
+        arbiterDid: did,
+        trustedScopes: config.trustedScopes,
+        policyLayers: config.policyLayers,
+      },
+      headers: {
+        Authorization: `Bearer ${await this.getServiceAuth('town.muni.arbiter.resetConfig')}`,
+      },
+    });
   },
 
   // ─── Discovery ─────────────────────────────────────────────────────
@@ -339,23 +580,6 @@ export const arbiter = {
       body: { arbiterDid, appPassword },
       headers: {
         Authorization: `Bearer ${await this.getServiceAuth('town.muni.arbiter.createAppPasswordArbiter')}`,
-      },
-    });
-  },
-
-  /**
-   * Reset a stewarded arbiter's root policy (recovery admin only).
-   *
-   * Authenticated via a serviceAuth token scoped to
-   * `town.muni.arbiter.resetPolicy`. Only the account designated in the
-   * arbiter's `town.muni.arbiter.recovery/self` record may reset the policy.
-   */
-  async resetPolicy(did: string, policy: string): Promise<void> {
-    if (!isDidString(did)) throw new Error(`Invalid arbiter DID \`${did}\``);
-    await xrpc(PUBLIC_ARBITER_URL, town.muni.arbiter.resetPolicy, {
-      body: { arbiterDid: did, policy },
-      headers: {
-        Authorization: `Bearer ${await this.getServiceAuth('town.muni.arbiter.resetPolicy')}`,
       },
     });
   },

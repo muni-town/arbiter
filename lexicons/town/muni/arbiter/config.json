@@ -1,0 +1,27 @@
+{
+  "lexicon": 1,
+  "id": "town.muni.arbiter.config",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Trusted scopes and policy pipeline configuration for a stewarded\narbiter.\n\nOne record per arbiter (rkey `self`) in the stewarded account's repo,\nmaintained by `town.muni.arbiter.installPolicy` appends, wholesale\n`town.muni.arbiter.resetConfig` rewrites, and direct repo writes, and\nhot-reloaded over Jetstream. `trustedScopes` gates which\n`*.arbiter.proxy` scopes the arbiter accepts at all; `policyLayers` is the\nordered community policy pipeline evaluated after the scope gate.",
+      "key": "literal:self",
+      "record": {
+        "type": "object",
+        "properties": {
+          "trustedScopes": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "NSID scopes (e.g. `community.lexicon.authCalendar`) this arbiter\naccepts. A scoped proxy request's scope — its NSID with the\n`.arbiter.proxy` suffix stripped — must be exactly one of these entries;\nanything else is rejected before the policy pipeline runs."
+          },
+          "policyLayers": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Ordered `at://` URIs of `town.muni.arbiter.policy` records (in the\nstewarded repo or another repo; entries naming other collections are\nrejected at install) forming the community policy pipeline. Evaluated in\norder: `pass` defers to the next layer, the first layer that handles or\ndenies wins, and falling off the end denies."
+          }
+        },
+        "required": ["trustedScopes", "policyLayers"]
+      }
+    }
+  }
+}

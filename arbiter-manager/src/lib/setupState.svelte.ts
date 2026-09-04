@@ -27,6 +27,12 @@ const setupStateTy = type({
   appPassword: type.string.optional(),
   /** The DID of a newly created (not imported) arbiter account, if any. */
   createDid: type.string.optional(),
+  /**
+   * Override for the pre-existing default policy URI the bootstrap flows
+   * reference (falls back to {@link DEFAULT_POLICY_URI} from
+   * `$lib/default-policy` when unset).
+   */
+  defaultPolicyUri: type.string.optional(),
   error: type.string.optional(),
   loading: type.boolean.default(false),
 });
@@ -46,7 +52,6 @@ export const resetSetupState = () => {
   setupState.step = initState.step;
   setupState.mode = undefined;
   setupState.appPassword = undefined;
-  setupState.createDid = undefined;
   setupState.error = undefined;
   setupState.loading = false;
 };

@@ -1,6 +1,6 @@
 {
 	"client_id": "http://localhost?redirect_uri=http%3A%2F%2F127.0.0.1%3A5173%2F&scope=atproto identity:*",
-	"scope": "atproto rpc:app.bsky.actor.getProfile?aud=did:web:api.bsky.app%23bsky_appview rpc:town.muni.leaf.authenticate?aud=*",
+	"scope": "atproto identity:* rpc:com.atproto.repo.putRecord?aud=* rpc:com.atproto.repo.getRecord?aud=* rpc:app.bsky.actor.getProfile?aud=* rpc:town.muni.arbiter.createArbiter?aud=* rpc:town.muni.arbiter.createAppPasswordArbiter?aud=* rpc:town.muni.arbiter.proxy?aud=* rpc:town.muni.arbiter.installPolicy?aud=* rpc:town.muni.arbiter.resetConfig?aud=*",
 	"redirect_uris": ["http://127.0.0.1:5173/"],
 	"response_types": ["code"],
 	"grant_types": ["authorization_code", "refresh_token"],
