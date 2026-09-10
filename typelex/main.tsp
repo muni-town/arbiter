@@ -681,6 +681,34 @@ namespace town.muni.arbiter.recovery {
   }
 }
 
+namespace town.muni.arbiter.simple.admins {
+  /**
+   * Day-to-day admin designation record for a stewarded arbiter.
+   *
+   * This record designates the accounts that administer the arbiter's
+   * day-to-day operation: the default policy
+   * (`town.muni.arbiter.policy/default`) loads it via the `xrpc` host
+   * function at evaluation time and authorizes admin callers — management
+   * requests (`town.muni.arbiter.*`) are handed to the arbiter's built-in
+   * handler and every other request is proxied as the stewarded account.
+   * Rewriting the record rotates the day-to-day adminship with effect on the
+   * next request.
+   *
+   * The `town.muni.arbiter.recovery/self` record remains the separate,
+   * ultimate trust root: it designates the recovery admin that the arbiter
+   * server gates `town.muni.arbiter.resetConfig` on.
+   */
+  @rec("literal:self")
+  model Main {
+    /**
+     * The DIDs of the account's day-to-day admins. A caller whose DID
+     * appears here is authorized by the default policy; the stewarded
+     * account itself is always authorized.
+     */
+    @required admins: did[],
+  }
+}
+
 namespace town.muni.arbiter.installPolicy {
   /**
    * Append a policy layer and/or trusted scopes to a stewarded arbiter's

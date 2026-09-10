@@ -12,12 +12,18 @@
     initialSource = '',
     /** Whether the policy name can be chosen (a brand-new record). */
     isNew = false,
+    /** Sheet title override. */
+    title,
+    /** Sheet description override (explains where/how the record is written). */
+    description,
     onSave,
   }: {
     open: boolean;
     initialRkey?: string;
     initialSource?: string;
     isNew?: boolean;
+    title?: string;
+    description?: string;
     onSave?: (rkey: string, source: string) => void;
   } = $props();
 
@@ -69,11 +75,12 @@
 
 <Sheet
   bind:open
-  title={isNew ? 'Add Policy' : `Edit Policy: ${initialRkey}`}
+  title={title ?? (isNew ? 'Add Policy' : `Edit Policy: ${initialRkey}`)}
   description={
-    isNew
-      ? 'Creates a `town.muni.arbiter.policy` record in this community\'s repo (via the arbiter proxy) and appends it to the END of the policy layers. Both requests are evaluated by the installed policy and can be denied.'
-      : 'Saving rewrites the policy record via the arbiter proxy and re-installs it: the layer keeps its position.'
+    description ??
+      (isNew
+        ? 'Creates a `town.muni.arbiter.policy` record in this community\'s repo (via the arbiter proxy) and appends it to the END of the policy layers. Both requests are evaluated by the installed policy and can be denied.'
+        : 'Saving rewrites the policy record via the arbiter proxy and re-installs it: the layer keeps its position.')
   }
   onOpenAutoFocus={onOpen}
 >

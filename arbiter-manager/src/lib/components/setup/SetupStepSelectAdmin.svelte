@@ -3,17 +3,19 @@
   import { setupState, setupClient } from '$lib/setupState.svelte';
   import { isAtprotoDid } from '@atproto/oauth-client-browser';
   import { XrpcResponseError } from '@atproto/lex';
-  import { DEFAULT_POLICY_URI } from '$lib/default-policy';
-  import { CONFIG_COLLECTION, CONFIG_RKEY, arbiter } from '$lib/arbiter';
+  import { DEFAULT_POLICY_RKEY, defaultPolicy } from '$lib/default-policy';
+  import {
+    ADMINS_COLLECTION,
+    ADMINS_RKEY,
+    CONFIG_COLLECTION,
+    CONFIG_RKEY,
+    POLICY_COLLECTION,
+    arbiter,
+  } from '$lib/arbiter';
   import { auth } from '$lib/auth.svelte';
 
   function goBack() {
     setupState.step = 'app-password';
-  }
-
-  /** The pre-existing default policy URI the bootstrap policy layers reference. */
-  function defaultPolicyUri(): string {
-    return setupState.defaultPolicyUri ?? DEFAULT_POLICY_URI;
   }
 
   async function finishSetup() {
@@ -48,19 +50,32 @@
         console.log('Arbiter already provisioned');
       }
 
-      // Bootstrap the fresh (offline) arbiter: write the initial config
-      // record (policy layers = the PRE-EXISTING default policy record, no
-      // trusted scopes) directly to the steward's repo via the app-password
-      // session — pre-arbiter there is nothing to gate these writes. The
-      // arbiter comes online on its own once the config record exists
-      // (startup onboarding / Jetstream). No policy record is authored and
-      // installPolicy is NOT used: it is append-only and policy-layer-gated.
-      // The referenced record must be published somewhere reachable (see
-      // DEFAULT_POLICY_URI); until it is, the arbiter fails closed.
+      // Bootstrap the fresh (offline) arbiter entirely from the repo —
+      // record-as-source-of-truth, pre-arbiter there is nothing to gate
+      // these app-password writes. First author the default policy record
+      // into the steward's repo (the owner-agnostic source is written
+      // verbatim: adminship comes from the admins record below, not from a
+      // per-community placeholder), then designate the importing account as
+      // the day-to-day admin, then activate everything with the config
+      // record. The arbiter comes online on its own once the config record
+      // exists (startup onboarding / Jetstream). No policy record is
+      // authored and installPolicy is NOT used: it is append-only and
+      // policy-layer-gated.
+      const policyUri = `at://${auth.did}/${POLICY_COLLECTION}/${DEFAULT_POLICY_RKEY}`;
+      await setupClient.putRecord(POLICY_COLLECTION, DEFAULT_POLICY_RKEY, {
+        $type: POLICY_COLLECTION,
+        policy: defaultPolicy,
+      });
+      console.log(`Published default policy record ${policyUri}`);
+      await setupClient.putRecord(ADMINS_COLLECTION, ADMINS_RKEY, {
+        $type: ADMINS_COLLECTION,
+        admins: [auth.did],
+      });
+      console.log(`Published admins record (admin: ${auth.did})`);
       await setupClient.putRecord(CONFIG_COLLECTION, CONFIG_RKEY, {
         $type: CONFIG_COLLECTION,
         trustedScopes: [],
-        policyLayers: [defaultPolicyUri()],
+        policyLayers: [policyUri],
       });
       console.log('Published bootstrap config record');
 

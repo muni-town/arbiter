@@ -34,6 +34,9 @@ export const POLICY_COLLECTION = 'town.muni.arbiter.policy';
 /** Community config record collection + rkey (exported for bootstrap writes). */
 export const CONFIG_COLLECTION = 'town.muni.arbiter.config';
 export const CONFIG_RKEY = 'self';
+/** Day-to-day admins record collection + rkey (exported for bootstrap writes). */
+export const ADMINS_COLLECTION = 'town.muni.arbiter.simple.admins';
+export const ADMINS_RKEY = 'self';
 
 /** Service record collection + rkey (discovery). */
 const SERVICE_COLLECTION = 'town.muni.arbiter.service';

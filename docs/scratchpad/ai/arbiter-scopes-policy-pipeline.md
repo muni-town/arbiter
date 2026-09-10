@@ -100,6 +100,14 @@ New:
   at:// URIs). One record = atomic install + one Jetstream collection.
 - `town.muni.arbiter.policy` (record, rkey = policy name): `policy: string`
   (Rego source). Referenced as `at://<did>/town.muni.arbiter.policy/<rkey>`.
+- `town.muni.arbiter.simple.admins` (record, `literal:self`):
+  `admins: did[]` — designates the account's day-to-day admins. The default
+  policy fetches it via the `xrpc` host function at evaluation time and
+  gates everything on membership (steward self-calls always pass), making
+  the default policy owner-agnostic and publishable once for all
+  communities; rewriting the record rotates day-to-day adminship. The
+  `town.muni.arbiter.recovery/self` record remains the separate, ultimate
+  trust root for `resetConfig`.
 - `town.muni.arbiter.installPolicy` (procedure): body
   `{arbiterDid, trustedScopes?, policyLayers, policies?: [{rkey, policy}]}`.
   Writes policy + config records to the community repo via the steward
@@ -115,7 +123,7 @@ Retired (hard cut): `town.muni.arbiter.policy.root`,
 `town.muni.arbiter.policy.sub`, `town.muni.arbiter.resetPolicy`.
 
 Kept unchanged: `town.muni.arbiter.proxy` (owner/manager path; the default
-policy allows steward + owner), `createArbiter`,
+policy hands management NSIDs to the built-in for admins), `createArbiter`,
 `createAppPasswordArbiter`, `service`, `recovery`.
 
 ## Implementation workstreams
@@ -173,6 +181,13 @@ policy allows steward + owner), `createArbiter`,
   -scope editor, and an install flow that calls `installPolicy` as the reset
   admin. The setup wizard's default policy becomes a policy record + a single
   -entry pipeline.
+- The import bootstrap writes the owner-agnostic default policy record
+  verbatim (no per-community substitution), the
+  `town.muni.arbiter.simple.admins` self record naming the importing
+  account, and the config record, all into the steward's repo via the
+  app-password session — self-contained until the shared default policy
+  record is published (then `DEFAULT_POLICY_URI` can replace the local
+  write).
 
 ### E. arbiter-simulator
 - Model the scope gate + pipeline layers in the node graph (this is the demo

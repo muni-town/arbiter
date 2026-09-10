@@ -23,12 +23,12 @@ implementation sprint. Nothing here blocks the change set from being committed.
   the scope NSIDs their apps were using.
 - **Publish the shared default policy record.** `DEFAULT_POLICY_URI` in
   `arbiter-manager/src/lib/default-policy.ts` is a placeholder; publish the
-  project's default policy and point the constant at it. Note: a *shared*
-  default policy cannot bake a per-community `${owner}` — it must be
-  owner-agnostic (e.g. authorize the DID found in the account's
-  `recovery/self` record, fetched via the policy's `xrpc` host fn). Same
-  applies to the `${owner}`-substituted template if it is ever published
-  shared.
+  project's (owner-agnostic) default policy — the shipped
+  `policies/arbiter/default-policy.rego`, which resolves adminship per
+  community from each account's `town.muni.arbiter.simple.admins` record —
+  as a shared record and point the constant at it. Then the import
+  bootstrap can reference the shared record instead of writing a
+  per-community copy.
 
 ## Manager
 
@@ -68,6 +68,22 @@ implementation sprint. Nothing here blocks the change set from being committed.
   is a copy-on-write / shared-read VM architecture in `arbiter-core`.
   ("Policy registry" discussion — storage dedup already exists via remote
   `at://` references + `LAYER_CACHE`.)
+- **Policy record read cache — not yet; explore the host-fn shape first.**
+  The default policy fetches the `town.muni.arbiter.simple.admins` record
+  through the `xrpc` host function on every request — one extra PDS
+  round-trip per request. Caching is deliberately deferred for now. When we
+  pick it up, explore whether authorization-data reads want a **new `record`
+  host function** with automatic firehose-based caching (records keyed
+  (repo, collection, rkey) → (cid, value), maintained by the unfiltered
+  Jetstream subscription the server already runs — push-not-pull, always
+  fresh, no policy-visible TTL decisions) **or whether `xrpc` can be
+  integrated with caching properly** instead (e.g. transparent read-through
+  caching for getRecord-shaped calls against watched repos, with the cache
+  key including the acting steward DID since private-record visibility
+  differs per session). Explicit TTL/cache-hint parameters on `xrpc` remain
+  the escape hatch for genuinely remote, non-record lookups either way.
+  The firehose-fed model means the arbiter + Jetstream already acts as the
+  local authorization engine — no separate SpiceDB-style server needed.
 
 ## Known acceptable behavior (documented, not bugs)
 

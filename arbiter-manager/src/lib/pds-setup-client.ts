@@ -7,7 +7,8 @@ import { isActorIdentifier } from '@atcute/lexicons/syntax';
  *
  * Used to prove control of an account via its app password before importing
  * it as a stewarded arbiter, and to publish the bootstrap records (the
- * default policy record + the initial config record) directly to the
+ * default policy record, the day-to-day admins record, and the initial
+ * config record) directly to the
  * steward's repo: pre-arbiter there is nothing to gate, and the arbiter
  * comes online on its own once the config record exists (startup onboarding
  * / Jetstream).

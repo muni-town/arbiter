@@ -23,6 +23,9 @@ const atprotoOauthScope = [
   'rpc:town.muni.arbiter.proxy?aud=*',
   'rpc:town.muni.arbiter.installPolicy?aud=*',
   'rpc:town.muni.arbiter.resetConfig?aud=*',
+  // Write access to the logged-in account's own policy library (records of this
+  // collection in the session's repo). Grants create, update, and delete.
+  'repo:town.muni.arbiter.policy',
 ].join(' ');
 
 export class Auth {

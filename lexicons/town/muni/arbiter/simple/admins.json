@@ -1,0 +1,22 @@
+{
+  "lexicon": 1,
+  "id": "town.muni.arbiter.simple.admins",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Day-to-day admin designation record for a stewarded arbiter.\n\nThis record designates the accounts that administer the arbiter's\nday-to-day operation: the default policy\n(`town.muni.arbiter.policy/default`) loads it via the `xrpc` host\nfunction at evaluation time and authorizes admin callers — management\nrequests (`town.muni.arbiter.*`) are handed to the arbiter's built-in\nhandler and every other request is proxied as the stewarded account.\nRewriting the record rotates the day-to-day adminship with effect on the\nnext request.\n\nThe `town.muni.arbiter.recovery/self` record remains the separate,\nultimate trust root: it designates the recovery admin that the arbiter\nserver gates `town.muni.arbiter.resetConfig` on.",
+      "key": "literal:self",
+      "record": {
+        "type": "object",
+        "properties": {
+          "admins": {
+            "type": "array",
+            "items": { "type": "string", "format": "did" },
+            "description": "The DIDs of the account's day-to-day admins. A caller whose DID\nappears here is authorized by the default policy; the stewarded\naccount itself is always authorized."
+          }
+        },
+        "required": ["admins"]
+      }
+    }
+  }
+}

@@ -1,22 +1,33 @@
 /**
  * Default policy helpers.
  *
- * Getting started assumes PRE-EXISTING policies: the setup wizard does not
- * author any policy record. Both bootstrap flows (create + import) reference
- * {@link DEFAULT_POLICY_URI} — the `at://` URI of a shared, pre-published
- * default policy record.
+ * The default policy is owner-agnostic: one copy can be published once and
+ * referenced by every community's pipeline (adminship is resolved at
+ * evaluation time from each account's `town.muni.arbiter.simple.admins`
+ * record). Two bootstrap flows:
+ *
+ * - Create: provisions a brand-new account and points its config at
+ *   {@link DEFAULT_POLICY_URI} — the `at://` URI of a shared, pre-published
+ *   default policy record.
+ * - Import: writes the default policy record (plus the admins + config
+ *   records) directly into the steward's repo via the app-password session,
+ *   so the flow is self-contained before the shared record exists.
+ *
+ * Once the shared record is published, the import flow can reference
+ * {@link DEFAULT_POLICY_URI} instead of writing its own copy.
  */
 
 import defaultPolicySource from '/policies/arbiter/default-policy.rego?raw';
 
 /**
- * The `at://` URI of the pre-existing default policy record referenced by
- * the bootstrap policy layers.
+ * The `at://` URI of the shared default policy record referenced by the
+ * create bootstrap flow.
  *
  * PLACEHOLDER: point this at the published default policy record when one
- * exists. Until then the bootstrap policy layers reference a record that does
- * not resolve, so a freshly bootstrapped arbiter fails closed (denies
- * everything) — which is the safe default for an unconfigured community.
+ * exists. Until then the create flow's bootstrap policy layers reference a
+ * record that does not resolve, so a freshly bootstrapped arbiter fails
+ * closed (denies everything) — which is the safe default for an
+ * unconfigured community.
  */
 export const DEFAULT_POLICY_URI = 'at://did:plc:TODO/town.muni.arbiter.policy/default';
 
@@ -28,27 +39,8 @@ export const DEFAULT_POLICY_URI = 'at://did:plc:TODO/town.muni.arbiter.policy/de
 export const DEFAULT_POLICY_RKEY = 'default';
 
 /**
- * The raw default policy source with the `${owner}` placeholder (loaded at
- * compile time via Vite raw import).
+ * The raw owner-agnostic default policy source (loaded at compile time via
+ * the Vite raw import). The import flow writes it as the community's policy
+ * record verbatim — no substitution.
  */
 export const defaultPolicy = defaultPolicySource as string;
-
-/**
- * Substitute the `${owner}` placeholder in the default policy with the
- * given DID, returning the final policy string ready to write as a policy
- * record.
- *
- * Available for the PolicyTab authoring flow (write the record to the
- * steward's repo via the arbiter proxy, then append its URI via
- * installPolicy). NOT used at bootstrap: a shared pre-existing default
- * policy cannot bake a per-community `${owner}` — it would need to be
- * owner-agnostic instead (e.g. allow the caller matching the DID in the
- * account's `town.muni.arbiter.recovery/self` record, fetched via an `xrpc`
- * host function).
- */
-export function defaultPolicyWithOwner(ownerDid: string): string {
-  // The template contains `${owner}` in both the doc comment and the actual
-  // `allow` rule, so replace every occurrence — a single `.replace` would only
-  // fix the comment and leave the rule's placeholder intact.
-  return defaultPolicy.replaceAll('${owner}', ownerDid);
-}

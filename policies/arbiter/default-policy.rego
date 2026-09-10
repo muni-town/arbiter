@@ -22,33 +22,84 @@
 #   { "ok": false, "error": { status, error } }  → deny with an error
 # Falling off the end of the pipeline (or an empty pipeline) denies.
 #
-# Allowed requests are proxied to the steward's PDS (`did#atproto_pds`)
-# authenticated as the stewarded account, via the `xrpc` host function.
-# Management requests (installPolicy / resetConfig) are instead handed to
-# the arbiter's built-in handler.
+# This policy is owner-agnostic: one copy can be published once and shared by
+# every community. It has no per-community owner placeholder. Instead,
+# day-to-day adminship is resolved at evaluation time from the account's
+# `town.muni.arbiter.simple.admins` record (rkey `self` in the stewarded
+# account's repo), which the policy fetches through the `xrpc` host function
+# on every request. Rewriting that record rotates the day-to-day adminship
+# with effect on the next request. The `town.muni.arbiter.recovery/self`
+# record remains the separate, ultimate trust root: it designates the
+# recovery admin that the arbiter server itself gates
+# `town.muni.arbiter.resetConfig` on, outside of this policy.
 #
-# The `${owner}` placeholder is substituted with the selected admin DID before
-# the policy is written to the account's PDS.
+# An admin — a DID listed in the admins record, or the stewarded account
+# itself — gets:
+#   - Management requests (any `town.muni.arbiter.*` NSID) handed to the
+#     arbiter's built-in handler.
+#   - Every other request proxied to the steward's PDS (`did#atproto_pds`),
+#     authenticated as the stewarded account, via the `xrpc` host function.
+# Everyone else is denied, and a failed admins-record fetch denies too
+# (fail-closed).
 
 package arbiter
 
 import rego.v1
 
-# By default we deny every request.
-default result := {"ok": false, "error": {"status": 403, "error": "ErrPermissionDenied"}}
-
-# Management NSIDs are served by the arbiter's built-in handler: a management
-# request from an allowed caller is handed off so the built-in handler can
-# perform it, and any other caller is denied.
-management_nsids := {"town.muni.arbiter.installPolicy", "town.muni.arbiter.resetConfig"}
-
-result := {"handleBuiltin": true} if {
-	input.nsid in management_nsids
-	allow
+# By default we deny every request: non-admin callers, and any caller whose
+# admins-record fetch failed (fail-closed).
+default result := {
+	"ok": false,
+	"error": {
+		"status": 403,
+		"error": "Denied",
+		"message": "caller is not an admin of this arbiter",
+	},
 }
 
-# Allowed non-management requests are proxied to the steward's PDS as the
-# stewarded account.
+# The stewarded account's day-to-day admins, loaded fresh on every request via
+# the `xrpc` host function (GET `com.atproto.repo.getRecord` against the
+# steward's PDS). On success the envelope is
+# `{ "ok": true, "output": <getRecord response> }`; on failure it is
+# `{ "ok": false, "error": { status, ... } }` — in which case `is_admin`
+# below simply won't match and the request falls through to the deny default.
+admins_resp := xrpc({
+	"did": concat("#", [input.arbiterDid, "atproto_pds"]),
+	"method": "GET",
+	"nsid": "com.atproto.repo.getRecord",
+	"parameters": {
+		"repo": input.arbiterDid,
+		"collection": "town.muni.arbiter.simple.admins",
+		"rkey": "self",
+	},
+	"body": null,
+	"encoding": null,
+})
+
+# A caller is an admin when the admins record lists their DID...
+is_admin if {
+	admins_resp.ok
+	admins_resp.output.value.admins[_] == input.callerDid
+}
+
+# ...or when the caller is the stewarded account itself (the account's own
+# service calls).
+is_admin if {
+	input.callerDid == input.arbiterDid
+}
+
+# Management NSIDs are served by the arbiter's built-in handler: a management
+# request from an admin is handed off so the built-in handler can perform it,
+# and any other caller is denied.
+result := {"handleBuiltin": true} if {
+	is_admin
+	startswith(input.nsid, "town.muni.arbiter.")
+}
+
+# Admin-issued non-management requests are proxied to the steward's PDS as
+# the stewarded account: the policy issues the request itself and returns the
+# response — the xrpc ok/err envelope is exactly the layer's handle/deny
+# output.
 result := xrpc({
 	"did": concat("#", [input.arbiterDid, "atproto_pds"]),
 	"method": input.method,
@@ -57,14 +108,6 @@ result := xrpc({
 	"body": input.body,
 	"encoding": input.encoding,
 }) if {
-	allow
-	not input.nsid in management_nsids
+	is_admin
+	not startswith(input.nsid, "town.muni.arbiter.")
 }
-
-# The stewarded account itself is always allowed.
-allow if input.callerDid == input.arbiterDid
-
-# The owner is always allowed.
-allow if input.callerDid == "${owner}"
-
-default allow := false
