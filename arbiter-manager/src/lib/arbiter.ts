@@ -206,6 +206,90 @@ async function resolvePdsEndpoint(did: string): Promise<string> {
   return pdsService.serviceEndpoint;
 }
 
+/** The public Bluesky AppView: a browser-friendly fallback for DID → handle. */
+const PUBLIC_APPVIEW_URL = 'https://public.api.bsky.app';
+
+/** Handle resolutions by DID, cached for the session (successes only). */
+const handleCache = new Map<string, string>();
+
+/**
+ * Resolve a DID to its associated atproto handle, best effort. Tries, in
+ * order: the DID document's `alsoKnownAs` entry (`at://<handle>`, populated
+ * by did:plc registrations), the public Bluesky AppView
+ * (`app.bsky.actor.getProfile`), and the account's own PDS
+ * (`com.atproto.repo.describeRepo`). Returns `undefined` when no handle can
+ * be found (callers fall back to displaying the DID). Successful results are
+ * cached for the session; failures are retried on the next lookup.
+ */
+export async function resolveHandle(did: string): Promise<string | undefined> {
+  const cached = handleCache.get(did);
+  if (cached !== undefined) return cached;
+
+  // Each path is guarded independently: one failing lookup must not skip the
+  // remaining fallbacks. All are best effort — `undefined` falls back to
+  // displaying the DID.
+  let handle = await handleFromDidDocument(did);
+  if (!handle) handle = await handleFromAppView(did);
+  if (!handle) handle = await handleFromPds(did);
+
+  if (handle) handleCache.set(did, handle);
+  return handle;
+}
+
+/**
+ * Read the handle off the DID document's `alsoKnownAs` entry
+ * (`at://<handle>`) — populated by did:plc registrations. An
+ * `at://did:...` entry is a self-reference, not a handle.
+ */
+async function handleFromDidDocument(did: string): Promise<string | undefined> {
+  try {
+    const doc = await didResolver.resolve(did as AtprotoDid);
+    const aka = (doc.alsoKnownAs ?? []).find(
+      (u) => u.startsWith('at://') && !u.startsWith('at://did:') && u.length > 5,
+    );
+    return aka ? aka.slice(5) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Look the handle up on the public Bluesky AppView
+ * (`app.bsky.actor.getProfile`) — resolves federated accounts from any PDS,
+ * with CORS enabled for browser use. Non-federated DIDs fail here.
+ */
+async function handleFromAppView(did: string): Promise<string | undefined> {
+  try {
+    const res = await fetch(
+      `${PUBLIC_APPVIEW_URL}/xrpc/app.bsky.actor.getProfile?actor=${encodeURIComponent(did)}`,
+      { signal: AbortSignal.timeout(5000) },
+    );
+    if (!res.ok) return undefined;
+    const body = (await res.json()) as { handle?: unknown };
+    return typeof body.handle === 'string' && body.handle ? body.handle : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Ask the account's own PDS (`com.atproto.repo.describeRepo`) — works for
+ * non-Bluesky accounts whose PDS implements the endpoint.
+ */
+async function handleFromPds(did: string): Promise<string | undefined> {
+  try {
+    const pds = await resolvePdsEndpoint(did);
+    const url = new URL(`${pds}/xrpc/com.atproto.repo.describeRepo`);
+    url.searchParams.set('repo', did);
+    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return undefined;
+    const body = (await res.json()) as { handle?: unknown };
+    return typeof body.handle === 'string' && body.handle ? body.handle : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export const arbiter = {
   /**
    * Obtain a service auth token scoped to the arbiter-server DID.
@@ -416,14 +500,19 @@ export const arbiter = {
   },
 
   /**
-   * Read a policy record's Rego source from the steward's public repo.
-   * Throws if the record does not exist or has no `policy` field.
+   * Read a policy record's Rego source from its repo's public endpoint.
+   * Defaults to the `town.muni.arbiter.policy` collection. Throws if the
+   * record does not exist or has no `policy` field.
    */
-  async getPolicyRecord(did: string, rkey: string): Promise<string> {
-    const value = await this.getPublicRecord(did, POLICY_COLLECTION, rkey);
+  async getPolicyRecord(
+    did: string,
+    rkey: string,
+    collection: string = POLICY_COLLECTION,
+  ): Promise<string> {
+    const value = await this.getPublicRecord(did, collection, rkey);
     const source = policySource(value);
     if (source == null) {
-      throw new Error(`Policy record \`${rkey}\` has no \`policy\` field`);
+      throw new Error(`Policy record \`${collection}/${rkey}\` has no \`policy\` field`);
     }
     return source;
   },

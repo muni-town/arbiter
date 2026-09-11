@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Button, Box, Input } from '@foxui/core';
   import { isNsidString } from '@atproto/lex';
+  import { SvelteMap } from 'svelte/reactivity';
   import PolicyEntrySheet from './PolicyEntrySheet.svelte';
   import ResetConfigSheet from './ResetConfigSheet.svelte';
   import {
@@ -9,8 +10,10 @@
     policyUri,
     POLICY_COLLECTION,
     NEW_POLICY_TEMPLATE,
+    resolveHandle,
     type ArbiterConfig,
   } from '$lib/arbiter';
+  import PolicyViewDialog from './PolicyViewDialog.svelte';
 
   let { arbiterDid }: { arbiterDid?: string } = $props();
 
@@ -32,6 +35,23 @@
   let liveUris = $state<string[]>([]);
   /** The staged layers: the live order plus local move/remove edits. */
   let entries = $state<LayerEntry[]>([]);
+  /**
+   * Resolved handles by DID (`undefined` = lookup failed; missing = pending).
+   * `SvelteMap` (not `$state(new Map())`) — plain `Map`s are not proxied by
+   * `$state`, so `set()` would never re-render the layer titles.
+   */
+  let handles = new SvelteMap<string, string | undefined>();
+
+  // Read-only policy viewer sheet (opened from a layer's `at://` URI).
+  let viewOpen = $state(false);
+  /** The viewed layer entry; `null` while closed. */
+  let viewEntry = $state<LayerEntry | null>(null);
+
+
+  /** The viewer's readable title, kept live as handles resolve. */
+  const viewTitle = $derived(viewEntry ? layerTitle(viewEntry.uri) : '');
+  /** The viewer's pre-loaded source (local records); remote refs are fetched in the sheet. */
+  const viewSource = $derived(viewEntry?.source);
   /** Loaded entry details by URI, so Discard can restore removed entries. */
   let entryDetails = $state(new Map<string, LayerEntry>());
   /** The live trusted scopes from the config record (dirty detection). */
@@ -123,6 +143,9 @@
         }),
       );
       entryDetails = new Map(entries.map((e) => [e.uri, e]));
+      // Best-effort handle resolution for readable layer titles (async,
+      // cached; failures leave the DID in the title).
+      void resolveEntryHandles(config.policyLayers);
     } catch (e) {
       error = arbiter.formatError(e);
       entries = [];
@@ -275,6 +298,46 @@
     // re-publishing it: seed the editor with the starter template.
     editorInitialSource = entry.source ?? NEW_POLICY_TEMPLATE;
     editorOpen = true;
+  }
+  /**
+   * Resolve each layer DID's handle (best effort, cached in `resolveHandle`)
+   * so layer titles can show `<handle>/<collection>/<rkey>` instead of a raw
+   * DID. Unresolvable DIDs keep the DID in the title.
+   */
+  async function resolveEntryHandles(uris: string[]) {
+    const dids = new Set<string>();
+    for (const uri of uris) {
+      const parts = parseAtUri(uri);
+      if (parts) dids.add(parts.did);
+    }
+    await Promise.all(
+      [...dids].map(async (did) => {
+        if (handles.has(did)) return;
+        handles.set(did, await resolveHandle(did));
+      }),
+    );
+  }
+
+  /** Readable layer title: `<handle-or-did>/<rkey>` (every layer is a `town.muni.arbiter.policy` record). */
+  function layerTitle(uri: string): string {
+    const parts = parseAtUri(uri);
+    if (!parts) return uri;
+    const handle = handles.get(parts.did);
+    return `${handle || parts.did}/${parts.rkey}`;
+  }
+
+  /** Open the read-only viewer for a layer entry. */
+  function openViewPolicy(entry: LayerEntry) {
+    addError = null;
+    viewEntry = entry;
+    viewOpen = true;
+  }
+
+  /** Edit the policy shown in the viewer (local records only). */
+  function editViewedPolicy() {
+    if (viewEntry?.rkey === undefined) return;
+    viewOpen = false;
+    openEditPolicy(viewEntry);
   }
 
   /**
@@ -531,17 +594,20 @@
               >
                 <span class="text-xs text-base-400 font-mono w-5 text-right">{i + 1}</span>
                 <div class="flex-1 min-w-0">
-                  {#if entry.rkey !== undefined}
-                    <button
-                      class="text-sm font-medium text-accent-700 dark:text-accent-300 hover:underline text-left"
-                      onclick={() => openEditPolicy(entry)}
-                    >
-                      {entry.rkey}
-                    </button>
-                    <p class="text-xs text-base-400 font-mono truncate">{entry.uri}</p>
-                  {:else}
-                    <p class="text-sm font-mono truncate" title={entry.uri}>{entry.uri}</p>
-                  {/if}
+                  <button
+                    class="block w-full max-w-full text-sm font-medium text-accent-700 dark:text-accent-300 hover:underline text-left truncate"
+                    title={layerTitle(entry.uri)}
+                    onclick={() => openViewPolicy(entry)}
+                  >
+                    {layerTitle(entry.uri)}
+                  </button>
+                  <button
+                    class="block w-full max-w-full text-xs text-base-400 font-mono truncate hover:underline text-left"
+                    title={entry.uri}
+                    onclick={() => openViewPolicy(entry)}
+                  >
+                    {entry.uri}
+                  </button>
                   {#if entry.rkey !== undefined && entry.source === undefined && !entry.error}
                     <p class="text-xs text-base-500">
                       Record missing — edit to re-create it (re-installing heals the layer).
@@ -721,6 +787,16 @@
     initialSource={editorInitialSource}
     isNew={editorIsNew}
     onSave={saveEntry}
+  />
+{/if}
+
+{#if arbiterDid}
+  <PolicyViewDialog
+    bind:open={viewOpen}
+    title={viewTitle}
+    uri={viewEntry?.uri ?? ''}
+    source={viewSource}
+    onEdit={viewEntry?.rkey !== undefined ? editViewedPolicy : undefined}
   />
 {/if}
 

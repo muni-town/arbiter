@@ -5,10 +5,12 @@
   let {
     value = $bindable(),
     language = 'json',
+    readOnly = false,
     onChange,
   }: {
     value?: string;
     language?: string;
+    readOnly?: boolean;
     onChange?: (v: string) => void;
   } = $props();
 
@@ -152,6 +154,7 @@
     // Create editor
     editor = monaco.editor.create(containerEl, {
       value,
+      readOnly,
       language,
       theme: 'vs-dark',
       minimap: { enabled: false },
