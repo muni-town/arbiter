@@ -2,12 +2,14 @@
   import { Button, Box, Input } from '@foxui/core';
   import { isNsidString } from '@atproto/lex';
   import PolicyEntrySheet from './PolicyEntrySheet.svelte';
+  import ResetConfigSheet from './ResetConfigSheet.svelte';
   import {
     arbiter,
     parseAtUri,
     policyUri,
     POLICY_COLLECTION,
     NEW_POLICY_TEMPLATE,
+    type ArbiterConfig,
   } from '$lib/arbiter';
 
   let { arbiterDid }: { arbiterDid?: string } = $props();
@@ -61,7 +63,11 @@
   let editorOpen = $state(false);
   let editorInitialRkey = $state('');
   let editorInitialSource = $state('');
+
   let editorIsNew = $state(false);
+
+  // Reset-config (recovery/bootstrap) sheet.
+  let resetOpen = $state(false);
 
   // ── Load when arbiterDid changes ────────────────────────────────────────
   $effect(() => {
@@ -397,6 +403,34 @@
       installing = false;
     }
   }
+
+  // ── Reset config (recovery/bootstrap hatch) ─────────────────────────────
+
+  /**
+   * Called by the reset sheet. Replaces the ENTIRE config record via
+   * `town.muni.arbiter.resetConfig` — the recovery-admin-only hatch performs
+   * no policy evaluation and is served even while the arbiter is offboarded
+   * (exactly the case where the normal editors cannot load). Then reloads:
+   * if the new config loads, the arbiter comes (back) online; a bad entry
+   * leaves it failing closed until the next reset.
+   */
+  async function applyResetConfig(config: ArbiterConfig) {
+    if (!arbiterDid) return;
+
+    saving = true;
+    installError = null;
+    status = null;
+
+    try {
+      await arbiter.resetConfig(arbiterDid, config);
+      await load();
+      status = 'Config replaced';
+    } catch (e) {
+      installError = arbiter.formatError(e);
+    } finally {
+      saving = false;
+    }
+  }
 </script>
 
 <div class="flex-1 overflow-auto h-full">
@@ -407,8 +441,11 @@
       <Box class="p-4 border border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-900/20 rounded-lg">
         <p class="text-sm font-medium text-red-800 dark:text-red-300">Failed to load policy configuration</p>
         <p class="text-xs text-red-700 dark:text-red-400 mt-1">{error}</p>
-        <div class="mt-3">
+        <div class="mt-3 flex gap-2">
           <Button size="sm" variant="secondary" onclick={load}>Retry</Button>
+          <Button size="sm" variant="ghost" onclick={() => (resetOpen = true)}>
+            Reset Config
+          </Button>
         </div>
       </Box>
     {:else if arbiterDid && !loading && !error}
@@ -438,6 +475,14 @@
               {saving ? 'Saving…' : 'Save Changes'}
             </Button>
           {/if}
+          <Button
+            size="sm"
+            variant="ghost"
+            onclick={() => (resetOpen = true)}
+            title="Replaces the entire config (policy layers + trusted scopes) — recovery/bootstrap only, works while the arbiter is offline"
+          >
+            Reset Config
+          </Button>
         </div>
       </div>
       <p class="text-xs text-base-500 dark:text-base-500">
@@ -676,5 +721,14 @@
     initialSource={editorInitialSource}
     isNew={editorIsNew}
     onSave={saveEntry}
+  />
+{/if}
+
+{#if arbiterDid}
+  <ResetConfigSheet
+    bind:open={resetOpen}
+    {arbiterDid}
+    initialConfig={{ trustedScopes: [...liveScopes], policyLayers: [...liveUris] }}
+    onSave={applyResetConfig}
   />
 {/if}

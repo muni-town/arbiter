@@ -18,6 +18,9 @@
       Arbiter Manager
     </a>
     <Button href="/setup">Setup Org Account</Button>
+    {#if auth.session}
+      <Button href="/library">Policy Library</Button>
+    {/if}
   </div>
 
   <div class="flex items-center gap-2">

@@ -15,7 +15,9 @@
  *    `putRecord` path and then installed by URI.
  *  - Replace the community config wholesale via `town.muni.arbiter.resetConfig`
  *    (recovery-admin-only recovery hatch; no policy evaluation, works while
- *    the arbiter is offline).
+ *    the arbiter is offline). Both setup flows bootstrap a freshly provisioned
+ *    arbiter through it, and the policy tab's "Reset Config" sheet is the
+ *    operator-facing recovery surface.
  *  - Discover whether a stewarded account has an arbiter service record.
  *  - Provision a new arbiter, or import an existing account via app password.
  */
@@ -31,12 +33,10 @@ import { didResolver } from '$lib/resolver';
 
 /** Policy record collection (rkey = the policy name). */
 export const POLICY_COLLECTION = 'town.muni.arbiter.policy';
-/** Community config record collection + rkey (exported for bootstrap writes). */
-export const CONFIG_COLLECTION = 'town.muni.arbiter.config';
-export const CONFIG_RKEY = 'self';
-/** Day-to-day admins record collection + rkey (exported for bootstrap writes). */
-export const ADMINS_COLLECTION = 'town.muni.arbiter.simple.admins';
-export const ADMINS_RKEY = 'self';
+
+/** Community config record collection + rkey. */
+const CONFIG_COLLECTION = 'town.muni.arbiter.config';
+const CONFIG_RKEY = 'self';
 
 /** Service record collection + rkey (discovery). */
 const SERVICE_COLLECTION = 'town.muni.arbiter.service';
@@ -131,6 +131,58 @@ export function parseAtUri(uri: string): AtUriParts | null {
   if (!match) return null;
   const [, did, collection, rkey] = match;
   return { did, collection, rkey };
+}
+
+/**
+ * Parse the setup bootstrap step's textarea input: one policy-layer `at://`
+ * URI per line (in evaluation order; at least one required) plus optional
+ * trusted-scope NSIDs, one per line. This is only client-side sanity —
+ * `resetConfig` writes the entries verbatim — but it catches malformed or
+ * non-policy URIs before an arbiter is bootstrapped against them. Throws
+ * with a line-numbered message on the first bad entry.
+ */
+export function parseBootstrapConfig(
+  policyLayersText: string,
+  trustedScopesText: string,
+): ArbiterConfig {
+  const policyLayers: string[] = [];
+  for (const [i, line] of policyLayersText.split('\n').entries()) {
+    const uri = line.trim();
+    if (!uri) continue;
+    const parts = parseAtUri(uri);
+    if (!parts) {
+      throw new Error(
+        `Policy layer line ${i + 1}: not a valid \`at://<did>/<collection>/<rkey>\` URI`,
+      );
+    }
+    if (parts.collection !== POLICY_COLLECTION) {
+      throw new Error(
+        `Policy layer line ${i + 1}: the referenced record must be a \`${POLICY_COLLECTION}\` record`,
+      );
+    }
+    if (policyLayers.includes(uri)) {
+      throw new Error(`Policy layer line ${i + 1}: duplicate policy layer URI`);
+    }
+    policyLayers.push(uri);
+  }
+  if (policyLayers.length === 0) {
+    throw new Error('Enter at least one policy layer `at://` URI');
+  }
+
+  const trustedScopes: string[] = [];
+  for (const [i, line] of trustedScopesText.split('\n').entries()) {
+    const scope = line.trim();
+    if (!scope) continue;
+    if (!isNsidString(scope)) {
+      throw new Error(`Trusted scope line ${i + 1}: not a valid NSID`);
+    }
+    if (trustedScopes.includes(scope)) {
+      throw new Error(`Trusted scope line ${i + 1}: duplicate scope`);
+    }
+    trustedScopes.push(scope);
+  }
+
+  return { trustedScopes, policyLayers };
 }
 
 /** Build the `at://` URI of a policy record in a steward's repo. */
@@ -490,9 +542,10 @@ export const arbiter = {
   /**
    * Replace a stewarded arbiter's community config (trusted scopes + policy
    * layers) wholesale. Recovery admin only. Also the setup wizard's
-   * bootstrap step for a freshly provisioned (offline) arbiter: point its
-   * config at the pre-existing default policy record (see
-   * `DEFAULT_POLICY_URI` in `$lib/default-policy`).
+   * bootstrap step for a freshly provisioned (offline) arbiter: the operator
+   * provides the policy-layer `at://` URIs (records published from the
+   * Library tab — they must already exist) and the trusted scopes, and the
+   * config record written here brings the arbiter online.
    *
    * Authenticated via a serviceAuth token scoped to
    * `town.muni.arbiter.resetConfig`. Only the account designated in the

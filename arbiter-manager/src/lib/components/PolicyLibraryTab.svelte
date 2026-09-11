@@ -2,14 +2,9 @@
   import { isDidString } from '@atproto/lex';
   import { Button, Box } from '@foxui/core';
   import { auth } from '$lib/auth.svelte';
-  import {
-    POLICY_COLLECTION,
-    NEW_POLICY_TEMPLATE,
-    parseAtUri,
-    policyUri,
-    arbiter,
-  } from '$lib/arbiter';
-  import PolicyEntrySheet from './PolicyEntrySheet.svelte';
+  import { goto } from '$app/navigation';
+  import { page } from '$app/state';
+  import { POLICY_COLLECTION, parseAtUri, policyUri, arbiter } from '$lib/arbiter';
 
   /** A `town.muni.arbiter.policy` record in the logged-in account's own repo. */
   interface LibraryEntry {
@@ -25,7 +20,6 @@
   let loading = $state(false);
   let error = $state<string | null>(null);
   let status = $state<string | null>(null);
-  let saving = $state(false);
   let deleting = $state(false);
   /** rkey of the row with an armed (two-step) delete confirmation. */
   let confirmDeleteRkey = $state<string | null>(null);
@@ -33,13 +27,16 @@
   let copiedRkey = $state<string | null>(null);
   let copyError = $state<string | null>(null);
 
-  // ── Policy entry editor sheet ──────────────────────────────────────────
-  let editorOpen = $state(false);
-  let editorIsNew = $state(false);
-  let editorInitialRkey = $state('');
-  let editorInitialSource = $state('');
-
   const did = $derived(auth.did);
+
+  // ── Save status handed back from the editor page (?created=/?saved=) ──
+  const editorStatus = $derived.by(() => {
+    const created = page.url.searchParams.get('created');
+    if (created) return `Policy “${created}” created`;
+    const saved = page.url.searchParams.get('saved');
+    if (saved) return `Policy “${saved}” saved`;
+    return null;
+  });
 
   // ── Load the library whenever the session changes ──────────────────────
   $effect(() => {
@@ -58,13 +55,19 @@
     error = null;
     try {
       const loaded: LibraryEntry[] = [];
+      /** rkeys already collected — guards against overlapping/broken pages. */
+      const seen = new Set<string>();
       let cursor: string | undefined;
       do {
-        const resp = await client.listRecords(POLICY_COLLECTION, { repo: did });
+        const resp = await client.listRecords(POLICY_COLLECTION, {
+          repo: did,
+          ...(cursor ? { cursor } : {}),
+        });
         for (const record of resp.body.records) {
           const parts = parseAtUri(record.uri);
           const rkey = parts?.rkey;
-          if (!rkey) continue;
+          if (!rkey || seen.has(rkey)) continue;
+          seen.add(rkey);
           const policy = record.value['policy'];
           loaded.push({
             rkey,
@@ -73,7 +76,13 @@
             error: typeof policy !== 'string' ? 'Record has no policy (Rego source) field' : undefined,
           });
         }
-        cursor = resp.body.cursor;
+        const next = resp.body.cursor;
+        // Stop at the end of the list. Also stop when the server makes no
+        // progress (same cursor again, or an empty page) — a server that
+        // returns a cursor on every response would otherwise be re-requested
+        // forever.
+        if (!next || next === cursor || resp.body.records.length === 0) break;
+        cursor = next;
       } while (cursor);
       entries = loaded;
     } catch (e) {
@@ -93,52 +102,16 @@
     return '';
   }
 
-  // ── Create / edit / delete ─────────────────────────────────────────────
+  // ── Open the full-page editor (create / edit) ──────────────────────────
   function openNewPolicy() {
-    editorIsNew = true;
-    editorInitialRkey = '';
-    editorInitialSource = NEW_POLICY_TEMPLATE;
-    editorOpen = true;
+    void goto('/library/new');
   }
 
   function openEditPolicy(entry: LibraryEntry) {
-    editorIsNew = false;
-    editorInitialRkey = entry.rkey;
-    editorInitialSource = entry.source ?? NEW_POLICY_TEMPLATE;
-    editorOpen = true;
+    void goto(`/library/${encodeURIComponent(entry.rkey)}`);
   }
 
-  /**
-   * Called by the editor sheet. Publishes the Rego source as a
-   * `town.muni.arbiter.policy` record directly in the logged-in account's repo
-   * (create for a new record, put for an existing one).
-   */
-  async function saveEntry(rkey: string, source: string) {
-    const client = auth.client;
-    if (!client || !did || !isDidString(did)) return;
-    saving = true;
-    error = null;
-    status = null;
-    try {
-      const record = {
-        $type: POLICY_COLLECTION as `${string}.${string}.${string}`,
-        policy: source,
-      };
-      if (editorIsNew) {
-        await client.createRecord(record, rkey, { repo: did });
-        status = `Policy “${rkey}” created`;
-      } else {
-        await client.putRecord(record, rkey, { repo: did });
-        status = `Policy “${rkey}” saved`;
-      }
-      await load();
-    } catch (e) {
-      error = arbiter.formatError(e);
-    } finally {
-      saving = false;
-    }
-  }
-
+  // ── Delete ─────────────────────────────────────────────────────────────
   function deleteRecord(entry: LibraryEntry) {
     // Two-step confirmation: the first click arms the button, the second
     // (within a few seconds) actually deletes.
@@ -187,7 +160,7 @@
 </script>
 
 <div class="flex-1 overflow-auto h-full">
-  <div class="p-4 space-y-4 h-full flex flex-col">
+  <div class="max-w-4xl mx-auto w-full p-4 space-y-4 h-full flex flex-col">
     {#if loading}
       <Box class="animate-pulse h-48" />
     {:else if error}
@@ -208,16 +181,15 @@
           Policy Library
         </h3>
         <div class="flex items-center gap-2">
-          {#if saving}
-            <span class="text-xs text-base-500 dark:text-base-500">Saving…</span>
-          {/if}
           {#if deleting}
             <span class="text-xs text-base-500 dark:text-base-500">Deleting…</span>
           {/if}
           {#if status}
             <span class="text-xs text-emerald-600 dark:text-emerald-400">{status}</span>
+          {:else if editorStatus}
+            <span class="text-xs text-emerald-600 dark:text-emerald-400">{editorStatus}</span>
           {/if}
-          <Button size="sm" onclick={openNewPolicy} disabled={saving || deleting}>
+          <Button size="sm" onclick={openNewPolicy} disabled={deleting}>
             New Policy
           </Button>
         </div>
@@ -225,8 +197,8 @@
       <p class="text-xs text-base-500 dark:text-base-500">
         Shared, publishable policy records in your own repo (<code class="font-mono">{did}</code>):
         create a policy here, copy its <code class="font-mono">at://</code> URI, and reference it
-        from arbiter configs (policy layers, <code class="font-mono">DEFAULT_POLICY_URI</code>, or
-        the reset-config bootstrap) in any community. Records here are written directly — not
+        from arbiter configs — the setup bootstrap and the policy tab's “Reset Config” sheet take
+        these URIs. Records here are written directly — not
         through an arbiter proxy — and are not installed anywhere until a config references them.
       </p>
 
@@ -249,7 +221,7 @@
             get started.
           </p>
           <div class="pt-2">
-            <Button size="sm" variant="secondary" onclick={openNewPolicy} disabled={saving || deleting}>
+            <Button size="sm" variant="secondary" onclick={openNewPolicy} disabled={deleting}>
               New Policy
             </Button>
           </div>
@@ -293,7 +265,7 @@
                   size="sm"
                   variant="ghost"
                   class="text-red-500"
-                  disabled={saving || deleting}
+                  disabled={deleting}
                   onclick={() => deleteRecord(entry)}
                   title={confirmDeleteRkey === entry.rkey
                     ? 'Click again to permanently delete this record'
@@ -309,19 +281,3 @@
     {/if}
   </div>
 </div>
-
-{#if did}
-  <PolicyEntrySheet
-    bind:open={editorOpen}
-    initialRkey={editorInitialRkey}
-    initialSource={editorInitialSource}
-    isNew={editorIsNew}
-    title={editorIsNew ? 'New Library Policy' : `Edit Library Policy: ${editorInitialRkey}`}
-    description={
-      editorIsNew
-        ? 'Creates a `town.muni.arbiter.policy` record in your own repo (the logged-in account). Copy its at:// URI afterwards to reference it from arbiter configs.'
-        : 'Saving rewrites the record directly in your repo. Any arbiter config referencing this URI picks up the new source.'
-    }
-    onSave={saveEntry}
-  />
-{/if}

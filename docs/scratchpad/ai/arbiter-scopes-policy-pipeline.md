@@ -185,9 +185,13 @@ policy hands management NSIDs to the built-in for admins), `createArbiter`,
   verbatim (no per-community substitution), the
   `town.muni.arbiter.simple.admins` self record naming the importing
   account, and the config record, all into the steward's repo via the
-  app-password session — self-contained until the shared default policy
-  record is published (then `DEFAULT_POLICY_URI` can replace the local
+  app-password session — self-contained until a shared default policy record
+  is published (then the manager could reference it instead of the local
   write).
+  Superseded 2026-09-10: no shared default policy record was ever published;
+  the import bootstrap no longer writes records via the app-password session
+  at all. Both setup flows take operator-provided policy-layer `at://` URIs
+  plus trusted scopes and bootstrap via `resetConfig` (see TODO.md).
 
 ### E. arbiter-simulator
 - Model the scope gate + pipeline layers in the node graph (this is the demo

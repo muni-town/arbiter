@@ -42,7 +42,6 @@
   const activeTab = $derived.by(() => {
     const path = page.url.pathname;
     if (path.endsWith('/policy')) return 'Policy';
-    if (path.endsWith('/library')) return 'Library';
     if (path.endsWith('/debug')) return 'Debug';
     return 'Policy';
   });
@@ -77,7 +76,6 @@
     <Tabs
       items={[
         { name: 'Policy', href: `/dashboard/${encodeURIComponent(did)}/policy` },
-        { name: 'Library', href: `/dashboard/${encodeURIComponent(did)}/library` },
         { name: 'Debug', href: `/dashboard/${encodeURIComponent(did)}/debug` },
       ]}
       active={activeTab}

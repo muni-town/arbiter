@@ -1,4 +1,3 @@
-#
 # Default Rego policy for a Muni Town arbiter.
 #
 # This policy is installed as the (single) layer of the community's policy

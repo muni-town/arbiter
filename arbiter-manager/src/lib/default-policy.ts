@@ -1,46 +1,19 @@
 /**
- * Default policy helpers.
+ * This module no longer ships bootstrap machinery.
  *
- * The default policy is owner-agnostic: one copy can be published once and
- * referenced by every community's pipeline (adminship is resolved at
- * evaluation time from each account's `town.muni.arbiter.simple.admins`
- * record). Two bootstrap flows:
+ * Decision: the manager has no default policy at all. There is no published
+ * shared default policy record; the default-policy URI placeholder — and the
+ * import flow's app-password direct writes it existed to work around — have
+ * been removed. Both setup flows and the policy tab's "Reset Config" sheet now
+ * take operator-provided policy-layer `at://` URIs (published from the Library
+ * tab, which is the publishing surface) plus trusted scopes, and write them
+ * verbatim via `town.muni.arbiter.resetConfig`.
  *
- * - Create: provisions a brand-new account and points its config at
- *   {@link DEFAULT_POLICY_URI} — the `at://` URI of a shared, pre-published
- *   default policy record.
- * - Import: writes the default policy record (plus the admins + config
- *   records) directly into the steward's repo via the app-password session,
- *   so the flow is self-contained before the shared record exists.
- *
- * Once the shared record is published, the import flow can reference
- * {@link DEFAULT_POLICY_URI} instead of writing its own copy.
+ * `policies/arbiter/default-policy.rego` stays in the repo as the shipped
+ * authoring reference template. Nothing in the manager imports it any more:
+ * its only consumer is the compile-guard test
+ * `crates/arbiter-core/tests/default_policy.rs`, which compiles it as a
+ * pipeline layer and asserts it remains owner-agnostic — adminship is resolved
+ * at evaluation time from each account's `town.muni.arbiter.simple.admins`
+ * record, never a `${owner}` placeholder.
  */
-
-import defaultPolicySource from '/policies/arbiter/default-policy.rego?raw';
-
-/**
- * The `at://` URI of the shared default policy record referenced by the
- * create bootstrap flow.
- *
- * PLACEHOLDER: point this at the published default policy record when one
- * exists. Until then the create flow's bootstrap policy layers reference a
- * record that does not resolve, so a freshly bootstrapped arbiter fails
- * closed (denies everything) — which is the safe default for an
- * unconfigured community.
- */
-export const DEFAULT_POLICY_URI = 'at://did:plc:TODO/town.muni.arbiter.policy/default';
-
-/**
- * The rkey (policy name) of a default policy record in a community's repo,
- * e.g. `at://<did>/town.muni.arbiter.policy/default`. Kept for the PolicyTab
- * authoring flow.
- */
-export const DEFAULT_POLICY_RKEY = 'default';
-
-/**
- * The raw owner-agnostic default policy source (loaded at compile time via
- * the Vite raw import). The import flow writes it as the community's policy
- * record verbatim — no substitution.
- */
-export const defaultPolicy = defaultPolicySource as string;

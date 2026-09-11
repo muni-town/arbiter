@@ -2,17 +2,15 @@
   import { Button } from '@foxui/core';
   import { setupState } from '$lib/setupState.svelte';
   import { isAtprotoDid } from '@atproto/oauth-client-browser';
-  import { DEFAULT_POLICY_URI } from '$lib/default-policy';
-  import { arbiter } from '$lib/arbiter';
+  import { arbiter, parseBootstrapConfig } from '$lib/arbiter';
   import { auth } from '$lib/auth.svelte';
+  import BootstrapConfigInputs from './BootstrapConfigInputs.svelte';
+
+  let policyLayersText = $state('');
+  let trustedScopesText = $state('');
 
   function goBack() {
     setupState.step = 'oauth';
-  }
-
-  /** The pre-existing default policy URI the bootstrap policy layers reference. */
-  function defaultPolicyUri(): string {
-    return setupState.defaultPolicyUri ?? DEFAULT_POLICY_URI;
   }
 
   async function createAndFinish() {
@@ -21,6 +19,10 @@
 
     try {
       if (!isAtprotoDid(auth.did)) throw new Error('Not logged in with valid DID');
+
+      // Parse the operator-provided bootstrap config before provisioning, so
+      // a malformed URI never leaves a half-bootstrapped account behind.
+      const config = parseBootstrapConfig(policyLayersText, trustedScopesText);
 
       // If a previous attempt already provisioned the account (its DID was
       // persisted after a successful createArbiter), skip re-provisioning and
@@ -36,19 +38,17 @@
         setupState.createDid = did;
       }
 
-      // Bootstrap the fresh (offline) arbiter: point its config at the
-      // PRE-EXISTING default policy record via resetConfig — the
+      // Bootstrap the fresh (offline) arbiter with the operator-provided
+      // policy layers + trusted scopes via resetConfig — the
       // recovery-admin-only hatch works while the arbiter is offboarded, and
       // bringing the config record into existence brings the arbiter online.
       // No record is authored and installPolicy is NOT used: it is
-      // append-only and policy-layer-gated, while resetConfig is the designated
-      // bootstrap/recovery hatch. The referenced record must be published
-      // somewhere reachable (see DEFAULT_POLICY_URI); until it is, the
-      // arbiter fails closed.
-      await arbiter.resetConfig(did, {
-        trustedScopes: [],
-        policyLayers: [defaultPolicyUri()],
-      });
+      // append-only and policy-layer-gated, while resetConfig is the
+      // designated bootstrap/recovery hatch. The referenced policy records
+      // must already exist (published from the Library tab); until they do,
+      // the arbiter comes online and then fails closed — recoverable by
+      // resetting the config again.
+      await arbiter.resetConfig(did, config);
 
       setupState.step = 'complete';
       setupState.error = undefined;
@@ -79,10 +79,13 @@
       return its DID. You (the signed-in account) become its recovery admin.
     </p>
     <p class="text-xs text-base-500 dark:text-base-500">
-      The new arbiter's policy layers reference the shared default policy record and start with no
-      trusted scopes — manage both from the policy editor afterwards.
+      The arbiter stays offline — denying every request — until this step writes its config:
+      provide the policy layers and trusted scopes below. You can manage both from the policy
+      editor afterwards.
     </p>
   </div>
+
+  <BootstrapConfigInputs bind:policyLayersText bind:trustedScopesText />
 
   <div class="space-y-4">
     {#if setupState.error}

@@ -21,22 +21,27 @@ implementation sprint. Nothing here blocks the change set from being committed.
 - **Seed `trustedScopes` in the migration config.** `resetConfig` sets scopes
   wholesale — spaces' scoped endpoints 403 until the migration config carries
   the scope NSIDs their apps were using.
-- **Publish the shared default policy record.** `DEFAULT_POLICY_URI` in
-  `arbiter-manager/src/lib/default-policy.ts` is a placeholder; publish the
-  project's (owner-agnostic) default policy — the shipped
-  `policies/arbiter/default-policy.rego`, which resolves adminship per
-  community from each account's `town.muni.arbiter.simple.admins` record —
-  as a shared record and point the constant at it. Then the import
-  bootstrap can reference the shared record instead of writing a
-  per-community copy.
+- **Decision — no shipped default policy; bootstrap is operator-provided.**
+  The default-policy URI placeholder and the import flow's app-password
+  direct writes are gone. Both setup flows ask the operator for one or more
+  `town.muni.arbiter.policy` `at://` URIs (published from the Library tab —
+  the referenced records must already exist) plus optional trusted scopes and
+  bootstrap via `town.muni.arbiter.resetConfig`; the policy tab's "Reset
+  Config" sheet is the recovery/bootstrap surface. The shipped
+  `policies/arbiter/default-policy.rego` remains only as the authoring
+  reference template (compiled by
+  `crates/arbiter-core/tests/default_policy.rs`). If a shared default policy
+  is ever published after all, keep it owner-agnostic: no `${owner}` —
+  adminship must keep resolving from each account's
+  `town.muni.arbiter.simple.admins` record at evaluation time.
+- **Admins-record editor.** With bootstrap no longer writing a
+  `town.muni.arbiter.simple.admins` record, policies that fetch it (the
+  reference template does) have no UI surface to create/update it — the
+  Library tab only manages `town.muni.arbiter.policy` records. Add an admins
+  editor (PolicyTab section or Library extension).
 
 ## Manager
 
-- **`resetConfig` OAuth scope.** The client metadata does not carry
-  `rpc:town.muni.arbiter.resetConfig?aud=*` yet — add it when a UI surface
-  calls `resetConfig` (the import flow currently bootstraps via app-password
-  writes, so nothing calls it from the UI). Adding a scope invalidates
-  existing localhost grants; do it deliberately.
 - **PolicyTab Add-Policy duplicate-URI dedupe.** Add-Policy can push an entry
   duplicating an Add-Reference URI (rkey-vs-uri identity mismatch) → duplicate
   layer evaluation on Install. (Review5, P3)
