@@ -59,8 +59,10 @@ use atrium_api::types::string::{AtIdentifier, Nsid, RecordKey, Tid};
 use atrium_xrpc::error::XrpcErrorKind;
 use atrium_xrpc_client::reqwest::ReqwestClient;
 use atproto_record::aturi::ATURI;
+use axum::http::StatusCode;
 use futures_util::stream::{self, StreamExt};
 use moka::future::Cache;
+use rand::Rng;
 
 /// Service record collection + rkey (`town.muni.arbiter.service/self`).
 const SERVICE_COLLECTION: &str = "town.muni.arbiter.service";
@@ -87,20 +89,60 @@ const RECOVERY_RKEY: &str = "self";
 /// many consecutive failures the arbiter is left offboarded (fail-closed) and
 /// we move on, so a permanently unreachable PDS cannot spin the pass forever.
 /// A subsequent Jetstream event or restart retries.
-const STARTUP_MAX_RETRIES: u32 = 5;
+const STARTUP_MAX_RETRIES: u32 = 2;
 
 /// Maximum arbiters whose `load_and_onboard` runs concurrently during a bulk
 /// onboarding pass ([`startup_onboard`], [`refresh_all_after_reconnect`]).
 ///
 /// Each load opens several unauthenticated HTTPS connections to per-DID
 /// endpoints (DID resolution, repo rev, service/config records, every
-/// pipeline layer — each on a fresh client with no pool reuse, see
-/// `pds_read_client`), so an unbounded pass at thousands-of-arbiters scale
+/// pipeline layer), so an unbounded pass at thousands-of-arbiters scale
 /// would mean thousands of simultaneous DNS lookups and TLS handshakes plus
 /// file-descriptor pressure. The bound keeps concurrent fetches — and open
 /// sockets — flat; the pass is background work, so 64-wide throughput is
 /// ample.
 const ONBOARD_CONCURRENCY: usize = 64;
+
+/// Marker attached to load errors that came back as HTTP 429 from a PDS
+/// (or its edge). atrium's XRPC error type discards response headers, so
+/// the server's own `Retry-After` value is not visible to us — the retry
+/// loop instead applies a dedicated longer window
+/// ([`RATE_LIMIT_RETRY_BASE`] / [`RATE_LIMIT_RETRY_MAX`]) as a stand-in.
+#[derive(Debug, thiserror::Error)]
+#[error("rate limited (HTTP 429)")]
+struct RateLimited;
+
+/// Base wait before retrying a rate-limited (429) load — far above the
+/// generic 1s backoff, so a retry does not instantly re-trip the same
+/// per-IP quota. Grown 4x per consecutive 429 up to
+/// [`RATE_LIMIT_RETRY_MAX`], then jittered (see [`jitter`]).
+const RATE_LIMIT_RETRY_BASE: Duration = Duration::from_secs(10);
+
+/// Upper bound on a single rate-limit retry wait, so one permanently
+/// 429-ing arbiter cannot stall its slot in a bulk pass indefinitely.
+const RATE_LIMIT_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Uniformly jitter a retry wait upward by up to 25%, so up to
+/// [`ONBOARD_CONCURRENCY`] concurrently failing loads do not all wake and
+/// re-fire at the same instant against the same host.
+fn jitter(d: Duration) -> Duration {
+    d + d.mul_f64(rand::rng().random_range(0.0..0.25))
+}
+
+/// Convert an atrium XRPC error into a load-path error, tagging HTTP 429
+/// responses with [`RateLimited`] so [`onboard_with_retries`] can back off
+/// differently from generic failures.
+fn xrpc_load_error<E>(what: &str, e: atrium_xrpc::Error<E>) -> anyhow::Error
+where
+    E: std::fmt::Display + std::fmt::Debug,
+{
+    if let atrium_xrpc::Error::XrpcResponse(xrpc_err) = &e
+        && xrpc_err.status == StatusCode::TOO_MANY_REQUESTS
+    {
+        return anyhow::Error::new(RateLimited).context(format!("{what}: {e}"));
+    }
+    anyhow!("{what}: {e}")
+}
 
 /// Compiled pipeline layers, keyed by `(at:// uri, record cid)`. A `(uri,
 /// cid)` pair is content-addressed, so entries never go stale — the TTL only
@@ -268,8 +310,10 @@ async fn onboard_all(
 }
 
 /// One arbiter's load + onboard with bounded retry: exponential backoff from
-/// 1s doubling to 30s, giving up after `max_retries` consecutive failures —
-/// fail-closed (the arbiter stays offboarded), so the pass always terminates.
+/// 1s doubling to 30s for generic failures, a longer 429-aware window for
+/// rate-limited loads ([`RATE_LIMIT_RETRY_BASE`]), all waits jittered —
+/// giving up after `max_retries` consecutive failures, fail-closed (the
+/// arbiter stays offboarded), so the pass always terminates.
 async fn onboard_with_retries(
     state: &AppState,
     did: String,
@@ -306,14 +350,31 @@ async fn onboard_with_retries(
             }
             Err(e) => {
                 attempt += 1;
+                // A 429 means the PDS's per-IP quota is exhausted. atrium's
+                // XRPC error type drops response headers, so the server's own
+                // `Retry-After` value is not visible; wait a dedicated longer
+                // window instead (4x growth, higher cap), and jitter every
+                // wait so concurrent failing loads don't re-sync into one
+                // burst against the same host.
+                let rate_limited = e.downcast_ref::<RateLimited>().is_some();
+                let wait = jitter(if rate_limited {
+                    RATE_LIMIT_RETRY_BASE.max(delay)
+                } else {
+                    delay
+                });
                 tracing::warn!(
                     did = %did,
                     attempt,
+                    rate_limited,
                     error = %format!("{e:#}"),
-                    "load_and_onboard failed during {pass}; retrying in {delay:?}"
+                    "load_and_onboard failed during {pass}; retrying in {wait:?}"
                 );
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_secs(30));
+                tokio::time::sleep(wait).await;
+                delay = if rate_limited {
+                    (delay * 4).min(RATE_LIMIT_RETRY_MAX)
+                } else {
+                    (delay * 2).min(Duration::from_secs(30))
+                };
             }
         }
     }
@@ -634,16 +695,29 @@ fn parse_at_identifier(repo: &str) -> Result<AtIdentifier> {
         .map_err(|e| anyhow!("invalid repo identifier `{repo}`: {e}"))
 }
 
-/// Build an unauthenticated atrium client for public PDS record reads. A bounded
-/// timeout keeps a hung PDS from stalling the caller.
+/// Shared HTTP client for every unauthenticated PDS read (service/config/rev
+/// fetches, layer records, remote loads). Pooling + keepalive mean repeated
+/// reads to the same PDS host reuse the established connection (HTTP/2 where
+/// negotiated) instead of redoing TCP+TLS per client, cutting per-request
+/// latency and connection churn at the PDS's edge. It does not reduce
+/// request *counts*, so request-based rate limits still apply — see
+/// [`RateLimited`] handling in [`onboard_with_retries`].
+static PDS_READ_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Duration::from_secs(60))
+        .build()
+        .expect("building shared PDS read HTTP client")
+});
+
+/// Build an unauthenticated atrium client for public PDS record reads. The
+/// per-request total timeout keeps a hung PDS from stalling the caller; the
+/// reqwest client itself is shared ([`PDS_READ_HTTP`]) so connections are
+/// pooled across loads instead of rebuilt per call.
 pub(crate) fn pds_read_client(pds_endpoint: &str) -> Result<PdsReadClient> {
     let client = atrium_xrpc_client::reqwest::ReqwestClientBuilder::new(pds_endpoint)
-        .client(
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .context("building HTTP client")?,
-        )
+        .client(PDS_READ_HTTP.clone())
         .build();
     Ok(AtpServiceClient::new(client))
 }
@@ -660,13 +734,12 @@ async fn fetch_repo_rev(
     let did = match repo {
         AtIdentifier::Did(did) => did.clone(),
         // Handle-based repo identifiers have no stable DID here; callers always
-        // pass a DID, so this is defensive.
         AtIdentifier::Handle(_) => return Ok(None),
     };
     let params = atrium_api::com::atproto::sync::get_repo_status::ParametersData { did }.into();
     match api.service.com.atproto.sync.get_repo_status(params).await {
         Ok(output) => Ok(output.data.rev),
-        Err(e) => Err(anyhow!("getRepoStatus: {e}")),
+        Err(e) => Err(xrpc_load_error("getRepoStatus", e)),
     }
 }
 
@@ -694,7 +767,7 @@ pub async fn repo_head_cid(state: &AppState, did: &str) -> Result<Option<String>
         .into();
     match api.service.com.atproto.sync.get_latest_commit(params).await {
         Ok(output) => Ok(Some(output.data.cid.as_ref().to_string())),
-        Err(e) => Err(anyhow!("getLatestCommit: {e}")),
+        Err(e) => Err(xrpc_load_error("getLatestCommit", e)),
     }
 }
 
@@ -722,7 +795,12 @@ async fn fetch_record(
             cid: output.data.cid.map(|c| c.as_ref().to_string()),
         })),
         Err(atrium_xrpc::Error::XrpcResponse(xrpc_err)) => {
-            if matches!(
+            if xrpc_err.status == StatusCode::TOO_MANY_REQUESTS {
+                Err(xrpc_load_error(
+                    &format!("getRecord {collection}/{rkey}"),
+                    atrium_xrpc::Error::XrpcResponse(xrpc_err),
+                ))
+            } else if matches!(
                 xrpc_err.error,
                 Some(XrpcErrorKind::Custom(get_record::Error::RecordNotFound(_)))
             ) {
@@ -731,7 +809,7 @@ async fn fetch_record(
                 Err(anyhow!("getRecord {collection}/{rkey}: {xrpc_err}"))
             }
         }
-        Err(e) => Err(anyhow!("getRecord {collection}/{rkey}: {e}")),
+        Err(e) => Err(xrpc_load_error(&format!("getRecord {collection}/{rkey}"), e)),
     }
 }
 
