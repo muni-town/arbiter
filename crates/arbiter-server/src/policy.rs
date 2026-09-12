@@ -59,6 +59,7 @@ use atrium_api::types::string::{AtIdentifier, Nsid, RecordKey, Tid};
 use atrium_xrpc::error::XrpcErrorKind;
 use atrium_xrpc_client::reqwest::ReqwestClient;
 use atproto_record::aturi::ATURI;
+use futures_util::stream::{self, StreamExt};
 use moka::future::Cache;
 
 /// Service record collection + rkey (`town.muni.arbiter.service/self`).
@@ -81,12 +82,25 @@ pub const POLICY_COLLECTION: &str = "town.muni.arbiter.policy";
 const RECOVERY_COLLECTION: &str = "town.muni.arbiter.recovery";
 const RECOVERY_RKEY: &str = "self";
 
-/// Maximum number of `load_and_onboard` attempts per arbiter during startup
-/// onboarding. After this many consecutive failures the arbiter is left
-/// offboarded (fail-closed) and we move on, so a permanently unreachable PDS
-/// cannot spin this task forever. A subsequent Jetstream event or restart
-/// retries.
+/// Maximum number of `load_and_onboard` attempts per arbiter during a bulk
+/// onboarding pass (startup onboarding, post-reconnect refresh). After this
+/// many consecutive failures the arbiter is left offboarded (fail-closed) and
+/// we move on, so a permanently unreachable PDS cannot spin the pass forever.
+/// A subsequent Jetstream event or restart retries.
 const STARTUP_MAX_RETRIES: u32 = 5;
+
+/// Maximum arbiters whose `load_and_onboard` runs concurrently during a bulk
+/// onboarding pass ([`startup_onboard`], [`refresh_all_after_reconnect`]).
+///
+/// Each load opens several unauthenticated HTTPS connections to per-DID
+/// endpoints (DID resolution, repo rev, service/config records, every
+/// pipeline layer — each on a fresh client with no pool reuse, see
+/// `pds_read_client`), so an unbounded pass at thousands-of-arbiters scale
+/// would mean thousands of simultaneous DNS lookups and TLS handshakes plus
+/// file-descriptor pressure. The bound keeps concurrent fetches — and open
+/// sockets — flat; the pass is background work, so 64-wide throughput is
+/// ample.
+const ONBOARD_CONCURRENCY: usize = 64;
 
 /// Compiled pipeline layers, keyed by `(at:// uri, record cid)`. A `(uri,
 /// cid)` pair is content-addressed, so entries never go stale — the TTL only
@@ -157,58 +171,22 @@ pub enum OnboardOutcome {
 ///
 /// Per-arbiter fail-closed is already enforced by `ArbiterCollection::begin_request`
 /// returning `ArbiterNotReady` for un-onboarded DIDs; this task just brings them
-/// online. Retry each load with bounded exponential backoff, giving up after
-/// [`STARTUP_MAX_RETRIES`] consecutive failures per arbiter.
+/// online. Loads run bounded-concurrent (see [`onboard_all`]) and each arbiter
+/// retries independently with bounded exponential backoff (see
+/// [`onboard_with_retries`]).
 pub async fn startup_onboard(state: Arc<AppState>) -> Result<()> {
-    let entries = state
-        .store
-        .list()
-        .await
-        .context("listing stored credentials")?;
-    if entries.is_empty() {
+    let dids = stored_dids(&state).await?;
+    if dids.is_empty() {
         tracing::info!("no stewarded accounts to onboard at startup");
         return Ok(());
     }
-    for (did, _creds) in entries {
-        let mut attempt: u32 = 0;
-        let mut delay = Duration::from_secs(1);
-        loop {
-            match load_and_onboard(&state, &did).await {
-                Ok(OnboardOutcome::Onboarded { pds_endpoint }) => {
-                    tracing::info!(did = %did, pds = %pds_endpoint, "onboarded arbiter");
-                    break;
-                }
-                Ok(OnboardOutcome::Offboarded { pds_endpoint }) => {
-                    tracing::info!(
-                        did = %did,
-                        pds = %pds_endpoint,
-                        "arbiter offboarded at startup (service record absent or repointed)"
-                    );
-                    break;
-                }
-                Err(e) if attempt >= STARTUP_MAX_RETRIES => {
-                    // Fail closed: leave the arbiter offboarded and move on.
-                    tracing::error!(
-                        did = %did,
-                        error = %format!("{e:#}"),
-                        "giving up onboarding arbiter after {STARTUP_MAX_RETRIES} attempts"
-                    );
-                    break;
-                }
-                Err(e) => {
-                    attempt += 1;
-                    tracing::warn!(
-                        did = %did,
-                        attempt,
-                        error = %format!("{e:#}"),
-                        "load_and_onboard failed; retrying in {delay:?}"
-                    );
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(Duration::from_secs(30));
-                }
-            }
-        }
-    }
+    let summary = onboard_all(&state, dids, STARTUP_MAX_RETRIES, "startup").await;
+    tracing::info!(
+        onboarded = summary.onboarded,
+        offboarded = summary.offboarded,
+        failed = summary.failed,
+        "startup onboarding complete"
+    );
     Ok(())
 }
 
@@ -218,52 +196,124 @@ pub async fn startup_onboard(state: Arc<AppState>) -> Result<()> {
 /// that happened while it was down, and `load_and_onboard` re-fetches the
 /// *current* PDS state, so this closes the fail-open window where the server
 /// would otherwise keep enforcing the last-loaded (possibly revoked/permissive)
-/// policy. Each failed load is left fail-closed (offboarded) and retried a
-/// bounded number of times.
+/// policy. Runs bounded-concurrent (see [`onboard_all`]); each failed load is
+/// left fail-closed (offboarded) and retried a bounded number of times.
 pub async fn refresh_all_after_reconnect(state: Arc<AppState>) {
-    let entries = match state.store.list().await {
-        Ok(e) => e,
+    let dids = match stored_dids(&state).await {
+        Ok(dids) => dids,
         Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "failed to list credentials for reconnect refresh");
+            tracing::error!(
+                error = %format!("{e:#}"),
+                "failed to list credentials for reconnect refresh"
+            );
             return;
         }
     };
-    for (did, _creds) in entries {
-        let mut attempt: u32 = 0;
-        let mut delay = Duration::from_secs(1);
-        loop {
-            match load_and_onboard(&state, &did).await {
-                Ok(OnboardOutcome::Onboarded { pds_endpoint }) => {
-                    tracing::info!(did = %did, pds = %pds_endpoint, "refreshed arbiter after reconnect");
-                    break;
+    if dids.is_empty() {
+        return;
+    }
+    let summary = onboard_all(&state, dids, STARTUP_MAX_RETRIES, "post-reconnect refresh").await;
+    tracing::info!(
+        onboarded = summary.onboarded,
+        offboarded = summary.offboarded,
+        failed = summary.failed,
+        "post-reconnect refresh complete"
+    );
+}
+
+/// The DIDs the server holds credentials for — the bulk-onboarding work list.
+async fn stored_dids(state: &AppState) -> Result<Vec<String>> {
+    let entries = state
+        .store
+        .list()
+        .await
+        .context("listing stored credentials")?;
+    Ok(entries.into_iter().map(|(did, _creds)| did).collect())
+}
+
+/// Outcome counts of a bulk onboarding pass.
+#[derive(Default)]
+struct OnboardSummary {
+    onboarded: usize,
+    offboarded: usize,
+    failed: usize,
+}
+
+/// Load + onboard every DID in `dids`, at most [`ONBOARD_CONCURRENCY`] loads
+/// in flight, returning per-outcome counts.
+///
+/// Concurrency is bounded because each load opens several unauthenticated
+/// HTTPS connections to per-DID endpoints (see [`ONBOARD_CONCURRENCY`]): at
+/// thousands-of-arbiters scale an unbounded pass would stampede DNS/PLC and
+/// the PDS fleet. Arbiters are independent — one hung PDS only occupies its
+/// own slot instead of stalling the pass head-of-line.
+async fn onboard_all(
+    state: &AppState,
+    dids: Vec<String>,
+    max_retries: u32,
+    pass: &str,
+) -> OnboardSummary {
+    let mut summary = OnboardSummary::default();
+    let mut loads = stream::iter(dids)
+        .map(|did| async move { onboard_with_retries(state, did, max_retries, pass).await })
+        .buffer_unordered(ONBOARD_CONCURRENCY);
+    while let Some(outcome) = loads.next().await {
+        match outcome {
+            Ok(OnboardOutcome::Onboarded { .. }) => summary.onboarded += 1,
+            Ok(OnboardOutcome::Offboarded { .. }) => summary.offboarded += 1,
+            Err(_) => summary.failed += 1, // already logged in `onboard_with_retries`
+        }
+    }
+    summary
+}
+
+/// One arbiter's load + onboard with bounded retry: exponential backoff from
+/// 1s doubling to 30s, giving up after `max_retries` consecutive failures —
+/// fail-closed (the arbiter stays offboarded), so the pass always terminates.
+async fn onboard_with_retries(
+    state: &AppState,
+    did: String,
+    max_retries: u32,
+    pass: &str,
+) -> Result<OnboardOutcome> {
+    let mut attempt: u32 = 0;
+    let mut delay = Duration::from_secs(1);
+    loop {
+        match load_and_onboard(state, &did).await {
+            Ok(outcome) => {
+                match &outcome {
+                    OnboardOutcome::Onboarded { pds_endpoint } => {
+                        tracing::info!(did = %did, pds = %pds_endpoint, "onboarded arbiter ({pass})");
+                    }
+                    OnboardOutcome::Offboarded { pds_endpoint } => {
+                        tracing::info!(
+                            did = %did,
+                            pds = %pds_endpoint,
+                            "arbiter offboarded during {pass} (service record absent or repointed)"
+                        );
+                    }
                 }
-                Ok(OnboardOutcome::Offboarded { pds_endpoint }) => {
-                    tracing::info!(
-                        did = %did,
-                        pds = %pds_endpoint,
-                        "arbiter offboarded after reconnect (service record absent or repointed)"
-                    );
-                    break;
-                }
-                Err(e) if attempt >= STARTUP_MAX_RETRIES => {
-                    tracing::error!(
-                        did = %did,
-                        error = %format!("{e:#}"),
-                        "giving up refreshing arbiter after reconnect ({STARTUP_MAX_RETRIES} attempts)"
-                    );
-                    break;
-                }
-                Err(e) => {
-                    attempt += 1;
-                    tracing::warn!(
-                        did = %did,
-                        attempt,
-                        error = %format!("{e:#}"),
-                        "reconnect refresh failed; retrying in {delay:?}"
-                    );
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(Duration::from_secs(30));
-                }
+                return Ok(outcome);
+            }
+            Err(e) if attempt >= max_retries => {
+                // Fail closed: leave the arbiter offboarded and move on.
+                tracing::error!(
+                    did = %did,
+                    error = %format!("{e:#}"),
+                    "giving up onboarding arbiter after {max_retries} attempts ({pass})"
+                );
+                return Err(e);
+            }
+            Err(e) => {
+                attempt += 1;
+                tracing::warn!(
+                    did = %did,
+                    attempt,
+                    error = %format!("{e:#}"),
+                    "load_and_onboard failed during {pass}; retrying in {delay:?}"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(30));
             }
         }
     }
