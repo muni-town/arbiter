@@ -51,10 +51,15 @@ use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use atproto_jetstream::EventHandler;
 use atproto_jetstream::JetstreamEvent;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::stream::{self, StreamExt};
+use futures_util::SinkExt;
+use moka::future::Cache;
 use reqwest_websocket::{Message, RequestBuilderExt};
 
-use crate::policy::{OnboardOutcome, load_and_onboard, refresh_all_after_reconnect};
+use crate::policy::{
+    OnboardOutcome, RecordSource, ONBOARD_CONCURRENCY, load_and_onboard_with,
+    refresh_all_after_reconnect,
+};
 use crate::{AppState, CONFIG};
 /// Collections this server watches on Jetstream.
 const WATCHED_COLLECTIONS: &[&str] = &[
@@ -291,19 +296,32 @@ impl EventHandler for ReloadHandler {
             // record's `at://` URI in the policy module's reverse index and
             // reload exactly the arbiters whose pipeline references it.
             let uri = format!("at://{did}/{collection}/{rkey}");
-            for arbiter_did in crate::policy::referencing_arbiters(&uri) {
-                // Index backlinks can outlive an offboard/purge; only reload
-                // accounts we currently steward (a redundant reload for a
-                // purged DID would just re-apply the lifecycle, but skipping
-                // keeps the stream cheap).
-                if self.is_stewarded(&arbiter_did).await {
-                    // Ungated (rev = None): the event rev belongs to the
-                    // record's repo, while the rev-floor gate compares against
-                    // the steward repo's head — cross-repo revs are
-                    // incomparable (see `reload`).
-                    self.reload(&arbiter_did, None).await;
-                }
-            }
+            // Reload the referencing arbiters bounded-concurrently and
+            // coalesce their record fetches within this dispatch: a widely
+            // shared layer can reference thousands of arbiters, and without
+            // both, one record write means thousands of SEQUENTIAL reloads
+            // (pinning the event pump past the stall watchdog, triggering a
+            // reconnect storm) that re-fetch the same record once per
+            // arbiter (a guaranteed 429 storm on the layer's PDS). The
+            // cache is scoped to this dispatch, so the next event always
+            // fetches fresh.
+            let layer_fetches = &Cache::new(4096);
+            let mut reloads = stream::iter(crate::policy::referencing_arbiters(&uri))
+                .map(|arbiter_did| async move {
+                    // Index backlinks can outlive an offboard/purge; only reload
+                    // accounts we currently steward (a redundant reload for a
+                    // purged DID would just re-apply the lifecycle, but skipping
+                    // keeps the stream cheap).
+                    if self.is_stewarded(&arbiter_did).await {
+                        // Ungated (rev = None): the event rev belongs to the
+                        // record's repo, while the rev-floor gate compares against
+                        // the steward repo's head — cross-repo revs are
+                        // incomparable (see `reload`).
+                        self.reload(&arbiter_did, None, Some(layer_fetches)).await;
+                    }
+                })
+                .buffer_unordered(ONBOARD_CONCURRENCY);
+            while reloads.next().await.is_some() {}
             return Ok(());
         }
 
@@ -315,7 +333,7 @@ impl EventHandler for ReloadHandler {
         if self.is_stewarded(did).await {
             // Rev-gated (Some): these collections exist only in the steward
             // repo — the same repo whose head is the load-time rev floor.
-            self.reload(did, Some(rev)).await;
+            self.reload(did, Some(rev), None).await;
         }
         Ok(())
     }
@@ -365,7 +383,17 @@ impl ReloadHandler {
     /// the gate only risks a redundant reload — every reload re-fetches
     /// current state, never the event payload — the same tradeoff
     /// `is_newer` accepts when no floor is known.
-    async fn reload(&self, did: &str, rev: Option<&str>) {
+    ///
+    /// `layer_fetches` coalesces pipeline-record fetches across a dispatch
+    /// wave (the policy-event branch passes a dispatch-scoped cache, since
+    /// every referencing arbiter loads the same pipeline); `None` — single
+    /// arbiter events — always fetches fresh.
+    async fn reload(
+        &self,
+        did: &str,
+        rev: Option<&str>,
+        layer_fetches: Option<&Cache<String, RecordSource>>,
+    ) {
         // Discard steward-repo events at or below the load-time rev floor:
         // their state is already reflected in the loaded records.
         if let Some(rev) = rev {
@@ -383,7 +411,7 @@ impl ReloadHandler {
         // TODO: maybe we should try to surgically update instead of refreshing the
         // whole policy by re-loading all the records in the future, but we need to
         // analyze carefully for correctness before doing that.
-        match load_and_onboard(&self.state, did).await {
+        match load_and_onboard_with(&self.state, did, layer_fetches).await {
             Ok(OnboardOutcome::Onboarded { pds_endpoint }) => {
                 tracing::info!(did, pds = %pds_endpoint, "reloaded arbiter from jetstream event");
             }

@@ -101,7 +101,7 @@ const STARTUP_MAX_RETRIES: u32 = 2;
 /// file-descriptor pressure. The bound keeps concurrent fetches — and open
 /// sockets — flat; the pass is background work, so 64-wide throughput is
 /// ample.
-const ONBOARD_CONCURRENCY: usize = 64;
+pub(crate) const ONBOARD_CONCURRENCY: usize = 64;
 
 /// Marker attached to load errors that came back as HTTP 429 from a PDS
 /// (or its edge). atrium's XRPC error type discards response headers, so
@@ -121,6 +121,13 @@ const RATE_LIMIT_RETRY_BASE: Duration = Duration::from_secs(10);
 /// Upper bound on a single rate-limit retry wait, so one permanently
 /// 429-ing arbiter cannot stall its slot in a bulk pass indefinitely.
 const RATE_LIMIT_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Maximum rate-limit deferrals per arbiter before giving up. A 429 is the
+/// PDS saying "slow down", not a load failure, so it must not consume the
+/// generic give-up budget; deferrals get their own cap instead. With the
+/// 10s → 60s deferral schedule this bounds one arbiter's rate-limit wait to
+/// a few minutes, so the pass still terminates.
+const RATE_LIMIT_MAX_DEFERRALS: u32 = 8;
 
 /// Uniformly jitter a retry wait upward by up to 25%, so up to
 /// [`ONBOARD_CONCURRENCY`] concurrently failing loads do not all wake and
@@ -144,6 +151,14 @@ where
     anyhow!("{what}: {e}")
 }
 
+/// Whether a load error was an HTTP 429 — either tagged directly
+/// ([`RateLimited`]) or carried inside a coalesced layer-fetch error, whose
+/// moka `Arc` sharing erases the inner anyhow chain.
+fn is_rate_limited(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RateLimited>().is_some()
+        || e.downcast_ref::<LayerFetchError>().is_some_and(|f| f.rate_limited)
+}
+
 /// Compiled pipeline layers, keyed by `(at:// uri, record cid)`. A `(uri,
 /// cid)` pair is content-addressed, so entries never go stale — the TTL only
 /// bounds memory; a changed record compiles under a fresh key.
@@ -153,6 +168,42 @@ static LAYER_CACHE: LazyLock<Cache<(String, String), Layer>> = LazyLock::new(|| 
         .time_to_idle(Duration::from_secs(6 * 60 * 60))
         .build()
 });
+
+
+/// Error shared between concurrent waiters of a coalesced layer fetch.
+/// moka hands errors to waiters as `Arc<E>`, which erases the inner anyhow
+/// chain — so the one bit the retry loop needs (whether the failure was a
+/// 429) is carried explicitly, and the message captures the full chain.
+#[derive(Clone, Debug)]
+struct LayerFetchError {
+    rate_limited: bool,
+    message: String,
+}
+
+impl LayerFetchError {
+    fn from_err(context: &str, e: &anyhow::Error) -> Self {
+        Self {
+            rate_limited: e.downcast_ref::<RateLimited>().is_some(),
+            message: format!("{context}: {e:#}"),
+        }
+    }
+
+    fn from_msg(message: String) -> Self {
+        Self {
+            rate_limited: false,
+            message,
+        }
+    }
+}
+
+impl std::fmt::Display for LayerFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for LayerFetchError {}
+
 
 /// Reverse index: `at://<did>/<collection>/<rkey>` policy-record URI → the
 /// stewarded arbiters whose loaded pipeline references it.
@@ -288,7 +339,10 @@ struct OnboardSummary {
 /// HTTPS connections to per-DID endpoints (see [`ONBOARD_CONCURRENCY`]): at
 /// thousands-of-arbiters scale an unbounded pass would stampede DNS/PLC and
 /// the PDS fleet. Arbiters are independent — one hung PDS only occupies its
-/// own slot instead of stalling the pass head-of-line.
+/// own slot instead of stalling the pass head-of-line. Layer-record fetches
+/// are coalesced per pass via a pass-local cache: a shared remote layer
+/// referenced by many arbiters is fetched once per pass instead of once per
+/// arbiter, while every load outside bulk passes always fetches fresh.
 async fn onboard_all(
     state: &AppState,
     dids: Vec<String>,
@@ -296,8 +350,16 @@ async fn onboard_all(
     pass: &str,
 ) -> OnboardSummary {
     let mut summary = OnboardSummary::default();
+    // Pass-scoped fetch coalescer: within this pass, concurrent loads of the
+    // same layer URI share one PDS read (a shared remote layer referenced by
+    // many arbiters is otherwise fetched once per arbiter per pass — a
+    // guaranteed 429 stampede on the layer's PDS). The cache dies with the
+    // pass, so loads outside it always observe the PDS's current state.
+    let layer_fetches = &Cache::new(4096);
     let mut loads = stream::iter(dids)
-        .map(|did| async move { onboard_with_retries(state, did, max_retries, pass).await })
+        .map(|did| async move {
+            onboard_with_retries(state, did, max_retries, pass, layer_fetches).await
+        })
         .buffer_unordered(ONBOARD_CONCURRENCY);
     while let Some(outcome) = loads.next().await {
         match outcome {
@@ -310,20 +372,23 @@ async fn onboard_all(
 }
 
 /// One arbiter's load + onboard with bounded retry: exponential backoff from
-/// 1s doubling to 30s for generic failures, a longer 429-aware window for
-/// rate-limited loads ([`RATE_LIMIT_RETRY_BASE`]), all waits jittered —
-/// giving up after `max_retries` consecutive failures, fail-closed (the
-/// arbiter stays offboarded), so the pass always terminates.
+/// 1s doubling to 30s for generic failures; 429s defer instead — they do not
+/// consume the give-up budget and wait a longer dedicated window
+/// ([`RATE_LIMIT_RETRY_BASE`]), capped after [`RATE_LIMIT_MAX_DEFERRALS`].
+/// All waits jittered. Giving up is fail-closed (the arbiter stays
+/// offboarded), so the pass always terminates.
 async fn onboard_with_retries(
     state: &AppState,
     did: String,
     max_retries: u32,
     pass: &str,
+    layer_fetches: &Cache<String, RecordSource>,
 ) -> Result<OnboardOutcome> {
     let mut attempt: u32 = 0;
     let mut delay = Duration::from_secs(1);
+    let mut deferrals: u32 = 0;
     loop {
-        match load_and_onboard(state, &did).await {
+        match load_and_onboard_with(state, &did, Some(layer_fetches)).await {
             Ok(outcome) => {
                 match &outcome {
                     OnboardOutcome::Onboarded { pds_endpoint } => {
@@ -349,14 +414,32 @@ async fn onboard_with_retries(
                 return Err(e);
             }
             Err(e) => {
-                attempt += 1;
-                // A 429 means the PDS's per-IP quota is exhausted. atrium's
-                // XRPC error type drops response headers, so the server's own
-                // `Retry-After` value is not visible; wait a dedicated longer
-                // window instead (4x growth, higher cap), and jitter every
-                // wait so concurrent failing loads don't re-sync into one
-                // burst against the same host.
-                let rate_limited = e.downcast_ref::<RateLimited>().is_some();
+                // A 429 means the PDS's per-IP quota is exhausted: the PDS
+                // saying "slow down", not "broken". It must not consume the
+                // give-up budget — otherwise `max_retries` retries are
+                // exhausted in seconds under a rate limit and the pass
+                // leaves most arbiters offline. Deferrals get their own cap
+                // ([`RATE_LIMIT_MAX_DEFERRALS`]) so the pass terminates.
+                let rate_limited = is_rate_limited(&e);
+                if rate_limited {
+                    deferrals += 1;
+                    if deferrals > RATE_LIMIT_MAX_DEFERRALS {
+                        tracing::error!(
+                            did = %did,
+                            error = %format!("{e:#}"),
+                            "giving up onboarding arbiter after {RATE_LIMIT_MAX_DEFERRALS} \
+                             rate-limit deferrals ({pass})"
+                        );
+                        return Err(e);
+                    }
+                } else {
+                    attempt += 1;
+                }
+                // atrium's XRPC error type drops response headers, so the
+                // server's own `Retry-After` value is not visible; wait a
+                // dedicated longer window for 429s (4x growth, higher cap),
+                // and jitter every wait so concurrent failing loads don't
+                // re-sync into one burst against the same host.
                 let wait = jitter(if rate_limited {
                     RATE_LIMIT_RETRY_BASE.max(delay)
                 } else {
@@ -365,6 +448,7 @@ async fn onboard_with_retries(
                 tracing::warn!(
                     did = %did,
                     attempt,
+                    deferrals,
                     rate_limited,
                     error = %format!("{e:#}"),
                     "load_and_onboard failed during {pass}; retrying in {wait:?}"
@@ -392,6 +476,20 @@ async fn onboard_with_retries(
 /// Returns [`OnboardOutcome`] so callers can tell an onboard from an offboard
 /// (both are `Ok` — the lifecycle applied successfully).
 pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<OnboardOutcome> {
+    load_and_onboard_with(state, did, None).await
+}
+
+/// [`load_and_onboard`] with optional fetch coalescing for bulk passes: when
+/// `layer_fetches` is `Some`, concurrent loads of the same layer URI within
+/// that pass share one PDS read (see [`onboard_all`]). The cache is
+/// pass-scoped — with `None` (every event- and handler-driven caller) the
+/// load always fetches the PDS's *current* state, the property the
+/// reconnect-refresh fail-closed argument relies on.
+pub(crate) async fn load_and_onboard_with(
+    state: &AppState,
+    did: &str,
+    layer_fetches: Option<&Cache<String, RecordSource>>,
+) -> Result<OnboardOutcome> {
     let pds_endpoint = state
         .resolver
         .resolve_pds_endpoint(did)
@@ -506,7 +604,7 @@ pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<OnboardOutc
     let mut layers = Vec::with_capacity(config.policy_layers.len());
     for uri in &config.policy_layers {
         layers.push(
-            resolve_layer(state, &api, did, uri, &mut remote_clients)
+            resolve_layer(state, &api, did, uri, &mut remote_clients, layer_fetches)
                 .await
                 .with_context(|| format!("resolving pipeline layer {uri}"))?,
         );
@@ -639,6 +737,10 @@ pub(crate) async fn current_config(
 /// remote ones. Compiled layers are cached by `(uri, cid)`, so an unchanged
 /// record is reused without recompiling.
 ///
+/// When `layer_fetches` is `Some` (bulk passes), the record fetch is
+/// coalesced through the pass-scoped cache; otherwise it always hits the PDS
+/// fresh.
+///
 /// The entry must name a `town.muni.arbiter.policy` record (see
 /// `require_policy_collection`): the Jetstream reload path would never deliver
 /// writes for a foreign collection, so such a layer could never hot-reload.
@@ -648,6 +750,7 @@ async fn resolve_layer(
     steward_did: &str,
     uri: &str,
     remote_clients: &mut HashMap<String, PdsReadClient>,
+    layer_fetches: Option<&Cache<String, RecordSource>>,
 ) -> Result<Layer> {
     let parsed = parse_at_uri(uri)?;
     require_policy_collection(uri, &parsed)?;
@@ -668,10 +771,34 @@ async fn resolve_layer(
         &remote_clients[&parsed.authority]
     };
 
-    let record = fetch_record(client, &record_repo, &parsed.collection, &parsed.record_key)
-        .await
-        .with_context(|| format!("fetching policy record {uri}"))?
-        .ok_or_else(|| anyhow!("pipeline policy record not found: {uri}"))?;
+    // Coalesced when the caller provides a pass-scoped cache (bulk passes):
+    // concurrent loads of the same layer URI share one PDS read — a shared
+    // remote layer referenced by many arbiters is otherwise fetched once per
+    // arbiter per pass, a guaranteed 429 stampede on the layer's PDS. moka
+    // hands errors to waiters as `Arc`, erasing the anyhow chain, so the 429
+    // bit rides along in [`LayerFetchError`]. Without a cache (every
+    // event-/handler-driven caller) the fetch always hits the PDS fresh.
+    let record = match layer_fetches {
+        Some(cache) => cache
+            .try_get_with(uri.to_string(), async {
+                fetch_record(client, &record_repo, &parsed.collection, &parsed.record_key)
+                    .await
+                    .map_err(|e| {
+                        LayerFetchError::from_err(&format!("fetching policy record {uri}"), &e)
+                    })?
+                    .ok_or_else(|| {
+                        LayerFetchError::from_msg(format!(
+                            "pipeline policy record not found: {uri}"
+                        ))
+                    })
+            })
+            .await
+            .map_err(|e| anyhow::Error::new(Arc::unwrap_or_clone(e)))?,
+        None => fetch_record(client, &record_repo, &parsed.collection, &parsed.record_key)
+            .await
+            .with_context(|| format!("fetching policy record {uri}"))?
+            .ok_or_else(|| anyhow!("pipeline policy record not found: {uri}"))?,
+    };
 
     // Cache hit: the record is unchanged since it was last compiled.
     if let Some(cid) = &record.cid {
@@ -814,7 +941,8 @@ async fn fetch_record(
 }
 
 /// A record value loaded from the PDS.
-struct RecordSource {
+#[derive(Clone)]
+pub(crate) struct RecordSource {
     /// The raw record value as an atrium [`Unknown`].
     source: atrium_api::types::Unknown,
     /// The record CID at fetch time, when the PDS reports one. Provenance for
@@ -910,7 +1038,7 @@ pub(crate) async fn validate_pipeline_records(
 ) -> Result<()> {
     let mut remote_clients: HashMap<String, PdsReadClient> = HashMap::new();
     for uri in pipeline {
-        resolve_layer(state, local_api, steward_did, uri, &mut remote_clients).await?;
+        resolve_layer(state, local_api, steward_did, uri, &mut remote_clients, None).await?;
     }
     Ok(())
 }
