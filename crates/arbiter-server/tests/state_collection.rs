@@ -17,15 +17,17 @@ use arbiter_server::state::ArbiterCollection;
 /// Build a simple `Arbiter` with a single pipeline layer that immediately
 /// returns success.
 fn test_arbiter() -> Arbiter {
-    Arbiter::new(Pipeline::from_layers(vec![Layer::compile(
-        r#"
+    Arbiter::new(Pipeline::from_layers(vec![
+        Layer::compile(
+            r#"
         package arbiter
         result := { "ok": true, "output": { "got": input.nsid } }
         "#,
-        "builtin:test",
-        None,
-    )
-    .expect("policy compiles")]))
+            "builtin:test",
+            None,
+        )
+        .expect("policy compiles"),
+    ]))
 }
 
 /// An arbiter whose single pipeline layer echoes a fixed `tag`, so tests can
@@ -37,12 +39,9 @@ fn tagged_arbiter(tag: &str) -> Arbiter {
         result := {{ "ok": true, "output": {{ "tag": "{tag}" }} }}
         "#
     );
-    Arbiter::new(Pipeline::from_layers(vec![Layer::compile(
-        &src,
-        "builtin:tagged",
-        None,
-    )
-    .expect("policy compiles")]))
+    Arbiter::new(Pipeline::from_layers(vec![
+        Layer::compile(&src, "builtin:tagged", None).expect("policy compiles"),
+    ]))
 }
 
 /// Run the arbiter's pipeline for `did` and return the `tag` in the output,
@@ -53,9 +52,11 @@ async fn active_tag(col: &ArbiterCollection, did: &str) -> String {
         .await
         .expect("begin_request");
     match drive.machine.start() {
-        ArbiterReqMachineStep::Completed(Ok(XrpcOutput::Data(json))) => {
-            json.get("tag").and_then(serde_json::Value::as_str).unwrap().to_string()
-        }
+        ArbiterReqMachineStep::Completed(Ok(XrpcOutput::Data(json))) => json
+            .get("tag")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string(),
         other => panic!("expected immediate Data completion, got {other:?}"),
     }
 }
@@ -238,7 +239,11 @@ async fn stale_onboard_does_not_regress() {
     // The newer policy and floor must remain active, and the stale load must
     // report itself as not applied, so callers never propagate its pipeline
     // state (e.g. never index it).
-    assert_eq!(active_tag(&col, DID_A).await, "new", "stale load regressed policy");
+    assert_eq!(
+        active_tag(&col, DID_A).await,
+        "new",
+        "stale load regressed policy"
+    );
     assert!(!stale_applied, "stale load must report not-applied");
     assert!(
         !col.is_newer(DID_A, "bbb").await,

@@ -15,6 +15,7 @@ pub mod jetstream;
 pub mod permission_set;
 pub mod policy;
 pub mod proxy;
+pub mod record_store;
 pub mod resolver;
 pub mod state;
 pub mod storage;

@@ -90,6 +90,22 @@ implementation sprint. Nothing here blocks the change set from being committed.
   The firehose-fed model means the arbiter + Jetstream already acts as the
   local authorization engine — no separate SpiceDB-style server needed.
 
+- **Persist the record store to `cache.db` (deferred 2026-09-12).** The
+  in-memory record store (moka, jetstream-fed, rev-gated — see
+  `crates/arbiter-server/src/record_store.rs`) plus the jetstream-cursor
+  resume makes reconnects cheap, but a process restart still re-fetches every
+  record on first reference (~4k accounts × service/config/layers). The
+  planned shape: keep moka as the serving layer (per-key coalescing needs it);
+  add a separate `cache.db` (turso, same driver as the credstore) as
+  write-through durability — store mutations enqueue into a dirty set flushed
+  every couple of seconds (`record_cache(uri PRIMARY KEY, rev, source_json,
+  cid)`); boot loads it into moka, then subscribes with the persisted cursor.
+  Freshness gate unchanged: replayed events apply rev-gated; the first-replayed
+  event is checked against the persisted cursor and an unverified gap wipes
+  the table and cold-fetches (same failure mode as today). Recovery records
+  stay excluded. Only worth it if restarts are frequent enough for the boot
+  storm (~12k fetches → ~4k rev fetches) to matter.
+
 ## Known acceptable behavior (documented, not bugs)
 
 - `installPolicy` append is idempotent but scope union/ordering means

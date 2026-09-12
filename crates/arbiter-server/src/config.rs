@@ -38,6 +38,35 @@ pub struct ServerConfig {
     )]
     pub default_pds: String,
 
+    /// Maximum disconnect for which a reconnect resumes via the Jetstream
+    /// `cursor` parameter instead of falling back to a full record-store
+    /// invalidation + refresh.
+    ///
+    /// MUST NOT exceed the configured Jetstream's event retention: the
+    /// protocol gives no signal when a cursor predates retention (the server
+    /// silently starts from its earliest retained event), so a gap longer
+    /// than retention loses events silently. The first replayed event's
+    /// timestamp is still checked as a coarse backstop (it catches a server
+    /// that replays nothing at all), but partial retention loss is invisible
+    /// to the client. Set to `0` to disable cursor resume entirely (always
+    /// full refresh on reconnect).
+    ///
+    /// Measured baseline: the Bluesky-hosted instances retain ~24h of events
+    /// (author's writeup, Sept 2024 — "a buffer of the past 24 hours
+    /// (configurable)"), so the 18-hour default is conservative there: any
+    /// outage up to 18h replays gaplessly from the cursor, and longer outages
+    /// drop the cursor into the full-refresh path. Note the tradeoff at long
+    /// gaps: the replay churns through hours of firehose server-side before
+    /// live-tail resumes — slower than an immediate full refresh, but with
+    /// zero PDS fetches. Self-hosted instances may run lower retention —
+    /// set this flag to match.
+    #[arg(
+        long = "jetstream-cursor-max-gap",
+        env = "JETSTREAM_CURSOR_MAX_GAP",
+        default_value = "64800"
+    )]
+    pub jetstream_cursor_max_gap_secs: u64,
+
     /// Invite code used to create new stewarded PDS accounts.
     #[arg(long = "invite-code", env = "INVITE_CODE")]
     pub invite_code: Option<String>,

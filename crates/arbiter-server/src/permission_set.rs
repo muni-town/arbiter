@@ -147,9 +147,10 @@ impl ScopeResolver {
             .with_context(|| format!("resolving permission-set lexicon for `{nsid}`"))?;
         let source = embedded_policy(&doc)
             .with_context(|| format!("extracting embedded arbiter policy from `{nsid}`"))?;
-        let policy = Arc::new(ScopePolicy::new(&source).with_context(|| {
-            format!("compiling embedded scope policy for `{nsid}`")
-        })?);
+        let policy = Arc::new(
+            ScopePolicy::new(&source)
+                .with_context(|| format!("compiling embedded scope policy for `{nsid}`"))?,
+        );
         self.cache.insert(nsid.to_string(), policy.clone()).await;
         Ok(policy)
     }
@@ -213,8 +214,8 @@ impl LexiconSource for AtprotoLexiconSource {
             .get_record(params)
             .await
             .with_context(|| format!("fetching lexicon record {LEXICON_COLLECTION}/{nsid}"))?;
-        let doc = serde_json::to_value(&output.data.value)
-            .context("decoding lexicon record value")?;
+        let doc =
+            serde_json::to_value(&output.data.value).context("decoding lexicon record value")?;
         check_lexicon_identity(&doc, nsid)?;
         Ok(doc)
     }
@@ -255,10 +256,7 @@ pub fn nsid_authority(nsid: &str) -> Result<String> {
 /// or several *distinct* DIDs, is a resolution failure (per the spec a
 /// conformant resolver must not guess).
 fn publisher_from_txt(txts: &[String]) -> Result<String> {
-    let mut dids: Vec<&str> = txts
-        .iter()
-        .filter_map(|t| t.strip_prefix("did="))
-        .collect();
+    let mut dids: Vec<&str> = txts.iter().filter_map(|t| t.strip_prefix("did=")).collect();
     // `dedup` only collapses consecutive duplicates and TXT record ordering
     // is arbitrary: sort first so repeated identical values collapse wherever
     // they appear, while distinct DIDs still fail closed.
@@ -286,9 +284,7 @@ fn embedded_policy(doc: &Value) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "lexicon document has no `defs.main.{ARBITER_DEF_KEY}.policy` string"
-            )
+            anyhow::anyhow!("lexicon document has no `defs.main.{ARBITER_DEF_KEY}.policy` string")
         })
 }
 
@@ -341,10 +337,7 @@ mod tests {
     fn publisher_from_txt_fails_closed() {
         assert!(publisher_from_txt(&[]).is_err());
         assert!(publisher_from_txt(&["v=1".to_string()]).is_err());
-        let conflicting = vec![
-            "did=did:plc:abc".to_string(),
-            "did=did:plc:def".to_string(),
-        ];
+        let conflicting = vec!["did=did:plc:abc".to_string(), "did=did:plc:def".to_string()];
         assert!(publisher_from_txt(&conflicting).is_err());
         // Distinct DIDs still conflict even when separated by other records.
         let non_adjacent_conflict = vec![
@@ -379,7 +372,8 @@ mod tests {
     #[test]
     fn embedded_policy_missing_or_malformed_is_unusable() {
         // No extension key at all.
-        let bare = serde_json::json!({ "lexicon": 1, "defs": { "main": { "type": "permission-set" } } });
+        let bare =
+            serde_json::json!({ "lexicon": 1, "defs": { "main": { "type": "permission-set" } } });
         assert!(embedded_policy(&bare).is_err());
         // Extension present but `policy` not a string.
         let wrong_type = serde_json::json!({
@@ -415,8 +409,8 @@ mod tests {
             "id": "community.lexicon.other",
             "defs": { "main": {} }
         });
-        let err = check_lexicon_identity(&mismatched, "community.lexicon.authCalendar")
-            .unwrap_err();
+        let err =
+            check_lexicon_identity(&mismatched, "community.lexicon.authCalendar").unwrap_err();
         assert!(err.to_string().contains("does not match requested NSID"));
         // A document without an `id` fails too.
         assert!(check_lexicon_identity(&serde_json::json!({ "lexicon": 1 }), "x.y.z").is_err());

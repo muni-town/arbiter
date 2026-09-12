@@ -45,28 +45,30 @@
 //! credential store only holds the steward password for *writing* records,
 //! not for these reads.)
 
+use crate::record_store::RecordSource;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
+use crate::record_store;
 use crate::resolver::IdentityResolverExt;
 use crate::{AppState, CONFIG};
 use anyhow::{Context, Result, anyhow};
 use arbiter_core::arbiter::{Arbiter, Layer, Pipeline};
+use atproto_record::aturi::ATURI;
 use atrium_api::client::AtpServiceClient;
 use atrium_api::com::atproto::repo::get_record;
 use atrium_api::types::string::{AtIdentifier, Nsid, RecordKey, Tid};
 use atrium_xrpc::error::XrpcErrorKind;
 use atrium_xrpc_client::reqwest::ReqwestClient;
-use atproto_record::aturi::ATURI;
 use axum::http::StatusCode;
 use futures_util::stream::{self, StreamExt};
 use moka::future::Cache;
 use rand::Rng;
 
 /// Service record collection + rkey (`town.muni.arbiter.service/self`).
-const SERVICE_COLLECTION: &str = "town.muni.arbiter.service";
-const SERVICE_RKEY: &str = "self";
+pub(crate) const SERVICE_COLLECTION: &str = "town.muni.arbiter.service";
+pub(crate) const SERVICE_RKEY: &str = "self";
 /// Arbiter config record collection + rkey
 /// (`town.muni.arbiter.config/self`): trusted scopes + ordered pipeline.
 pub const CONFIG_COLLECTION: &str = "town.muni.arbiter.config";
@@ -77,6 +79,17 @@ pub const CONFIG_RKEY: &str = "self";
 /// stewarded repo or a remote (app-owned) repo, but an entry naming any other
 /// collection is rejected (see `validate_config_inputs`).
 pub const POLICY_COLLECTION: &str = "town.muni.arbiter.policy";
+
+/// Canonical `at://` URI of `did`'s config record (`.../config/self`).
+pub(crate) fn config_record_uri(did: &str) -> String {
+    format!("at://{did}/{CONFIG_COLLECTION}/{CONFIG_RKEY}")
+}
+
+/// Canonical `at://` URI of `did`'s service record (`.../service/self`).
+pub(crate) fn service_record_uri(did: &str) -> String {
+    format!("at://{did}/{SERVICE_COLLECTION}/{SERVICE_RKEY}")
+}
+
 /// Recovery-admin designation record collection + rkey
 /// (`town.muni.arbiter.recovery/self`): its `did` field designates the
 /// account's recovery admin — THE authority for `installPolicy` (see
@@ -99,9 +112,9 @@ const STARTUP_MAX_RETRIES: u32 = 2;
 /// pipeline layer), so an unbounded pass at thousands-of-arbiters scale
 /// would mean thousands of simultaneous DNS lookups and TLS handshakes plus
 /// file-descriptor pressure. The bound keeps concurrent fetches — and open
-/// sockets — flat; the pass is background work, so 64-wide throughput is
+/// sockets — flat; the pass is background work, so 32-wide throughput is
 /// ample.
-pub(crate) const ONBOARD_CONCURRENCY: usize = 64;
+pub(crate) const ONBOARD_CONCURRENCY: usize = 32;
 
 /// Marker attached to load errors that came back as HTTP 429 from a PDS
 /// (or its edge). atrium's XRPC error type discards response headers, so
@@ -110,7 +123,7 @@ pub(crate) const ONBOARD_CONCURRENCY: usize = 64;
 /// ([`RATE_LIMIT_RETRY_BASE`] / [`RATE_LIMIT_RETRY_MAX`]) as a stand-in.
 #[derive(Debug, thiserror::Error)]
 #[error("rate limited (HTTP 429)")]
-struct RateLimited;
+pub(crate) struct RateLimited;
 
 /// Base wait before retrying a rate-limited (429) load — far above the
 /// generic 1s backoff, so a retry does not instantly re-trip the same
@@ -152,11 +165,12 @@ where
 }
 
 /// Whether a load error was an HTTP 429 — either tagged directly
-/// ([`RateLimited`]) or carried inside a coalesced layer-fetch error, whose
+/// ([`RateLimited`]) or carried inside a coalesced store-fetch error, whose
 /// moka `Arc` sharing erases the inner anyhow chain.
 fn is_rate_limited(e: &anyhow::Error) -> bool {
     e.downcast_ref::<RateLimited>().is_some()
-        || e.downcast_ref::<LayerFetchError>().is_some_and(|f| f.rate_limited)
+        || e.downcast_ref::<record_store::FetchError>()
+            .is_some_and(|f| f.rate_limited)
 }
 
 /// Compiled pipeline layers, keyed by `(at:// uri, record cid)`. A `(uri,
@@ -168,43 +182,6 @@ static LAYER_CACHE: LazyLock<Cache<(String, String), Layer>> = LazyLock::new(|| 
         .time_to_idle(Duration::from_secs(6 * 60 * 60))
         .build()
 });
-
-
-/// Error shared between concurrent waiters of a coalesced layer fetch.
-/// moka hands errors to waiters as `Arc<E>`, which erases the inner anyhow
-/// chain — so the one bit the retry loop needs (whether the failure was a
-/// 429) is carried explicitly, and the message captures the full chain.
-#[derive(Clone, Debug)]
-struct LayerFetchError {
-    rate_limited: bool,
-    message: String,
-}
-
-impl LayerFetchError {
-    fn from_err(context: &str, e: &anyhow::Error) -> Self {
-        Self {
-            rate_limited: e.downcast_ref::<RateLimited>().is_some(),
-            message: format!("{context}: {e:#}"),
-        }
-    }
-
-    fn from_msg(message: String) -> Self {
-        Self {
-            rate_limited: false,
-            message,
-        }
-    }
-}
-
-impl std::fmt::Display for LayerFetchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for LayerFetchError {}
-
-
 /// Reverse index: `at://<did>/<collection>/<rkey>` policy-record URI → the
 /// stewarded arbiters whose loaded pipeline references it.
 ///
@@ -239,7 +216,10 @@ fn index_pipeline(did: &str, uris: &[String]) {
     }
     index.retain(|_, arbiters| !arbiters.is_empty());
     for uri in uris {
-        index.entry(uri.clone()).or_default().insert(did.to_string());
+        index
+            .entry(uri.clone())
+            .or_default()
+            .insert(did.to_string());
     }
 }
 
@@ -283,15 +263,33 @@ pub async fn startup_onboard(state: Arc<AppState>) -> Result<()> {
     Ok(())
 }
 
-/// Re-load + onboard every stewarded arbiter after a Jetstream reconnect.
+/// Re-onboard stewarded arbiters after a Jetstream reconnect, tiered by how
+/// much the record store can be trusted:
 ///
-/// A disconnect means the subscription missed any policy/service-record writes
-/// that happened while it was down, and `load_and_onboard` re-fetches the
-/// *current* PDS state, so this closes the fail-open window where the server
-/// would otherwise keep enforcing the last-loaded (possibly revoked/permissive)
-/// policy. Runs bounded-concurrent (see [`onboard_all`]); each failed load is
-/// left fail-closed (offboarded) and retried a bounded number of times.
-pub async fn refresh_all_after_reconnect(state: Arc<AppState>) {
+/// - `full = true` — an unverified gap: Jetstream could not honor the cursor,
+///   so the store was invalidated and nothing cached may be served. The pass
+///   re-observes *current* PDS state for every steward, closing the
+///   fail-open window where the server would otherwise keep enforcing the
+///   last-loaded (possibly revoked/permissive) policy.
+/// - `full = false` — a verified cursor replay (or a fresh boot, whose
+///   baseline is the just-finished startup onboard): the store is provably
+///   current, and replayed events already reloaded every arbiter whose
+///   records changed. Loading the non-serving arbiters only — never-onboarded,
+///   load-failure-offboarded (fail-closed), or deliberately offboarded
+///   accounts — heals them without the full 4k-arbiter pass; serving
+///   arbiters would re-onboard to identical pipelines.
+///
+/// Runs bounded-concurrent (see [`onboard_all`]); each failed load is left
+/// fail-closed (offboarded) and retried a bounded number of times. The rev
+/// floor captured per load remains the gate baseline for future events.
+pub async fn refresh_all_after_reconnect(state: Arc<AppState>, full: bool) {
+    if full {
+        // Jetstream does not replay missed events, so entries in the record
+        // store may be stale after an unverified disconnect. The whole point
+        // of this pass is re-observing current PDS state (fail-closed), so
+        // nothing cached before the disconnect may be served.
+        record_store::invalidate_all();
+    }
     let dids = match stored_dids(&state).await {
         Ok(dids) => dids,
         Err(e) => {
@@ -305,6 +303,25 @@ pub async fn refresh_all_after_reconnect(state: Arc<AppState>) {
     if dids.is_empty() {
         return;
     }
+    let dids = if full {
+        dids
+    } else {
+        // Heal-only: a verified replay already reloaded every arbiter whose
+        // records changed, and serving arbiters would re-onboard to
+        // identical pipelines. Load only the ones that are not serving.
+        let mut heal = Vec::new();
+        for did in &dids {
+            if !state.arbiters.is_online(did).await {
+                heal.push(did.clone());
+            }
+        }
+        tracing::info!(
+            total = dids.len(),
+            healing = heal.len(),
+            "verified reconnect refresh; healing non-serving arbiters"
+        );
+        heal
+    };
     let summary = onboard_all(&state, dids, STARTUP_MAX_RETRIES, "post-reconnect refresh").await;
     tracing::info!(
         onboarded = summary.onboarded,
@@ -339,10 +356,9 @@ struct OnboardSummary {
 /// HTTPS connections to per-DID endpoints (see [`ONBOARD_CONCURRENCY`]): at
 /// thousands-of-arbiters scale an unbounded pass would stampede DNS/PLC and
 /// the PDS fleet. Arbiters are independent — one hung PDS only occupies its
-/// own slot instead of stalling the pass head-of-line. Layer-record fetches
-/// are coalesced per pass via a pass-local cache: a shared remote layer
-/// referenced by many arbiters is fetched once per pass instead of once per
-/// arbiter, while every load outside bulk passes always fetches fresh.
+/// own slot instead of stalling the pass head-of-line. Record fetches are
+/// coalesced globally by the record store, so a shared remote layer is
+/// fetched once per pass no matter how many arbiters reference it.
 async fn onboard_all(
     state: &AppState,
     dids: Vec<String>,
@@ -350,16 +366,8 @@ async fn onboard_all(
     pass: &str,
 ) -> OnboardSummary {
     let mut summary = OnboardSummary::default();
-    // Pass-scoped fetch coalescer: within this pass, concurrent loads of the
-    // same layer URI share one PDS read (a shared remote layer referenced by
-    // many arbiters is otherwise fetched once per arbiter per pass — a
-    // guaranteed 429 stampede on the layer's PDS). The cache dies with the
-    // pass, so loads outside it always observe the PDS's current state.
-    let layer_fetches = &Cache::new(4096);
     let mut loads = stream::iter(dids)
-        .map(|did| async move {
-            onboard_with_retries(state, did, max_retries, pass, layer_fetches).await
-        })
+        .map(|did| async move { onboard_with_retries(state, did, max_retries, pass).await })
         .buffer_unordered(ONBOARD_CONCURRENCY);
     while let Some(outcome) = loads.next().await {
         match outcome {
@@ -382,13 +390,12 @@ async fn onboard_with_retries(
     did: String,
     max_retries: u32,
     pass: &str,
-    layer_fetches: &Cache<String, RecordSource>,
 ) -> Result<OnboardOutcome> {
     let mut attempt: u32 = 0;
     let mut delay = Duration::from_secs(1);
     let mut deferrals: u32 = 0;
     loop {
-        match load_and_onboard_with(state, &did, Some(layer_fetches)).await {
+        match load_and_onboard(state, &did).await {
             Ok(outcome) => {
                 match &outcome {
                     OnboardOutcome::Onboarded { pds_endpoint } => {
@@ -464,8 +471,9 @@ async fn onboard_with_retries(
     }
 }
 
-/// Fetch the config record + pipeline for `did` from the PDS, compile the
-/// pipeline layers, and onboard (or update) the arbiter.
+/// Load `did`'s config record + pipeline and onboard (or update) the arbiter.
+/// Records are served by the global record store — fetch-on-miss, coalesced,
+/// kept current by Jetstream events (see `record_store`).
 ///
 /// Also applies the lifecycle: if `town.muni.arbiter.service/self` is absent
 /// -> `state.arbiters.offboard(did)`; if its `did` field != `CONFIG.server_did`
@@ -476,20 +484,6 @@ async fn onboard_with_retries(
 /// Returns [`OnboardOutcome`] so callers can tell an onboard from an offboard
 /// (both are `Ok` — the lifecycle applied successfully).
 pub async fn load_and_onboard(state: &AppState, did: &str) -> Result<OnboardOutcome> {
-    load_and_onboard_with(state, did, None).await
-}
-
-/// [`load_and_onboard`] with optional fetch coalescing for bulk passes: when
-/// `layer_fetches` is `Some`, concurrent loads of the same layer URI within
-/// that pass share one PDS read (see [`onboard_all`]). The cache is
-/// pass-scoped — with `None` (every event- and handler-driven caller) the
-/// load always fetches the PDS's *current* state, the property the
-/// reconnect-refresh fail-closed argument relies on.
-pub(crate) async fn load_and_onboard_with(
-    state: &AppState,
-    did: &str,
-    layer_fetches: Option<&Cache<String, RecordSource>>,
-) -> Result<OnboardOutcome> {
     let pds_endpoint = state
         .resolver
         .resolve_pds_endpoint(did)
@@ -502,8 +496,55 @@ pub(crate) async fn load_and_onboard_with(
 
     let repo = parse_at_identifier(did)?;
 
+    // Compute the load-time rev floor BEFORE reading the records so the floor
+    // provably dominates the records we load: the records are read at or after
+    // the moment the floor was captured, so they reflect state at least as new
+    // as the floor. (Fetching the floor after the reads would let a concurrent
+    // load read stale records and then capture a raised floor, permanently
+    // dropping the events it is missing.)
+    //
+    // A failed floor fetch is retried with short jittered backoff; if it
+    // still fails the load FAILS (fail-closed, healable by the retry loop's
+    // deferrals) rather than proceeding floor-less — a floor-less onboard is
+    // rejected by the gate whenever an entry already exists, which would
+    // silently discard a reload that already read correct store values.
+    // `Ok(None)` (repo inactive / no rev reported) is a legitimate floor-less
+    // load: the gate accepts everything, which only risks redundant reloads
+    // — never a missed update.
+    let rev_floor = {
+        let mut attempt: u32 = 0;
+        let mut delay = Duration::from_secs(1);
+        loop {
+            match fetch_repo_rev(&api, &repo).await {
+                Ok(Some(rev)) => break Some(rev.as_str().to_string()),
+                Ok(None) => {
+                    tracing::warn!(
+                        did,
+                        "repo inactive or no rev reported; leaving rev floor unset"
+                    );
+                    break None;
+                }
+                Err(e) if attempt >= 2 => return Err(e),
+                Err(e) => {
+                    attempt += 1;
+                    let wait = jitter(delay);
+                    tracing::warn!(
+                        did,
+                        attempt,
+                        error = %format!("{e:#}"),
+                        "repo rev unavailable; retrying in {wait:?}"
+                    );
+                    tokio::time::sleep(wait).await;
+                    delay = (delay * 2).min(Duration::from_secs(8));
+                }
+            }
+        }
+    };
     // --- lifecycle: service record ----------------------------------------
-    let service = fetch_record(&api, &repo, SERVICE_COLLECTION, SERVICE_RKEY)
+    let service =
+        record_store::get_or_fetch(&service_record_uri(did), rev_floor.as_deref(), || {
+            fetch_record(&api, &repo, SERVICE_COLLECTION, SERVICE_RKEY)
+        })
         .await
         .with_context(|| format!("fetching {SERVICE_COLLECTION}/{SERVICE_RKEY}"))?;
     match service {
@@ -517,9 +558,11 @@ pub(crate) async fn load_and_onboard_with(
             let creds = state.store.get(did).await.context("reading credentials")?;
             match creds {
                 Some(creds) if !creds.provisioned => {
-                    tracing::info!(did, "un-provisioned account missing service record; repairing bootstrap");
-                    crate::handlers::repair_provisioning(state, did, &creds, &pds_endpoint)
-                        .await?;
+                    tracing::info!(
+                        did,
+                        "un-provisioned account missing service record; repairing bootstrap"
+                    );
+                    crate::handlers::repair_provisioning(state, did, &creds, &pds_endpoint).await?;
                     // Fall through: the records are (re)written; re-run the
                     // service-record fetch so we don't treat it as absent below.
                 }
@@ -561,34 +604,13 @@ pub(crate) async fn load_and_onboard_with(
         }
     }
 
-    // Compute the load-time rev floor BEFORE reading the records so the floor
-    // provably dominates the records we load: the records are read at or after
-    // the moment the floor was captured, so they reflect state at least as new
-    // as the floor. (Fetching the floor after the reads would let a concurrent
-    // load read stale records and then capture a raised floor, permanently
-    // dropping the events it is missing.) If the floor can't be determined we
-    // use no floor (accept everything), which only risks redundant reloads —
-    // never a missed update.
-    let rev_floor = match fetch_repo_rev(&api, &repo).await {
-        Ok(Some(rev)) => Some(rev.as_str().to_string()),
-        Ok(None) => {
-            tracing::warn!(did, "repo inactive or no rev reported; leaving rev floor unset");
-            None
-        }
-        Err(e) => {
-            tracing::warn!(
-                did,
-                error = %format!("{e:#}"),
-                "repo rev unavailable; leaving rev floor unset"
-            );
-            None
-        }
-    };
-
     // --- config record ------------------------------------------------------
     // Fail-closed: a missing or malformed config record is a load error, which
     // every caller treats as offboarded.
-    let config_rec = fetch_record(&api, &repo, CONFIG_COLLECTION, CONFIG_RKEY)
+    let config_rec =
+        record_store::get_or_fetch(&config_record_uri(did), rev_floor.as_deref(), || {
+            fetch_record(&api, &repo, CONFIG_COLLECTION, CONFIG_RKEY)
+        })
         .await
         .with_context(|| format!("fetching {CONFIG_COLLECTION}/{CONFIG_RKEY}"))?
         .ok_or_else(|| {
@@ -604,9 +626,16 @@ pub(crate) async fn load_and_onboard_with(
     let mut layers = Vec::with_capacity(config.policy_layers.len());
     for uri in &config.policy_layers {
         layers.push(
-            resolve_layer(state, &api, did, uri, &mut remote_clients, layer_fetches)
-                .await
-                .with_context(|| format!("resolving pipeline layer {uri}"))?,
+            resolve_layer(
+                state,
+                &api,
+                did,
+                uri,
+                &mut remote_clients,
+                rev_floor.as_deref(),
+            )
+            .await
+            .with_context(|| format!("resolving pipeline layer {uri}"))?,
         );
     }
     let arbiter = Arbiter::new(Pipeline::from_layers(layers));
@@ -737,9 +766,9 @@ pub(crate) async fn current_config(
 /// remote ones. Compiled layers are cached by `(uri, cid)`, so an unchanged
 /// record is reused without recompiling.
 ///
-/// When `layer_fetches` is `Some` (bulk passes), the record fetch is
-/// coalesced through the pass-scoped cache; otherwise it always hits the PDS
-/// fresh.
+/// Record reads go through the global record store — fetch-on-miss, coalesced,
+/// kept current by Jetstream (see `record_store`); entries are stamped with
+/// the load's rev floor when the caller has one.
 ///
 /// The entry must name a `town.muni.arbiter.policy` record (see
 /// `require_policy_collection`): the Jetstream reload path would never deliver
@@ -750,7 +779,7 @@ async fn resolve_layer(
     steward_did: &str,
     uri: &str,
     remote_clients: &mut HashMap<String, PdsReadClient>,
-    layer_fetches: Option<&Cache<String, RecordSource>>,
+    rev_floor: Option<&str>,
 ) -> Result<Layer> {
     let parsed = parse_at_uri(uri)?;
     require_policy_collection(uri, &parsed)?;
@@ -764,41 +793,39 @@ async fn resolve_layer(
                 .resolve_pds_endpoint(&parsed.authority)
                 .await
                 .with_context(|| {
-                    format!("resolving PDS for pipeline record repo `{}`", parsed.authority)
+                    format!(
+                        "resolving PDS for pipeline record repo `{}`",
+                        parsed.authority
+                    )
                 })?;
             remote_clients.insert(parsed.authority.clone(), pds_read_client(&pds)?);
         }
         &remote_clients[&parsed.authority]
     };
 
-    // Coalesced when the caller provides a pass-scoped cache (bulk passes):
-    // concurrent loads of the same layer URI share one PDS read — a shared
-    // remote layer referenced by many arbiters is otherwise fetched once per
-    // arbiter per pass, a guaranteed 429 stampede on the layer's PDS. moka
-    // hands errors to waiters as `Arc`, erasing the anyhow chain, so the 429
-    // bit rides along in [`LayerFetchError`]. Without a cache (every
-    // event-/handler-driven caller) the fetch always hits the PDS fresh.
-    let record = match layer_fetches {
-        Some(cache) => cache
-            .try_get_with(uri.to_string(), async {
-                fetch_record(client, &record_repo, &parsed.collection, &parsed.record_key)
-                    .await
-                    .map_err(|e| {
-                        LayerFetchError::from_err(&format!("fetching policy record {uri}"), &e)
-                    })?
-                    .ok_or_else(|| {
-                        LayerFetchError::from_msg(format!(
-                            "pipeline policy record not found: {uri}"
-                        ))
-                    })
-            })
-            .await
-            .map_err(|e| anyhow::Error::new(Arc::unwrap_or_clone(e)))?,
-        None => fetch_record(client, &record_repo, &parsed.collection, &parsed.record_key)
-            .await
-            .with_context(|| format!("fetching policy record {uri}"))?
-            .ok_or_else(|| anyhow!("pipeline policy record not found: {uri}"))?,
+    // Stamp the store entry with the load's rev floor ONLY for records in
+    // the steward's own repo: the floor is the STEWARD repo's head, and rev
+    // streams are per-repo — comparing a remote record's events against it
+    // would gate valid updates on an incomparable rev (the same reason
+    // `reload` skips the gate for remote-record events). Remote entries are
+    // stamped `None`, so their events always apply — the tradeoff there is
+    // only a redundant reload, never a missed update.
+    let rev_floor = if parsed.authority == steward_did {
+        rev_floor
+    } else {
+        None
     };
+
+    // Serve from the global record store (fetch-on-miss, coalesced, kept
+    // current by Jetstream — see `record_store`); the entry is stamped with
+    // this load's rev floor so events at or below it are recognized as
+    // already-reflected.
+    let record = record_store::get_or_fetch(uri, rev_floor, || {
+        fetch_record(client, &record_repo, &parsed.collection, &parsed.record_key)
+    })
+    .await
+    .with_context(|| format!("fetching policy record {uri}"))?
+    .ok_or_else(|| anyhow!("pipeline policy record not found: {uri}"))?;
 
     // Cache hit: the record is unchanged since it was last compiled.
     if let Some(cid) = &record.cid {
@@ -807,11 +834,14 @@ async fn resolve_layer(
         }
     }
 
-    let source = rego_source(&record).with_context(|| format!("extracting policy source from {uri}"))?;
+    let source =
+        rego_source(&record).with_context(|| format!("extracting policy source from {uri}"))?;
     let layer = Layer::compile(&source, uri, record.cid.clone())
         .with_context(|| format!("compiling pipeline layer {uri}"))?;
     if let Some(cid) = record.cid {
-        LAYER_CACHE.insert((uri.to_string(), cid), layer.clone()).await;
+        LAYER_CACHE
+            .insert((uri.to_string(), cid), layer.clone())
+            .await;
     }
     Ok(layer)
 }
@@ -854,10 +884,7 @@ pub(crate) fn pds_read_client(pds_endpoint: &str) -> Result<PdsReadClient> {
 /// Jetstream gating.
 ///
 /// Returns `Ok(None)` when the repo is inactive or the PDS reports no rev.
-async fn fetch_repo_rev(
-    api: &PdsReadClient,
-    repo: &AtIdentifier,
-) -> Result<Option<Tid>> {
+async fn fetch_repo_rev(api: &PdsReadClient, repo: &AtIdentifier) -> Result<Option<Tid>> {
     let did = match repo {
         AtIdentifier::Did(did) => did.clone(),
         // Handle-based repo identifiers have no stable DID here; callers always
@@ -890,8 +917,8 @@ pub async fn repo_head_cid(state: &AppState, did: &str) -> Result<Option<String>
         AtIdentifier::Did(d) => d,
         AtIdentifier::Handle(_) => return Ok(None),
     };
-    let params = atrium_api::com::atproto::sync::get_latest_commit::ParametersData { did: repo_did }
-        .into();
+    let params =
+        atrium_api::com::atproto::sync::get_latest_commit::ParametersData { did: repo_did }.into();
     match api.service.com.atproto.sync.get_latest_commit(params).await {
         Ok(output) => Ok(Some(output.data.cid.as_ref().to_string())),
         Err(e) => Err(xrpc_load_error("getLatestCommit", e)),
@@ -936,28 +963,10 @@ async fn fetch_record(
                 Err(anyhow!("getRecord {collection}/{rkey}: {xrpc_err}"))
             }
         }
-        Err(e) => Err(xrpc_load_error(&format!("getRecord {collection}/{rkey}"), e)),
-    }
-}
-
-/// A record value loaded from the PDS.
-#[derive(Clone)]
-pub(crate) struct RecordSource {
-    /// The raw record value as an atrium [`Unknown`].
-    source: atrium_api::types::Unknown,
-    /// The record CID at fetch time, when the PDS reports one. Provenance for
-    /// pipeline layers + the cache key for compiled layers.
-    cid: Option<String>,
-}
-
-impl RecordSource {
-    /// Read a top-level string field from the record value.
-    ///
-    /// `Unknown` is an untagged serde enum; materialize it as JSON to read the
-    /// field without depending on ipld internals.
-    fn field(&self, name: &str) -> Option<String> {
-        let json = serde_json::to_value(&self.source).ok()?;
-        json.get(name).and_then(|v| v.as_str()).map(String::from)
+        Err(e) => Err(xrpc_load_error(
+            &format!("getRecord {collection}/{rkey}"),
+            e,
+        )),
     }
 }
 
@@ -976,9 +985,11 @@ pub(crate) async fn recovery_admin(state: &AppState, did: &str) -> Result<Option
         .map_err(|e| anyhow!("resolving PDS endpoint for {did}: {e:#}"))?;
     let api = pds_read_client(&pds_endpoint)?;
     let repo = parse_at_identifier(did)?;
-    Ok(fetch_record(&api, &repo, RECOVERY_COLLECTION, RECOVERY_RKEY)
-        .await?
-        .and_then(|record| record.field("did")))
+    Ok(
+        fetch_record(&api, &repo, RECOVERY_COLLECTION, RECOVERY_RKEY)
+            .await?
+            .and_then(|record| record.field("did")),
+    )
 }
 
 /// Extract the Rego source string from a policy record's `policy` field.
@@ -1038,7 +1049,15 @@ pub(crate) async fn validate_pipeline_records(
 ) -> Result<()> {
     let mut remote_clients: HashMap<String, PdsReadClient> = HashMap::new();
     for uri in pipeline {
-        resolve_layer(state, local_api, steward_did, uri, &mut remote_clients, None).await?;
+        resolve_layer(
+            state,
+            local_api,
+            steward_did,
+            uri,
+            &mut remote_clients,
+            None,
+        )
+        .await?;
     }
     Ok(())
 }

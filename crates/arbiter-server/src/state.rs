@@ -129,6 +129,18 @@ impl ArbiterCollection {
     pub async fn offboard(&self, did: &str) -> bool {
         self.inner.write().await.remove(did).is_some()
     }
+
+    /// Whether `did` is currently serving (has an onboarded entry; offboard
+    /// removes the entry).
+    ///
+    /// The reconnect refresh uses this to heal only arbiters that are *not*
+    /// serving: a serving arbiter's pipeline was built from record-store
+    /// state that a verified cursor replay has proven current, so
+    /// re-onboarding it would be a no-op.
+    pub async fn is_online(&self, did: &str) -> bool {
+        self.inner.read().await.contains_key(did)
+    }
+
     pub async fn begin_request(
         &self,
         did: &str,

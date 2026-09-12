@@ -1,6 +1,5 @@
 /// Durable storage for PDS credentials of accounts the arbiter server has
 /// created or imported.
-
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

@@ -127,7 +127,9 @@ impl FromRequestParts<Arc<AppState>> for CallerDid {
             .next()
             .ok_or_else(|| AppError::Unauthorized("malformed serviceAuth JWT".into()))?;
         let unverified_header: atproto_oauth::jwt::Header = FromBase64::from_base64(header_segment)
-            .map_err(|e| AppError::Unauthorized(format!("unable to decode serviceAuth header: {e}")))?;
+            .map_err(|e| {
+                AppError::Unauthorized(format!("unable to decode serviceAuth header: {e}"))
+            })?;
         let kid = unverified_header.key_id;
 
         // 3. Resolve the caller's signing key named by `kid` (cached by
@@ -142,7 +144,10 @@ impl FromRequestParts<Arc<AppState>> for CallerDid {
                 let key =
                     resolve_pds_signing_key(&*state.resolver, issuer_did, kid.as_deref()).await?;
                 PDS_SIGNING_KEYS
-                    .insert((issuer_did.to_string(), kid.clone().unwrap_or_default()), key.clone())
+                    .insert(
+                        (issuer_did.to_string(), kid.clone().unwrap_or_default()),
+                        key.clone(),
+                    )
                     .await;
                 key
             }
@@ -162,8 +167,7 @@ impl FromRequestParts<Arc<AppState>> for CallerDid {
             .audience
             .as_deref()
             .ok_or_else(|| AppError::Unauthorized("serviceAuth missing `aud` claim".into()))?;
-        let aud_ok = aud == CONFIG.server_did
-            || aud == format!("{}#arbiter", CONFIG.server_did);
+        let aud_ok = aud == CONFIG.server_did || aud == format!("{}#arbiter", CONFIG.server_did);
         if !aud_ok {
             return Err(AppError::Unauthorized(format!(
                 "serviceAuth `aud` `{aud}` does not match this server `{}`",
@@ -177,9 +181,10 @@ impl FromRequestParts<Arc<AppState>> for CallerDid {
         //       absurdly long even if `exp` is far out).
         //     - `jti` must be present and unique per (issuer, jti) within the
         //       token's plausible lifetime.
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
-            AppError::Unauthorized("system clock error".into())
-        })?.as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| AppError::Unauthorized("system clock error".into()))?
+            .as_secs();
         let iat = claims
             .jose
             .issued_at
@@ -190,7 +195,9 @@ impl FromRequestParts<Arc<AppState>> for CallerDid {
             )));
         }
         if iat > now + MAX_CLOCK_SKEW_SECS {
-            return Err(AppError::Unauthorized("serviceAuth token is from the future".into()));
+            return Err(AppError::Unauthorized(
+                "serviceAuth token is from the future".into(),
+            ));
         }
         let jti = claims
             .jose
@@ -199,7 +206,9 @@ impl FromRequestParts<Arc<AppState>> for CallerDid {
             .ok_or_else(|| AppError::Unauthorized("serviceAuth missing `jti` claim".into()))?;
         let jti_key = (issuer_did.to_string(), jti);
         if SEEN_JTIS.get(&jti_key).await.is_some() {
-            return Err(AppError::Unauthorized("serviceAuth token replay detected".into()));
+            return Err(AppError::Unauthorized(
+                "serviceAuth token replay detected".into(),
+            ));
         }
         SEEN_JTIS.insert(jti_key, ()).await;
 
@@ -258,9 +267,13 @@ pub async fn resolve_pds_signing_key(
         }
         None => None,
     };
-    let multibase = multibase.or_else(|| doc.did_keys().into_iter().next()).ok_or_else(|| {
-        AppError::Unauthorized(format!("issuer `{issuer_did}` exposes no signing key matching kid"))
-    })?;
+    let multibase = multibase
+        .or_else(|| doc.did_keys().into_iter().next())
+        .ok_or_else(|| {
+            AppError::Unauthorized(format!(
+                "issuer `{issuer_did}` exposes no signing key matching kid"
+            ))
+        })?;
 
     let full = if multibase.starts_with("did:key:") {
         multibase.to_string()

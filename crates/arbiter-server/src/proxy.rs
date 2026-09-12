@@ -13,6 +13,7 @@
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use crate::CONFIG;
 use arbiter_core::xrpc::{XrpcError, XrpcRequest, XrpcResult};
 use atrium_api::agent::CloneWithProxy;
 use atrium_api::agent::atp_agent::CredentialSession;
@@ -24,7 +25,6 @@ use atrium_xrpc_client::reqwest::{ReqwestClient, ReqwestClientBuilder};
 use moka::future::Cache;
 use serde_json::Value;
 use tracing::warn;
-use crate::CONFIG;
 
 /// An authenticated session against a stewarded account's PDS.
 type Session = CredentialSession<MemorySessionStore, ReqwestClient>;
@@ -220,8 +220,7 @@ pub async fn execute_remote(
     if target_did_str == CONFIG.server_did {
         warn!(
             stewarded_did,
-            endpoint,
-            "policy tried to proxy to the arbiter server itself; refusing"
+            endpoint, "policy tried to proxy to the arbiter server itself; refusing"
         );
         return Err(self_target_error(endpoint));
     }

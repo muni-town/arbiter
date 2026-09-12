@@ -47,8 +47,7 @@ const INSERT_IF_ABSENT_SQL: &str = "INSERT INTO arbiter_credentials (did, passwo
      ON CONFLICT(did) DO NOTHING";
 
 /// Mark an account as fully provisioned (bootstrap records written).
-const MARK_PROVISIONED_SQL: &str =
-    "UPDATE arbiter_credentials SET provisioned = 1 WHERE did = ?";
+const MARK_PROVISIONED_SQL: &str = "UPDATE arbiter_credentials SET provisioned = 1 WHERE did = ?";
 
 /// Durable credential store backed by a local Turso database file.
 ///

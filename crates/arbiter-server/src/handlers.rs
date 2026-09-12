@@ -39,10 +39,10 @@ use atrium_xrpc::error::{ErrorResponseBody, XrpcErrorKind};
 use atrium_xrpc_client::reqwest::{ReqwestClient, ReqwestClientBuilder};
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
 use axum::extract::DefaultBodyLimit;
-use axum::http::{Method, StatusCode};
+use axum::extract::{Path, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use rand::RngCore;
 use serde_json::{Value, json};
@@ -55,6 +55,7 @@ use crate::credstore::PdsCredentials;
 use crate::error::AppError;
 use crate::policy;
 use crate::proxy;
+use crate::record_store;
 use crate::resolver::IdentityResolverExt;
 
 /// Built-in NSID: provision a brand-new stewarded PDS account.
@@ -217,7 +218,9 @@ const MAX_REMOTE_XRPC_CALLS: usize = 12;
 /// proxy request.
 static PROXY_SEMAPHORE: LazyLock<Option<Arc<tokio::sync::Semaphore>>> = LazyLock::new(|| {
     if CONFIG.max_concurrent_proxies > 0 {
-        Some(Arc::new(tokio::sync::Semaphore::new(CONFIG.max_concurrent_proxies)))
+        Some(Arc::new(tokio::sync::Semaphore::new(
+            CONFIG.max_concurrent_proxies,
+        )))
     } else {
         None
     }
@@ -227,12 +230,11 @@ static PROXY_SEMAPHORE: LazyLock<Option<Arc<tokio::sync::Semaphore>>> = LazyLock
 /// independent of policy; requests beyond the cap wait.
 async fn acquire_proxy_permit() -> Result<Option<tokio::sync::OwnedSemaphorePermit>, AppError> {
     match PROXY_SEMAPHORE.as_ref() {
-        Some(semaphore) => Ok(Some(
-            Arc::clone(semaphore)
-                .acquire_owned()
-                .await
-                .map_err(|_| AppError::Other(anyhow::anyhow!("proxy semaphore closed")))?,
-        )),
+        Some(semaphore) => {
+            Ok(Some(Arc::clone(semaphore).acquire_owned().await.map_err(
+                |_| AppError::Other(anyhow::anyhow!("proxy semaphore closed")),
+            )?))
+        }
         None => Ok(None),
     }
 }
@@ -255,10 +257,7 @@ async fn proxy_parts(
         .method
         .parse()
         .map_err(|_| AppError::BadRequest(format!("invalid method `{}`", proxy.method)))?;
-    let input = proxy
-        .body
-        .map(decode_proxy_body)
-        .transpose()?;
+    let input = proxy.body.map(decode_proxy_body).transpose()?;
     // JSON bodies default to `application/json` (the historical behavior); the
     // prior code always sent `application/json` even with no body. A raw-bytes
     // body carries the caller-supplied `encoding` (e.g. image/png).
@@ -361,7 +360,10 @@ async fn scoped_proxy_request(
     let prefix = nsid
         .strip_suffix(SCOPED_PROXY_SUFFIX)
         .expect("router only dispatches `.arbiter.proxy` suffixed NSIDs here");
-    state.arbiters.check_trusted_scope(&arbiter_did, prefix).await?;
+    state
+        .arbiters
+        .check_trusted_scope(&arbiter_did, prefix)
+        .await?;
 
     let scope = state
         .scopes
@@ -490,14 +492,8 @@ async fn drive_request(
                     // install handlers, which drive request machines again —
                     // an async recursion cycle the compiler requires an
                     // indirection for. Bounded by MAX_BUILTIN_HANDOFF_DEPTH.
-                    return Box::pin(serve_builtin(
-                        state,
-                        caller,
-                        nsid,
-                        body,
-                        handoff_depth + 1,
-                    ))
-                    .await;
+                    return Box::pin(serve_builtin(state, caller, nsid, body, handoff_depth + 1))
+                        .await;
                 }
                 BuiltinHandoff::Install { body, creds } => {
                     return perform_install(state, body, creds).await;
@@ -512,10 +508,11 @@ async fn drive_request(
 fn registry_body(input: Option<&InputDataOrBytes<Value>>) -> Result<Option<Bytes>, AppError> {
     match input {
         None => Ok(None),
-        Some(InputDataOrBytes::Data(json)) => Ok(Some(Bytes::from(
-            serde_json::to_vec(json)
-                .map_err(|e| AppError::Other(anyhow::anyhow!("serializing handed-off body: {e}")))?,
-        ))),
+        Some(InputDataOrBytes::Data(json)) => {
+            Ok(Some(Bytes::from(serde_json::to_vec(json).map_err(
+                |e| AppError::Other(anyhow::anyhow!("serializing handed-off body: {e}")),
+            )?)))
+        }
         Some(InputDataOrBytes::Bytes(bytes)) => Ok(Some(Bytes::from(bytes.clone()))),
     }
 }
@@ -543,9 +540,7 @@ async fn serve_builtin(
     let body = body.unwrap_or_default();
     match nsid {
         NSID_CREATE_ARBITER => create_arbiter(state, caller).await,
-        NSID_CREATE_APP_PASSWORD_ARBITER => {
-            create_app_password_arbiter(state, caller, &body).await
-        }
+        NSID_CREATE_APP_PASSWORD_ARBITER => create_app_password_arbiter(state, caller, &body).await,
         NSID_PROXY => proxy_request_at(state, caller, &body, depth).await,
         NSID_INSTALL_POLICY => install_policy(state, caller, &body, depth).await,
         NSID_RESET_CONFIG => reset_config(state, caller, &body).await,
@@ -684,7 +679,10 @@ async fn install_policy(
 
     // Pipeline-gated install: drive the arbiter's community policy over the
     // install request itself.
-    let pds_endpoint = state.resolver.resolve_pds_endpoint(&body.arbiter_did).await?;
+    let pds_endpoint = state
+        .resolver
+        .resolve_pds_endpoint(&body.arbiter_did)
+        .await?;
     let req = XrpcRequest {
         method: Method::POST,
         nsid: NSID_INSTALL_POLICY.to_string(),
@@ -756,6 +754,15 @@ async fn perform_install(
     };
     policy::validate_config_inputs(&body.trusted_scopes, pipeline_entry)
         .map_err(|e| AppError::InvalidPolicy(format!("invalid install payload: {e:#}")))?;
+    // The store may serve pre-write values: the caller writes the policy
+    // record externally right before installing (its jetstream event may
+    // not have landed yet), and a prior install's config write may likewise
+    // still be in flight. Drop both so validation and the reads below
+    // observe current PDS state.
+    if let Some(uri) = &body.policy {
+        record_store::invalidate(uri).await;
+    }
+    record_store::invalidate(&policy::config_record_uri(&body.arbiter_did)).await;
     let repo = body
         .arbiter_did
         .parse::<AtIdentifier>()
@@ -770,12 +777,20 @@ async fn perform_install(
     // config record, and then fail the re-onboard as an undeclared 500 the
     // installer cannot act on. The caller writes the record itself before
     // installing; this endpoint never writes policy records.
-    let pds_endpoint = state.resolver.resolve_pds_endpoint(&body.arbiter_did).await?;
+    let pds_endpoint = state
+        .resolver
+        .resolve_pds_endpoint(&body.arbiter_did)
+        .await?;
     let local_api = policy::pds_read_client(&pds_endpoint)?;
     if let Some(uri) = &body.policy {
-        policy::validate_pipeline_records(state, &local_api, &body.arbiter_did, std::slice::from_ref(uri))
-            .await
-            .map_err(|e| AppError::InvalidPolicy(format!("invalid install payload: {e:#}")))?;
+        policy::validate_pipeline_records(
+            state,
+            &local_api,
+            &body.arbiter_did,
+            std::slice::from_ref(uri),
+        )
+        .await
+        .map_err(|e| AppError::InvalidPolicy(format!("invalid install payload: {e:#}")))?;
     }
 
     // Read the CURRENT config: absent (bootstrap) → the empty config the
@@ -831,11 +846,16 @@ async fn perform_install(
             swap_commit.as_deref(),
         )
         .await?;
+        // The config write just changed the record on the PDS; the entry
+        // current_config cached is now stale until the write's jetstream
+        // event lands. Drop it so the re-onboard below observes the write.
+        record_store::invalidate(&policy::config_record_uri(&body.arbiter_did)).await;
     }
 
     // Re-onboard so the appended layer is active (and an already-installed
-    // layer's updated record content is picked up: the reload re-resolves
-    // the pipeline, keyed by record CID).
+    // layer's updated record content is picked up: the caller-written
+    // policy record and the just-written config were invalidated above, so
+    // the reload observes current values from the store).
     policy::load_and_onboard(state, &body.arbiter_did)
         .await
         .map_err(AppError::from)?;
@@ -907,7 +927,10 @@ async fn reset_config(state: &AppState, caller: &str, body: &Bytes) -> Result<Re
             AppError::PermissionDenied("account is not stewarded by this server".to_string())
         })?;
 
-    let pds_endpoint = state.resolver.resolve_pds_endpoint(&body.arbiter_did).await?;
+    let pds_endpoint = state
+        .resolver
+        .resolve_pds_endpoint(&body.arbiter_did)
+        .await?;
     let writer = login_session(&body.arbiter_did, &creds.password, &pds_endpoint).await?;
     let swap_commit = policy::repo_head_cid(state, &body.arbiter_did)
         .await
@@ -920,6 +943,9 @@ async fn reset_config(state: &AppState, caller: &str, body: &Bytes) -> Result<Re
         swap_commit.as_deref(),
     )
     .await?;
+    // The config write just changed the record; the store must not serve
+    // the pre-write value to the re-onboard below.
+    record_store::invalidate(&policy::config_record_uri(&body.arbiter_did)).await;
 
     // Re-onboard so the replacement config takes effect. This is the regular
     // load path, not a request against the (previously broken) arbiter, so
@@ -982,9 +1008,7 @@ fn oversized_response() -> Response {
 static CREATE_ARBITER_COUNTS: LazyLock<moka::future::Cache<String, u64>> = LazyLock::new(|| {
     moka::future::Cache::builder()
         .max_capacity(10_000)
-        .time_to_live(Duration::from_secs(
-            CONFIG.create_arbiter_rate_window_secs,
-        ))
+        .time_to_live(Duration::from_secs(CONFIG.create_arbiter_rate_window_secs))
         .build()
 });
 
@@ -998,17 +1022,16 @@ async fn check_create_arbiter_rate(caller: &str) -> Result<(), AppError> {
             "createArbiter is disabled (CREATE_ARBITER_RATE_LIMIT=0)".into(),
         ));
     }
-    let count = CREATE_ARBITER_COUNTS
-        .get(caller)
-        .await
-        .unwrap_or(0);
+    let count = CREATE_ARBITER_COUNTS.get(caller).await.unwrap_or(0);
     if count >= limit {
         return Err(AppError::PermissionDenied(format!(
             "createArbiter rate limit exceeded ({limit} per {}s)",
             CONFIG.create_arbiter_rate_window_secs
         )));
     }
-    CREATE_ARBITER_COUNTS.insert(caller.to_string(), count + 1).await;
+    CREATE_ARBITER_COUNTS
+        .insert(caller.to_string(), count + 1)
+        .await;
     Ok(())
 }
 
@@ -1222,10 +1245,8 @@ async fn create_app_password_arbiter(
 /// PDS (e.g. the create path, which just created the account) can treat any
 /// error as provisioning failure.
 async fn login_session(did: &str, password: &str, pds_url: &str) -> Result<SessionAgent, AppError> {
-    let session = CredentialSession::new(
-        time_bound_reqwest(pds_url),
-        MemorySessionStore::default(),
-    );
+    let session =
+        CredentialSession::new(time_bound_reqwest(pds_url), MemorySessionStore::default());
     session
         .login(did, password)
         .await

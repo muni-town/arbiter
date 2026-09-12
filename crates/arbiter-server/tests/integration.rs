@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use atproto_identity::key::{KeyData, KeyType, generate_key, to_public};
 use atproto_identity::model::{Document, Service, VerificationMethod};
 use atproto_identity::traits::IdentityResolver;
-use atproto_jetstream::{EventHandler, JetstreamEvent, JetstreamEventCommit};
+use atproto_jetstream::{EventHandler, JetstreamEvent, JetstreamEventCommit, JetstreamEventDelete};
 use atproto_oauth::jwt::{Claims, Header, JoseClaims, mint};
 use axum::Json;
 use axum::extract::{Query, State};
@@ -42,6 +42,58 @@ use arbiter_server::storage::TursoCredentialStore;
 /// The mock PDS record map keyed by `(repo, collection, rkey)`.
 type RecordMap = Arc<Mutex<HashMap<(String, String, String), Value>>>;
 
+/// A repo rev sorting above the mock's `getRepoStatus` rev
+/// (`MOCK_REPO_REV`), so rev-gated store updates and `is_newer` both accept
+/// events carrying it. (Revs are TIDs — lexicographic order is chronological.)
+const NEWER_MOCK_REV: &str = "3lyileto4q52l";
+
+/// Build a Jetstream Create/Update commit event — the production path for a
+/// record write reaching the server.
+fn commit_event(
+    did: &str,
+    rev: &str,
+    collection: &str,
+    rkey: &str,
+    record: Value,
+) -> JetstreamEvent {
+    JetstreamEvent::Commit {
+        did: did.to_string(),
+        time_us: 0,
+        kind: "commit".into(),
+        commit: JetstreamEventCommit {
+            rev: rev.to_string(),
+            operation: "update".into(),
+            collection: collection.to_string(),
+            rkey: rkey.to_string(),
+            cid: "bafkreih000000000000000000000000000000000000000000".into(),
+            record,
+        },
+    }
+}
+
+/// Build a Jetstream Delete event.
+fn delete_event(did: &str, rev: &str, collection: &str, rkey: &str) -> JetstreamEvent {
+    JetstreamEvent::Delete {
+        did: did.to_string(),
+        time_us: 0,
+        kind: "commit".into(),
+        commit: JetstreamEventDelete {
+            rev: rev.to_string(),
+            operation: "delete".into(),
+            collection: collection.to_string(),
+            rkey: rkey.to_string(),
+        },
+    }
+}
+
+/// Dispatch an event through the same handler the live WebSocket drives.
+async fn dispatch(state: &Arc<AppState>, event: JetstreamEvent) {
+    ReloadHandler::new(state.clone())
+        .handle_event(Arc::new(event))
+        .await
+        .expect("handle jetstream event");
+}
+
 // ─── constants matching the server's record layout ──────────────────────────
 
 const SERVICE_COLLECTION: &str = "town.muni.arbiter.service";
@@ -59,7 +111,6 @@ const SERVER_DID: &str = "did:web:localhost%3A8203";
 /// A pipeline layer that echoes `input.nsid` back in `output.got`.
 const ECHO_POLICY: &str =
     "package arbiter\nresult := { \"ok\": true, \"output\": { \"got\": input.nsid } }";
-
 
 /// A pipeline layer that approves any request by handing it to the arbiter's
 /// built-in handler (the `installPolicy` pipeline-gate approval marker).
@@ -161,7 +212,10 @@ fn unique_did(tag: &str) -> String {
     digits.reverse();
     suffix.extend(std::iter::repeat(b'a').take(24 - suffix.len() - digits.len()));
     suffix.extend(digits);
-    format!("did:plc:{}", String::from_utf8(suffix).expect("fixture DID suffix is ASCII"))
+    format!(
+        "did:plc:{}",
+        String::from_utf8(suffix).expect("fixture DID suffix is ASCII")
+    )
 }
 
 /// Monotonic counter yielding unique Turso database file paths per run, so a
@@ -210,11 +264,7 @@ fn did_doc(did: &str, pds_url: &str, signing_key_multibase: Option<&str>) -> Doc
 
 /// Like [`did_doc`], but exposes multiple `Multikey` verification methods (in
 /// order), so tests can exercise `kid`-based key selection and rotation.
-fn did_doc_multi(
-    did: &str,
-    pds_url: &str,
-    signing_key_multibases: &[&str],
-) -> Document {
+fn did_doc_multi(did: &str, pds_url: &str, signing_key_multibases: &[&str]) -> Document {
     let verification_method = signing_key_multibases
         .iter()
         .enumerate()
@@ -419,7 +469,10 @@ async fn list_records_handler(
 }
 
 async fn create_session_handler(State(st): State<PdsState>) -> Response {
-    if st.fail_create_session.load(std::sync::atomic::Ordering::SeqCst) {
+    if st
+        .fail_create_session
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "AuthFactorTokenRequired" })),
@@ -437,7 +490,10 @@ async fn create_session_handler(State(st): State<PdsState>) -> Response {
 }
 
 async fn create_account_handler(State(st): State<PdsState>) -> Response {
-    if st.fail_create_account.load(std::sync::atomic::Ordering::SeqCst) {
+    if st
+        .fail_create_account
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "InternalServerError" })),
@@ -466,22 +522,28 @@ const MOCK_HEAD_B: &str = "bafkreiehdmbxxtwm46tkz6giymuyljrxfzzwdzfmeweufl3oaus7
 /// enforcing `swapCommit` (repo head compare-and-swap) and `swapRecord` (record
 /// CID compare-and-swap) so the server's optimistic-concurrency path is
 /// exercised.
-async fn put_record_handler(
-    State(st): State<PdsState>,
-    Json(body): Json<Value>,
-) -> Response {
-    let repo = body.get("repo").and_then(|v| v.as_str()).unwrap_or_default();
+async fn put_record_handler(State(st): State<PdsState>, Json(body): Json<Value>) -> Response {
+    let repo = body
+        .get("repo")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     let collection = body
         .get("collection")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let rkey = body.get("rkey").and_then(|v| v.as_str()).unwrap_or_default();
+    let rkey = body
+        .get("rkey")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     let swap_commit = body.get("swapCommit").and_then(|v| v.as_str());
     let record = match body.get("record").cloned() {
         Some(v) => v,
         None => {
-            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "InvalidRequest" })))
-                .into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "InvalidRequest" })),
+            )
+                .into_response();
         }
     };
 
@@ -513,8 +575,15 @@ async fn put_record_handler(
     map.insert(key, record);
     let uri = format!("at://{repo}/{collection}/{rkey}");
     // Advance the repo head so a subsequent swapCommit on the old head fails.
-    st.heads.lock().await.insert(repo.to_string(), MOCK_HEAD_B.to_string());
-    (StatusCode::OK, Json(json!({ "uri": uri, "cid": MOCK_HEAD_B }))).into_response()
+    st.heads
+        .lock()
+        .await
+        .insert(repo.to_string(), MOCK_HEAD_B.to_string());
+    (
+        StatusCode::OK,
+        Json(json!({ "uri": uri, "cid": MOCK_HEAD_B })),
+    )
+        .into_response()
 }
 
 /// Serve `com.atproto.sync.getLatestCommit` with the current repo head.
@@ -523,7 +592,13 @@ async fn get_latest_commit_handler(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let repo = q.get("did").cloned().unwrap_or_default();
-    let cid = st.heads.lock().await.get(&repo).cloned().unwrap_or_else(|| MOCK_HEAD_A.to_string());
+    let cid = st
+        .heads
+        .lock()
+        .await
+        .get(&repo)
+        .cloned()
+        .unwrap_or_else(|| MOCK_HEAD_A.to_string());
     Json(json!({ "cid": cid, "rev": MOCK_REPO_REV })).into_response()
 }
 
@@ -609,9 +684,7 @@ async fn start_mock_pds_with_flags(
 /// deserialization and would leave the rev floor unset).
 const MOCK_REPO_REV: &str = "3lyileto4q52k";
 
-async fn get_repo_status_handler(
-    Query(q): Query<HashMap<String, String>>,
-) -> Response {
+async fn get_repo_status_handler(Query(q): Query<HashMap<String, String>>) -> Response {
     let did = q
         .get("did")
         .cloned()
@@ -711,13 +784,7 @@ fn pds_keypair() -> (KeyData, KeyData) {
 /// Mint a serviceAuth-style JWT signed by `priv_key` (the caller account's
 /// key). Canonical ATProto serviceAuth tokens carry `iss` = caller DID and no
 /// `sub` claim.
-fn mint_service_auth(
-    priv_key: &KeyData,
-    iss: &str,
-    aud: &str,
-    lxm: &str,
-    exp_secs: u64,
-) -> String {
+fn mint_service_auth(priv_key: &KeyData, iss: &str, aud: &str, lxm: &str, exp_secs: u64) -> String {
     let header = Header::try_from(priv_key.clone()).expect("jwt header from key");
     // Unique jti so the replay cache (keyed by (iss, jti)) never rejects a
     // freshly-minted token across tests that run in parallel.
@@ -926,10 +993,7 @@ async fn fail_closed_when_pds_unreachable() {
     // Seed the credential store so `startup_onboard` has an account to load.
     state
         .store
-        .store(
-            did.clone(),
-            test_creds("irrelevant"),
-        )
+        .store(did.clone(), test_creds("irrelevant"))
         .await
         .expect("store creds");
 
@@ -1190,8 +1254,7 @@ async fn auth_selects_key_by_kid_when_multiple() {
     // blindly taking the first key.
     let (k1_priv, _) = pds_keypair();
     let (k2_priv, _) = pds_keypair();
-    let (addr, caller_did, steward_did, _) =
-        auth_setup_with_keys(&[&k1_priv, &k2_priv]).await;
+    let (addr, caller_did, steward_did, _) = auth_setup_with_keys(&[&k1_priv, &k2_priv]).await;
 
     // Mint with the second key; its header `kid` is that key's did:key:.
     let jwt = mint_service_auth(
@@ -1228,8 +1291,7 @@ async fn auth_key_rotation_not_served_stale() {
     // for the whole TTL.
     let (old_priv, _) = pds_keypair();
     let (new_priv, _) = pds_keypair();
-    let (addr, caller_did, steward_did, _) =
-        auth_setup_with_keys(&[&old_priv, &new_priv]).await;
+    let (addr, caller_did, steward_did, _) = auth_setup_with_keys(&[&old_priv, &new_priv]).await;
 
     let mint = |key: &KeyData| {
         mint_service_auth(
@@ -1291,8 +1353,9 @@ async fn hot_reload_updates_policy() {
         .expect("begin v1");
     assert_policy_output(drive.machine.start(), json!({ "got": "v1" }));
 
-    // Swap the pipeline's policy record to v2 and reload (simulates a
-    // Jetstream reload after a `town.muni.arbiter.policy` write).
+    // Swap the pipeline's policy record to v2 on the PDS (simulates the
+    // write that reaches the server as a Jetstream commit) and store
+    // credentials so the reload wave recognizes the account as stewarded.
     {
         let mut m = env.records.lock().await;
         m.insert(
@@ -1304,9 +1367,27 @@ async fn hot_reload_updates_policy() {
             json!({ "policy": "package arbiter\nresult := { \"ok\": true, \"output\": { \"got\": \"v2\" } }" }),
         );
     }
-    policy::load_and_onboard(&env.state, &env.steward_did)
+    env.state
+        .store
+        .store(env.steward_did.clone(), test_creds("reload"))
         .await
-        .expect("reload onboard");
+        .expect("store creds");
+
+    // Dispatch the Jetstream commit for the rewritten record (the
+    // production path for a record write reaching the server): the handler
+    // folds it into the record store rev-gated and reloads the arbiter,
+    // which now serves v2.
+    dispatch(
+        &env.state,
+        commit_event(
+            &env.steward_did,
+            NEWER_MOCK_REV,
+            POLICY_COLLECTION,
+            ECHO_POLICY_RKEY,
+            json!({ "policy": "package arbiter\nresult := { \"ok\": true, \"output\": { \"got\": \"v2\" } }" }),
+        ),
+    )
+    .await;
 
     let mut drive = env
         .state
@@ -1326,10 +1407,7 @@ async fn auto_delete_service_absent() {
     // Store credentials so we can assert they survive the offboard.
     env.state
         .store
-        .store(
-            env.steward_did.clone(),
-            test_creds("kept"),
-        )
+        .store(env.steward_did.clone(), test_creds("kept"))
         .await
         .expect("store creds");
     assert!(is_serving(&env.state, &env.steward_did).await);
@@ -1343,9 +1421,20 @@ async fn auto_delete_service_absent() {
             SERVICE_RKEY.into(),
         ));
     }
-    policy::load_and_onboard(&env.state, &env.steward_did)
-        .await
-        .expect("reload after service removal");
+
+    // Dispatch the Jetstream delete event (the production path for a record
+    // removal): the handler evicts the store entry and reloads, which
+    // fetches the now-absent record and offboards.
+    dispatch(
+        &env.state,
+        delete_event(
+            &env.steward_did,
+            NEWER_MOCK_REV,
+            SERVICE_COLLECTION,
+            SERVICE_RKEY,
+        ),
+    )
+    .await;
 
     assert!(
         !is_serving(&env.state, &env.steward_did).await,
@@ -1374,10 +1463,7 @@ async fn reimport_after_offboard_reonboards() {
 
     env.state
         .store
-        .store(
-            env.steward_did.clone(),
-            test_creds("kept"),
-        )
+        .store(env.steward_did.clone(), test_creds("kept"))
         .await
         .expect("store creds");
     assert!(is_serving(&env.state, &env.steward_did).await);
@@ -1391,9 +1477,19 @@ async fn reimport_after_offboard_reonboards() {
             SERVICE_RKEY.into(),
         ));
     }
-    policy::load_and_onboard(&env.state, &env.steward_did)
-        .await
-        .expect("reload after service removal");
+    // Dispatch the Jetstream delete event for the removed record: the
+    // handler evicts the store entry and reloads, which fetches the
+    // now-absent record and offboards.
+    dispatch(
+        &env.state,
+        delete_event(
+            &env.steward_did,
+            NEWER_MOCK_REV,
+            SERVICE_COLLECTION,
+            SERVICE_RKEY,
+        ),
+    )
+    .await;
     assert!(
         !is_serving(&env.state, &env.steward_did).await,
         "absent service record must offboard the arbiter"
@@ -1411,9 +1507,20 @@ async fn reimport_after_offboard_reonboards() {
             json!({ "did": SERVER_DID }),
         );
     }
-    policy::load_and_onboard(&env.state, &env.steward_did)
-        .await
-        .expect("reload after service restore");
+    // Dispatch the restored record's commit event: the store accepts events
+    // for an offboarded DID (no floor to regress — the point this regression
+    // test covers) and the reload re-onboards the arbiter.
+    dispatch(
+        &env.state,
+        commit_event(
+            &env.steward_did,
+            NEWER_MOCK_REV,
+            SERVICE_COLLECTION,
+            SERVICE_RKEY,
+            json!({ "did": SERVER_DID }),
+        ),
+    )
+    .await;
     assert!(
         is_serving(&env.state, &env.steward_did).await,
         "restored service record must re-onboard the arbiter"
@@ -1426,10 +1533,7 @@ async fn auto_delete_service_repointed() {
 
     env.state
         .store
-        .store(
-            env.steward_did.clone(),
-            test_creds("purge-me"),
-        )
+        .store(env.steward_did.clone(), test_creds("purge-me"))
         .await
         .expect("store creds");
     assert!(is_serving(&env.state, &env.steward_did).await);
@@ -1446,9 +1550,20 @@ async fn auto_delete_service_repointed() {
             json!({ "did": "did:web:other.example" }),
         );
     }
-    policy::load_and_onboard(&env.state, &env.steward_did)
-        .await
-        .expect("reload after service repoint");
+    // Dispatch the repointed record's commit event (the production path for
+    // the write): the handler folds it into the store and reloads, which
+    // sees the repoint and offboards + purges credentials.
+    dispatch(
+        &env.state,
+        commit_event(
+            &env.steward_did,
+            NEWER_MOCK_REV,
+            SERVICE_COLLECTION,
+            SERVICE_RKEY,
+            json!({ "did": "did:web:other.example" }),
+        ),
+    )
+    .await;
 
     assert!(
         !is_serving(&env.state, &env.steward_did).await,
@@ -1466,6 +1581,124 @@ async fn auto_delete_service_repointed() {
     );
 }
 
+/// The verified-replay (heal-only) reconnect refresh must load ONLY
+/// non-serving arbiters: a serving arbiter whose records were broken on the
+/// PDS is skipped (its pipeline provably matches the trusted store — a load
+/// would have offboarded it), and a never-onboarded steward is healed.
+#[tokio::test]
+async fn verified_reconnect_heals_only_non_serving() {
+    let records = Arc::new(Mutex::new(HashMap::new()));
+    let did_a = unique_did("steward");
+    let did_b = unique_did("steward");
+    let did_c = unique_did("steward");
+    for did in [&did_a, &did_b, &did_c] {
+        populate_standard_records(&records, did, ECHO_POLICY).await;
+    }
+    let pds_addr = start_mock_pds(records.clone()).await;
+    let pds_url = format!("http://{pds_addr}");
+    let mut docs = HashMap::new();
+    for did in [&did_a, &did_b, &did_c] {
+        docs.insert(did.clone(), did_doc(did, &pds_url, None));
+    }
+    let state = make_state(Arc::new(MockResolver { docs }));
+    for did in [&did_a, &did_b, &did_c] {
+        state
+            .store
+            .store(did.clone(), test_creds(did))
+            .await
+            .expect("store creds");
+    }
+    for did in [&did_a, &did_b] {
+        policy::load_and_onboard(&state, did)
+            .await
+            .expect("initial onboard");
+    }
+    // did_c intentionally never onboarded.
+
+    // Break steward A's service record on the PDS WITHOUT an event: any load
+    // would observe the absence and offboard. The heal-only pass must skip
+    // the serving A (its pipeline provably matches the trusted store) and
+    // load only the non-serving C.
+    {
+        let mut m = records.lock().await;
+        m.remove(&(
+            did_a.clone(),
+            SERVICE_COLLECTION.into(),
+            SERVICE_RKEY.into(),
+        ));
+    }
+    policy::refresh_all_after_reconnect(state.clone(), false).await;
+
+    assert!(
+        is_serving(&state, &did_a).await,
+        "serving arbiter must be skipped by the heal-only refresh"
+    );
+    assert!(
+        is_serving(&state, &did_b).await,
+        "untouched serving arbiter stays serving"
+    );
+    assert!(
+        is_serving(&state, &did_c).await,
+        "never-onboarded steward is healed by the heal-only refresh"
+    );
+    let creds = state.store.get(&did_a).await.expect("store get");
+    assert!(
+        creds.is_some(),
+        "the skipped arbiter keeps its credentials untouched"
+    );
+}
+
+/// The unverified-gap (full) reconnect refresh must re-observe CURRENT PDS
+/// state for every steward — even for arbiters whose records the (now
+/// invalidated) store had cached: steward A's service record was removed
+/// during the gap with no event (jetstream was down), so only a store
+/// invalidation + fresh fetch can observe the absence.
+#[tokio::test]
+async fn unverified_reconnect_reobserves_everything() {
+    let records = Arc::new(Mutex::new(HashMap::new()));
+    let did_a = unique_did("steward");
+    let did_b = unique_did("steward");
+    populate_standard_records(&records, &did_a, ECHO_POLICY).await;
+    populate_standard_records(&records, &did_b, ECHO_POLICY).await;
+    let pds_addr = start_mock_pds(records.clone()).await;
+    let pds_url = format!("http://{pds_addr}");
+    let mut docs = HashMap::new();
+    for did in [&did_a, &did_b] {
+        docs.insert(did.clone(), did_doc(did, &pds_url, None));
+    }
+    let state = make_state(Arc::new(MockResolver { docs }));
+    for did in [&did_a, &did_b] {
+        state
+            .store
+            .store(did.clone(), test_creds(did))
+            .await
+            .expect("store creds");
+        policy::load_and_onboard(&state, did)
+            .await
+            .expect("initial onboard");
+    }
+
+    // Steward A's service record was removed during the outage (no event —
+    // the subscription was down), so the store still holds its entry.
+    {
+        let mut m = records.lock().await;
+        m.remove(&(
+            did_a.clone(),
+            SERVICE_COLLECTION.into(),
+            SERVICE_RKEY.into(),
+        ));
+    }
+    policy::refresh_all_after_reconnect(state.clone(), true).await;
+
+    assert!(
+        !is_serving(&state, &did_a).await,
+        "the full pass must re-fetch and observe the absence (fail-closed)"
+    );
+    assert!(
+        is_serving(&state, &did_b).await,
+        "the healthy steward re-onboards from the re-fetched store"
+    );
+}
 #[tokio::test]
 async fn unprovisioned_account_is_repaired_not_offboarded() {
     // A partially-provisioned account (bootstrap records never fully written,
@@ -1541,7 +1774,11 @@ async fn unprovisioned_account_is_repaired_not_offboarded() {
     let svc = records
         .lock()
         .await
-        .get(&(steward_did.clone(), SERVICE_COLLECTION.to_string(), SERVICE_RKEY.to_string()))
+        .get(&(
+            steward_did.clone(),
+            SERVICE_COLLECTION.to_string(),
+            SERVICE_RKEY.to_string(),
+        ))
         .cloned();
     assert_eq!(
         svc.and_then(|v| v.get("did").and_then(|d| d.as_str()).map(String::from)),
@@ -1570,7 +1807,10 @@ async fn unprovisioned_account_is_repaired_not_offboarded() {
         .await
         .expect("store get")
         .expect("creds present");
-    assert!(creds.provisioned, "account must be marked provisioned after repair");
+    assert!(
+        creds.provisioned,
+        "account must be marked provisioned after repair"
+    );
 }
 
 // ─── 5b. createArbiter (new-account provisioning) ────────────────────────────
@@ -1634,7 +1874,11 @@ async fn create_arbiter_provisions_account_and_stays_offline() {
         .send()
         .await
         .expect("createArbiter request");
-    assert_eq!(resp.status(), StatusCode::OK, "createArbiter should succeed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "createArbiter should succeed"
+    );
     let body: Value = resp.json().await.expect("json body");
     assert_eq!(
         body.get("did").and_then(|v| v.as_str()),
@@ -1909,10 +2153,7 @@ async fn create_app_password_arbiter_rejects_duplicate() {
     // Pre-seed credentials so the arbiter already exists on this server.
     state
         .store
-        .store(
-            arbiter_did.clone(),
-            test_creds("existing-pw"),
-        )
+        .store(arbiter_did.clone(), test_creds("existing-pw"))
         .await
         .expect("store creds");
     let jwt = create_app_password_jwt(&caller_priv, &caller_did);
@@ -1959,10 +2200,7 @@ async fn create_app_password_arbiter_denies_bad_app_password() {
         caller_did.clone(),
         did_doc(&caller_did, &pds_url, Some(&multibase)),
     );
-    docs.insert(
-        arbiter_did.clone(),
-        did_doc(&arbiter_did, &pds_url, None),
-    );
+    docs.insert(arbiter_did.clone(), did_doc(&arbiter_did, &pds_url, None));
     let resolver: Arc<dyn IdentityResolver> = Arc::new(MockResolver { docs });
     let state = make_state(resolver);
     let app = handlers::router(state);
@@ -1995,8 +2233,6 @@ async fn create_app_password_arbiter_denies_bad_app_password() {
         "error code must match the lexicon's ErrPermissionDenied"
     );
 }
-
-
 
 // ─── 6. installPolicy (recovery admin) ──────────────────────────────────────
 
@@ -2032,7 +2268,14 @@ struct InstallEnv {
 /// bootstrap designation), and return the router address + a signing keypair
 /// for minting the admin's JWTs + the steward/admin DIDs + the mock PDS record
 /// map + the live state (the router keeps its own clone).
-async fn install_setup() -> (SocketAddr, KeyData, String, String, RecordMap, Arc<AppState>) {
+async fn install_setup() -> (
+    SocketAddr,
+    KeyData,
+    String,
+    String,
+    RecordMap,
+    Arc<AppState>,
+) {
     let env = install_setup_full().await;
     (
         env.addr,
@@ -2156,8 +2399,7 @@ async fn install_policy_as_recovery_admin() {
     // stewarded repo, via the mock PDS map); installPolicy only references
     // it — it must never write policy records.
     let installed_rkey = "installed";
-    let installed_uri =
-        format!("at://{steward_did}/{POLICY_COLLECTION}/{installed_rkey}");
+    let installed_uri = format!("at://{steward_did}/{POLICY_COLLECTION}/{installed_rkey}");
     let installed_src =
         "package arbiter\nresult := { \"ok\": true, \"output\": { \"got\": \"installed\" } }";
     records.lock().await.insert(
@@ -2323,10 +2565,34 @@ async fn install_policy_appends_sequential_entries_in_order() {
     )
     .await;
 
-    let resp = admin_append(&addr, &admin_priv, &admin_did, &steward_did, Some(&a_uri), &[TRUSTED_SCOPE]).await;
-    assert_eq!(resp.status(), StatusCode::OK, "the first append must succeed");
-    let resp = admin_append(&addr, &admin_priv, &admin_did, &steward_did, Some(&b_uri), &[]).await;
-    assert_eq!(resp.status(), StatusCode::OK, "the second append must succeed");
+    let resp = admin_append(
+        &addr,
+        &admin_priv,
+        &admin_did,
+        &steward_did,
+        Some(&a_uri),
+        &[TRUSTED_SCOPE],
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the first append must succeed"
+    );
+    let resp = admin_append(
+        &addr,
+        &admin_priv,
+        &admin_did,
+        &steward_did,
+        Some(&b_uri),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the second append must succeed"
+    );
 
     let echo_uri = format!("at://{steward_did}/{POLICY_COLLECTION}/{ECHO_POLICY_RKEY}");
     let config = records
@@ -2367,13 +2633,33 @@ async fn install_policy_reinstall_keeps_position_and_updates_record() {
     let v2 = "package arbiter\nresult := { \"ok\": true, \"output\": { \"got\": \"v2\" } }";
     seed_policy_record(&records, &steward_did, "shared", v1).await;
 
-    let resp = admin_append(&addr, &admin_priv, &admin_did, &steward_did, Some(&uri), &[TRUSTED_SCOPE]).await;
-    assert_eq!(resp.status(), StatusCode::OK, "the first install must succeed");
+    let resp = admin_append(
+        &addr,
+        &admin_priv,
+        &admin_did,
+        &steward_did,
+        Some(&uri),
+        &[TRUSTED_SCOPE],
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the first install must succeed"
+    );
 
     // The caller updates the record in their repo, then re-installs the
     // SAME URI.
     seed_policy_record(&records, &steward_did, "shared", v2).await;
-    let resp = admin_append(&addr, &admin_priv, &admin_did, &steward_did, Some(&uri), &[TRUSTED_SCOPE]).await;
+    let resp = admin_append(
+        &addr,
+        &admin_priv,
+        &admin_did,
+        &steward_did,
+        Some(&uri),
+        &[TRUSTED_SCOPE],
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK, "the re-install must succeed");
 
     let echo_uri = format!("at://{steward_did}/{POLICY_COLLECTION}/{ECHO_POLICY_RKEY}");
@@ -2441,7 +2727,11 @@ async fn install_policy_scopes_union_dedupes_preserving_order() {
         &[TRUSTED_SCOPE, "community.new.thing"],
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK, "the scope install must succeed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the scope install must succeed"
+    );
 
     assert_eq!(
         stored_config(&records, &steward_did)
@@ -2484,8 +2774,20 @@ async fn install_policy_scope_only_appends_scopes_without_pipeline_change() {
     let (addr, admin_priv, admin_did, steward_did, records, _state) = install_setup().await;
 
     let echo_uri = format!("at://{steward_did}/{POLICY_COLLECTION}/{ECHO_POLICY_RKEY}");
-    let resp = admin_append(&addr, &admin_priv, &admin_did, &steward_did, None, &["community.other.thing"]).await;
-    assert_eq!(resp.status(), StatusCode::OK, "the scope-only install must succeed");
+    let resp = admin_append(
+        &addr,
+        &admin_priv,
+        &admin_did,
+        &steward_did,
+        None,
+        &["community.other.thing"],
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the scope-only install must succeed"
+    );
 
     let config = records
         .lock()
@@ -2523,8 +2825,20 @@ async fn install_policy_empty_scopes_preserve_existing_scopes() {
         "package arbiter\nresult := { \"ok\": true, \"output\": { \"got\": \"scoped\" } }",
     )
     .await;
-    let resp = admin_append(&addr, &admin_priv, &admin_did, &steward_did, Some(&uri), &[]).await;
-    assert_eq!(resp.status(), StatusCode::OK, "the policy-only install must succeed");
+    let resp = admin_append(
+        &addr,
+        &admin_priv,
+        &admin_did,
+        &steward_did,
+        Some(&uri),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the policy-only install must succeed"
+    );
 
     let echo_uri = format!("at://{steward_did}/{POLICY_COLLECTION}/{ECHO_POLICY_RKEY}");
     let config = records
@@ -2615,8 +2929,20 @@ async fn install_policy_references_remote_repo_record() {
         .expect("onboard");
     let addr = start_router(state.clone()).await;
 
-    let resp = admin_append(&addr, &admin_priv, &admin_did, &steward_did, Some(&shared_uri), &[TRUSTED_SCOPE]).await;
-    assert_eq!(resp.status(), StatusCode::OK, "the remote-reference install must succeed");
+    let resp = admin_append(
+        &addr,
+        &admin_priv,
+        &admin_did,
+        &steward_did,
+        Some(&shared_uri),
+        &[TRUSTED_SCOPE],
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the remote-reference install must succeed"
+    );
 
     let echo_uri = format!("at://{steward_did}/{POLICY_COLLECTION}/{ECHO_POLICY_RKEY}");
     let map = records.lock().await;
@@ -2668,8 +2994,20 @@ async fn install_policy_noop_reinstall_skips_config_write() {
         "package arbiter\nresult := { \"ok\": true, \"output\": { \"got\": \"noop\" } }",
     )
     .await;
-    let resp = admin_append(&addr, &admin_priv, &admin_did, &steward_did, Some(&uri), &[TRUSTED_SCOPE]).await;
-    assert_eq!(resp.status(), StatusCode::OK, "the first install must succeed");
+    let resp = admin_append(
+        &addr,
+        &admin_priv,
+        &admin_did,
+        &steward_did,
+        Some(&uri),
+        &[TRUSTED_SCOPE],
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the first install must succeed"
+    );
 
     let config_key = (
         steward_did.clone(),
@@ -2683,8 +3021,20 @@ async fn install_policy_noop_reinstall_skips_config_write() {
         .cloned()
         .expect("config record after first install");
 
-    let resp = admin_append(&addr, &admin_priv, &admin_did, &steward_did, Some(&uri), &[TRUSTED_SCOPE]).await;
-    assert_eq!(resp.status(), StatusCode::OK, "the no-op re-install must succeed");
+    let resp = admin_append(
+        &addr,
+        &admin_priv,
+        &admin_did,
+        &steward_did,
+        Some(&uri),
+        &[TRUSTED_SCOPE],
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the no-op re-install must succeed"
+    );
 
     let after = records
         .lock()
@@ -2715,8 +3065,20 @@ async fn install_policy_bootstraps_onto_absent_config() {
     let first_src =
         "package arbiter\nresult := { \"ok\": true, \"output\": { \"got\": \"installed\" } }";
     seed_policy_record(&records, &steward_did, "first", first_src).await;
-    let resp = admin_append(&addr, &admin_priv, &admin_did, &steward_did, Some(&uri), &["community.other.thing"]).await;
-    assert_eq!(resp.status(), StatusCode::OK, "the bootstrap install must succeed");
+    let resp = admin_append(
+        &addr,
+        &admin_priv,
+        &admin_did,
+        &steward_did,
+        Some(&uri),
+        &["community.other.thing"],
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the bootstrap install must succeed"
+    );
 
     let config = records
         .lock()
@@ -2768,7 +3130,15 @@ async fn install_policy_rejects_uncompilable_policy() {
     )
     .await;
     let broken_uri = format!("at://{steward_did}/{POLICY_COLLECTION}/broken");
-    let resp = admin_append(&addr, &admin_priv, &admin_did, &steward_did, Some(&broken_uri), &["community.other.thing"]).await;
+    let resp = admin_append(
+        &addr,
+        &admin_priv,
+        &admin_did,
+        &steward_did,
+        Some(&broken_uri),
+        &["community.other.thing"],
+    )
+    .await;
 
     assert_eq!(
         resp.status(),
@@ -2889,7 +3259,15 @@ async fn install_policy_rejects_ghost_local_pipeline_entry() {
     let (addr, admin_priv, admin_did, steward_did, records, _state) = install_setup().await;
 
     let ghost_uri = format!("at://{steward_did}/{POLICY_COLLECTION}/ghost");
-    let resp = admin_append(&addr, &admin_priv, &admin_did, &steward_did, Some(&ghost_uri), &[TRUSTED_SCOPE]).await;
+    let resp = admin_append(
+        &addr,
+        &admin_priv,
+        &admin_did,
+        &steward_did,
+        Some(&ghost_uri),
+        &[TRUSTED_SCOPE],
+    )
+    .await;
     let status = resp.status();
     let body: Value = resp.json().await.expect("json body");
     assert_eq!(
@@ -2942,7 +3320,15 @@ async fn install_policy_rejects_ghost_remote_pipeline_entry() {
     let (addr, admin_priv, admin_did, steward_did, records, _state) = install_setup().await;
 
     let ghost_uri = format!("at://{admin_did}/{POLICY_COLLECTION}/ghost");
-    let resp = admin_append(&addr, &admin_priv, &admin_did, &steward_did, Some(&ghost_uri), &[TRUSTED_SCOPE]).await;
+    let resp = admin_append(
+        &addr,
+        &admin_priv,
+        &admin_did,
+        &steward_did,
+        Some(&ghost_uri),
+        &[TRUSTED_SCOPE],
+    )
+    .await;
     let status = resp.status();
     let body: Value = resp.json().await.expect("json body");
     assert_eq!(
@@ -3239,7 +3625,9 @@ async fn install_policy_rotates_with_recovery_record_rewrite() {
         .cloned()
         .expect("config record after the old admin's install");
     assert_eq!(
-        config_after_first.get("trustedScopes").and_then(|v| v.as_array()),
+        config_after_first
+            .get("trustedScopes")
+            .and_then(|v| v.as_array()),
         Some(&vec![json!(TRUSTED_SCOPE), json!("community.other.thing")]),
         "the old admin's bypass install must union the scopes"
     );
@@ -3424,7 +3812,13 @@ fn echo_install_body(env: &InstallEnv) -> Value {
 
 /// A non-admin serviceAuth JWT bound to `nsid`.
 fn caller_jwt(env: &InstallEnv, nsid: &str) -> String {
-    mint_service_auth(&env.caller_priv, &env.caller_did, SERVER_DID, nsid, now_secs() + 60)
+    mint_service_auth(
+        &env.caller_priv,
+        &env.caller_did,
+        SERVER_DID,
+        nsid,
+        now_secs() + 60,
+    )
 }
 
 /// Break the steward's config record (pipeline references a policy record
@@ -3534,7 +3928,6 @@ async fn install_policy_pipeline_handoff_performs_install() {
         is_serving(&env.state, &env.steward_did).await,
         "the install must re-onboard the arbiter"
     );
-
 }
 #[tokio::test]
 async fn install_policy_pipeline_layer_deny_is_surfaced() {
@@ -3542,14 +3935,24 @@ async fn install_policy_pipeline_layer_deny_is_surfaced() {
     // error envelope is the response.
     let env = install_setup_full().await;
     let resp = admin_reset_layer(&env, "gate", DENY_INSTALL_POLICY).await;
-    assert_eq!(resp.status(), StatusCode::OK, "admin resets the deny layer in");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin resets the deny layer in"
+    );
 
     let jwt = caller_jwt(&env, "town.muni.arbiter.installPolicy");
     let resp = install_call(env.addr, &jwt, echo_install_body(&env)).await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a denying layer must deny the install");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a denying layer must deny the install"
+    );
     let body: Value = resp.json().await.expect("json body");
     assert_eq!(
-        body.get("error").and_then(|e| e.get("error")).and_then(|v| v.as_str()),
+        body.get("error")
+            .and_then(|e| e.get("error"))
+            .and_then(|v| v.as_str()),
         Some("InstallDenied"),
         "the layer's error envelope must be surfaced"
     );
@@ -3561,7 +3964,11 @@ async fn install_policy_pipeline_pass_falls_off_end_denies() {
     // fail-closed deny.
     let env = install_setup_full().await;
     let resp = admin_reset_layer(&env, "gate", PASS_INSTALL_POLICY).await;
-    assert_eq!(resp.status(), StatusCode::OK, "admin resets the pass layer in");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin resets the pass layer in"
+    );
 
     let jwt = caller_jwt(&env, "town.muni.arbiter.installPolicy");
     let resp = install_call(env.addr, &jwt, echo_install_body(&env)).await;
@@ -3572,7 +3979,9 @@ async fn install_policy_pipeline_pass_falls_off_end_denies() {
     );
     let body: Value = resp.json().await.expect("json body");
     assert_eq!(
-        body.get("error").and_then(|e| e.get("error")).and_then(|v| v.as_str()),
+        body.get("error")
+            .and_then(|e| e.get("error"))
+            .and_then(|v| v.as_str()),
         Some("Denied"),
         "the default deny envelope must be surfaced"
     );
@@ -3584,7 +3993,11 @@ async fn install_policy_recovery_admin_bypasses_denying_pipeline() {
     // pipeline: the bypass is the recovery path while a pipeline is active.
     let env = install_setup_full().await;
     let resp = admin_reset_layer(&env, "gate", DENY_INSTALL_POLICY).await;
-    assert_eq!(resp.status(), StatusCode::OK, "admin resets the deny layer in");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin resets the deny layer in"
+    );
 
     let jwt = install_jwt(&env.admin_priv, &env.admin_did);
     let resp = install_call(env.addr, &jwt, echo_install_body(&env)).await;
@@ -3735,7 +4148,10 @@ async fn reset_config_shape_validates_body() {
         .cloned()
         .expect("config record still present");
     assert_eq!(
-        config.get("trustedScopes").and_then(|v| v.as_array()).map(|a| a.len()),
+        config
+            .get("trustedScopes")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len()),
         Some(1),
         "the rejected reset must not touch the config record"
     );
@@ -3778,7 +4194,11 @@ async fn builtin_handoff_registry_dispatches_proxied_management_nsid() {
     // proxy path (the handoff terminates at depth 1).
     let env = install_setup_full().await;
     let resp = admin_reset_layer(&env, "gate", HANDLE_BUILTIN_POLICY).await;
-    assert_eq!(resp.status(), StatusCode::OK, "admin resets the handoff layer in");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin resets the handoff layer in"
+    );
 
     let jwt = caller_jwt(&env, "town.muni.arbiter.proxy");
     let resp = proxy_call(
@@ -3839,7 +4259,11 @@ async fn builtin_handoff_unknown_nsid_is_invalid_request() {
     // naming the NSID, not a panic and not a success.
     let env = install_setup_full().await;
     let resp = admin_reset_layer(&env, "gate", HANDLE_BUILTIN_POLICY).await;
-    assert_eq!(resp.status(), StatusCode::OK, "admin resets the handoff layer in");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin resets the handoff layer in"
+    );
 
     let unknown = "com.example.calendar.listEvents";
     let jwt = caller_jwt(&env, "town.muni.arbiter.proxy");
@@ -3856,7 +4280,9 @@ async fn builtin_handoff_unknown_nsid_is_invalid_request() {
     );
     let out: Value = resp.json().await.expect("json body");
     assert_eq!(
-        out.get("error").and_then(|e| e.get("error")).and_then(|v| v.as_str()),
+        out.get("error")
+            .and_then(|e| e.get("error"))
+            .and_then(|v| v.as_str()),
         Some("InvalidRequest"),
         "the unknown-NSID handoff must surface the InvalidRequest envelope: {out}"
     );
@@ -3881,13 +4307,22 @@ async fn builtin_handoff_chain_beyond_depth_bound_terminates() {
     // and the depth-9 dispatch trips the bound.
     let env = install_setup_full().await;
     let resp = admin_reset_layer(&env, "gate", HANDLE_BUILTIN_POLICY).await;
-    assert_eq!(resp.status(), StatusCode::OK, "admin resets the handoff layer in");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin resets the handoff layer in"
+    );
 
     // Nest nine self-similar proxy envelopes (the cap + 1): each level names
     // the proxy NSID and carries the next level's envelope as its body, so
     // every level parses cleanly and hands off again. The innermost leaf is
     // never parsed — the depth bound trips first.
-    let mut body = proxy_envelope(&env.steward_did, "POST", "town.muni.arbiter.proxy", Value::Null);
+    let mut body = proxy_envelope(
+        &env.steward_did,
+        "POST",
+        "town.muni.arbiter.proxy",
+        Value::Null,
+    );
     for _ in 0..8 {
         body = proxy_envelope(&env.steward_did, "POST", "town.muni.arbiter.proxy", body);
     }
@@ -3900,7 +4335,9 @@ async fn builtin_handoff_chain_beyond_depth_bound_terminates() {
     );
     let out: Value = resp.json().await.expect("json body");
     assert_eq!(
-        out.get("error").and_then(|e| e.get("error")).and_then(|v| v.as_str()),
+        out.get("error")
+            .and_then(|e| e.get("error"))
+            .and_then(|v| v.as_str()),
         Some("BuiltInHandoffTooDeep"),
         "the depth-bound trip must surface BuiltInHandoffTooDeep: {out}"
     );
@@ -3936,7 +4373,6 @@ async fn policy_xrpc_to_arbiter_self_receives_error_envelope() {
     );
 }
 
-
 // ─── 7. optimistic concurrency (swapCommit) is enforced by the mock ─────────
 
 #[tokio::test]
@@ -3966,15 +4402,27 @@ async fn put_record_rejects_stale_swap_commit() {
 
     // Current head is MOCK_HEAD_A for a fresh repo; a stale head must be rejected.
     let stale = put(Some(MOCK_HEAD_B)).send().await.expect("stale send");
-    assert_eq!(stale.status(), StatusCode::CONFLICT, "stale swapCommit must be rejected");
+    assert_eq!(
+        stale.status(),
+        StatusCode::CONFLICT,
+        "stale swapCommit must be rejected"
+    );
 
     // The current head succeeds and advances the repo head.
     let ok = put(Some(MOCK_HEAD_A)).send().await.expect("current send");
-    assert_eq!(ok.status(), StatusCode::OK, "current swapCommit must succeed");
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "current swapCommit must succeed"
+    );
 
     // Now MOCK_HEAD_A is stale; another write against it is rejected.
     let again = put(Some(MOCK_HEAD_A)).send().await.expect("again send");
-    assert_eq!(again.status(), StatusCode::CONFLICT, "old head must be rejected after advance");
+    assert_eq!(
+        again.status(),
+        StatusCode::CONFLICT,
+        "old head must be rejected after advance"
+    );
 }
 
 // ─── 8. scoped endpoints (`<scope>.arbiter.proxy` wildcard) ─────────────────
@@ -4046,7 +4494,8 @@ async fn scoped_setup(trusted_scopes: &[&str], scope_rego: &str) -> ScopedEnv {
 
     let mut lexicons = HashMap::new();
     lexicons.insert(TRUSTED_SCOPE.to_string(), scope_lexicon_doc(scope_rego));
-    let state = make_state_with_scope_source(resolver, Arc::new(MockLexiconSource { docs: lexicons }));
+    let state =
+        make_state_with_scope_source(resolver, Arc::new(MockLexiconSource { docs: lexicons }));
     policy::load_and_onboard(&state, &steward_did)
         .await
         .expect("onboard for scoped test");
@@ -4103,7 +4552,11 @@ async fn scoped_endpoint_happy_path() {
     let env = scoped_setup(&[TRUSTED_SCOPE], ALLOW_SCOPE_REGO).await;
     let jwt = scoped_jwt(&env, SCOPED_NSID);
     let resp = scoped_post(&env, &jwt, SCOPED_NSID, scoped_body(&env.steward_did)).await;
-    assert_eq!(resp.status(), StatusCode::OK, "scoped request must be handled");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "scoped request must be handled"
+    );
     let body: Value = resp.json().await.expect("json body");
     assert_eq!(body, json!({ "got": "com.example.calendars.readEvents" }));
 }
@@ -4118,7 +4571,10 @@ async fn scoped_endpoint_rejects_untrusted_scope() {
     let resp = scoped_post(&env, &jwt, SCOPED_NSID, scoped_body(&env.steward_did)).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let body: Value = resp.json().await.expect("json body");
-    assert_eq!(body.get("error").and_then(|v| v.as_str()), Some("Forbidden"));
+    assert_eq!(
+        body.get("error").and_then(|v| v.as_str()),
+        Some("Forbidden")
+    );
 }
 
 #[tokio::test]
@@ -4130,7 +4586,10 @@ async fn scoped_endpoint_denied_by_scope_policy() {
     let resp = scoped_post(&env, &jwt, SCOPED_NSID, scoped_body(&env.steward_did)).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let body: Value = resp.json().await.expect("json body");
-    assert_eq!(body.get("error").and_then(|v| v.as_str()), Some("Forbidden"));
+    assert_eq!(
+        body.get("error").and_then(|v| v.as_str()),
+        Some("Forbidden")
+    );
 }
 
 #[tokio::test]
@@ -4144,7 +4603,10 @@ async fn scoped_endpoint_unusable_permission_set_denies() {
     let resp = scoped_post(&env, &jwt, unknown, scoped_body(&env.steward_did)).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let body: Value = resp.json().await.expect("json body");
-    assert_eq!(body.get("error").and_then(|v| v.as_str()), Some("Forbidden"));
+    assert_eq!(
+        body.get("error").and_then(|v| v.as_str()),
+        Some("Forbidden")
+    );
 }
 
 // ─── 9. fail-closed lifecycle ────────────────────────────────────────────────
@@ -4231,7 +4693,10 @@ async fn fail_closed_when_pipeline_record_missing() {
     let state = make_state(resolver);
 
     let result = policy::load_and_onboard(&state, &steward_did).await;
-    assert!(result.is_err(), "missing pipeline record must fail the load");
+    assert!(
+        result.is_err(),
+        "missing pipeline record must fail the load"
+    );
     assert!(!is_serving(&state, &steward_did).await);
 }
 
@@ -4291,6 +4756,12 @@ async fn remote_pipeline_layer_resolves_and_hot_reloads() {
         .await
         .expect("onboard with remote layer");
     assert!(is_serving(&state, &steward_did).await);
+    // The reload wave acts only on stewarded accounts.
+    state
+        .store
+        .store(steward_did.clone(), test_creds("steward"))
+        .await
+        .expect("store creds");
     let mut drive = state
         .arbiters
         .begin_request(&steward_did, make_req(), RequestCtx::default())
@@ -4318,9 +4789,20 @@ async fn remote_pipeline_layer_resolves_and_hot_reloads() {
             json!({ "policy": "package arbiter\nresult := { \"ok\": true, \"output\": { \"got\": \"v2\" } }" }),
         );
     }
-    policy::load_and_onboard(&state, &steward_did)
-        .await
-        .expect("reload with updated remote layer");
+    // Dispatch the Jetstream commit for the remote write (the production
+    // path): the handler folds it into the store rev-gated and reloads the
+    // referencing arbiter, which resolves the updated remote layer.
+    dispatch(
+        &state,
+        commit_event(
+            &remote_did,
+            NEWER_MOCK_REV,
+            POLICY_COLLECTION,
+            "shared",
+            json!({ "policy": "package arbiter\nresult := { \"ok\": true, \"output\": { \"got\": \"v2\" } }" }),
+        ),
+    )
+    .await;
     let mut drive = state
         .arbiters
         .begin_request(&steward_did, make_req(), RequestCtx::default())
@@ -4407,11 +4889,7 @@ async fn jetstream_handler_reloads_remote_record_despite_lower_rev() {
     );
 
     let handler = ReloadHandler::new(state.clone());
-    let commit = |did: &str,
-                  rev: &str,
-                  collection: &str,
-                  rkey: &str,
-                  record: Value| {
+    let commit = |did: &str, rev: &str, collection: &str, rkey: &str, record: Value| {
         JetstreamEvent::Commit {
             did: did.to_string(),
             time_us: 0,
@@ -4500,8 +4978,23 @@ async fn jetstream_handler_reloads_remote_record_despite_lower_rev() {
         .expect("begin after gated steward-repo event");
     assert_policy_output(drive.machine.start(), json!({ "got": "v2" }));
 
-    // The same steward-repo event with a rev above the floor reloads and
-    // picks up v3.
+    // Move the remote record to v3 and dispatch its commit: the store's
+    // entry (rev-stamped with the phase-1 stale rev) accepts the newer
+    // event, so the reload below observes v3 from the store — record
+    // changes reach the arbiter only through events now.
+    handler
+        .handle_event(Arc::new(commit(
+            &remote_did,
+            NEWER_MOCK_REV,
+            POLICY_COLLECTION,
+            "shared",
+            v3,
+        )))
+        .await
+        .expect("handle remote policy-record v3 event");
+
+    // The same steward-repo event with a rev above the floor reloads, and
+    // the load serves v3 from the record store.
     handler
         .handle_event(Arc::new(commit(
             &steward_did,
